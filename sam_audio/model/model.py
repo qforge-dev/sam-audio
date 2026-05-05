@@ -267,6 +267,13 @@ class SAMAudio(BaseModel):
                 ),
             )
 
+            forward_args["anchor_ids"] = self._repeat_for_reranking(
+                batch.anchor_ids, reranking_candidates
+            )
+            forward_args["anchor_alignment"] = self._repeat_for_reranking(
+                batch.anchor_alignment, reranking_candidates
+            )
+
         audio_features = forward_args["audio_features"]
         B, T, C = audio_features.shape
         C = C // 2  # we stack audio_features, so the actual channels is half
