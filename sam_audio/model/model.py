@@ -267,11 +267,16 @@ class SAMAudio(BaseModel):
                 ),
             )
 
-            forward_args["anchor_ids"] = self._repeat_for_reranking(
-                batch.anchor_ids, reranking_candidates
-            )
-            forward_args["anchor_alignment"] = self._repeat_for_reranking(
-                batch.anchor_alignment, reranking_candidates
+            # Refresh anchor conditioning created by predict_spans()
+            forward_args.update(
+                {
+                    "anchor_ids": self._repeat_for_reranking(
+                        batch.anchor_ids, reranking_candidates
+                    ),
+                    "anchor_alignment": self._repeat_for_reranking(
+                        batch.anchor_alignment, reranking_candidates
+                    ),
+                }
             )
 
         audio_features = forward_args["audio_features"]
