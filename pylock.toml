@@ -2223,6 +2223,15 @@ wheels = [
 ]
 
 [[packages]]
+name = "nvidia-cuda-runtime"
+version = "13.3.29"
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5f/e5/c1a221c8e6fecd071b80ea44c20fc253ae24f56e15e3f77cfbc3fb76e724/nvidia_cuda_runtime-13.3.29-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", upload-time = 2026-05-26T16:29:56Z, size = 2356574, hashes = { sha256 = "73291e19c9dd919c140c91bda2f80b0eca487da5ee30a086ef7bc4918ecb90ea" } },
+    { url = "https://files.pythonhosted.org/packages/97/be/5699b6e642b372f7d24c59c2f41383e2696825e20bab85f7399c7c6a56f7/nvidia_cuda_runtime-13.3.29-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", upload-time = 2026-05-26T16:30:21Z, size = 2339786, hashes = { sha256 = "e04420616e72f563167a7733272992d7e6df6dc5cb54b2f94f9f1520ea9e30c1" } },
+    { url = "https://files.pythonhosted.org/packages/d2/27/b53a5e0397842a5c11f0e1a39d4e5b2f22638a4126e83b3c4e196f62c969/nvidia_cuda_runtime-13.3.29-py3-none-win_amd64.whl", upload-time = 2026-05-26T17:00:05Z, size = 2630354, hashes = { sha256 = "0667ec61c3d897388efa305ed4f7609ace88849a753ba9c6311d06dca55fff4f" } },
+]
+
+[[packages]]
 name = "nvidia-cuda-runtime-cu12"
 version = "12.9.79"
 marker = "sys_platform == 'linux'"
