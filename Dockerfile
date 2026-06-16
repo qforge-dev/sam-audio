@@ -3,6 +3,8 @@
 ARG PYTHON_IMAGE=python:3.14-slim-bookworm
 ARG UV_VERSION=0.9.2
 
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
 FROM ${PYTHON_IMAGE} AS runtime
 
 ARG UV_VERSION
@@ -23,7 +25,7 @@ RUN apt-get update \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /uvx /usr/local/bin/
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 WORKDIR /opt/sam-audio
 
