@@ -36,4 +36,14 @@ COPY sam_audio ./sam_audio
 RUN uv pip sync pylock.toml --system --torch-backend "${UV_TORCH_BACKEND}" --strict \
     && uv pip install --system --no-deps --no-build-isolation .
 
+RUN python - <<'PY'
+import sam_audio
+from sam_audio import SAMAudio, SAMAudioProcessor
+from torchcodec.decoders import AudioDecoder
+from transformers import ModernBertConfig
+
+print("sam_audio", sam_audio.__version__ if hasattr(sam_audio, "__version__") else "imported")
+print(SAMAudio.__name__, SAMAudioProcessor.__name__, AudioDecoder.__name__, ModernBertConfig.__name__)
+PY
+
 CMD ["python", "-c", "import torch, sam_audio; print(f'sam_audio image ready: torch {torch.__version__}')"]

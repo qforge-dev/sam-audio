@@ -12,6 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install system media libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
       - uses: mamba-org/setup-micromamba@v3
         with:
           environment-name: sam-audio
