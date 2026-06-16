@@ -10,28 +10,40 @@ jobs:
   build:
     runs-on: 32-core-ubuntu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: mamba-org/setup-micromamba@v1.8.1
+      - uses: mamba-org/setup-micromamba@v3
         with:
           environment-name: sam-audio
           init-shell: bash
           create-args: >-
-            python=3.11
-            pip=24.2
-            ruff==
+            python=3.14
+            uv
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: /home/runner/micromamba/envs/sam-audio
-          key: ${{ hashFiles('pyproject.toml') }}-${{ env.CACHE_NUMBER }}
+          key: ${{ hashFiles('pyproject.toml', 'pylock.toml') }}-${{ env.CACHE_NUMBER }}
         id: cache
 
       - name: Update environment
         shell: bash -l {0}
         run: |
-          pip install .
+          uv pip sync pylock.toml --group dev --torch-backend cu129 --strict
         if: steps.cache.outputs.cache-hit != 'true'
+
+      - name: Import smoke test
+        shell: bash -l {0}
+        run: |
+          python - <<'PY'
+          import sam_audio
+          from sam_audio import SAMAudio, SAMAudioProcessor
+          from torchcodec.decoders import AudioDecoder
+          from transformers import ModernBertConfig
+
+          print("sam_audio", sam_audio.__version__ if hasattr(sam_audio, "__version__") else "imported")
+          print(SAMAudio.__name__, SAMAudioProcessor.__name__, AudioDecoder.__name__, ModernBertConfig.__name__)
+          PY
 
       - name: Check formatting
         shell: bash -l {0}

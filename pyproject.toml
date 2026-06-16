@@ -13,15 +13,15 @@ authors = [
 
 readme = "README.md"
 license = { file="LICENSE" }
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
-    "dacvae@git+https://github.com/facebookresearch/dacvae.git",
     "audiobox_aesthetics",
+    "dacvae @ git+https://github.com/facebookresearch/dacvae.git@main",
     "einops",
-    "imagebind@git+https://github.com/facebookresearch/ImageBind.git",
-    "laion-clap@git+https://github.com/lematt1991/CLAP.git",
+    "imagebind @ git+https://github.com/facebookresearch/ImageBind.git@main",
+    "laion-clap @ git+https://github.com/lematt1991/CLAP.git@main",
     "numpy",
-    "perception-models@git+https://github.com/facebookresearch/perception_models@unpin-deps",
+    "perception-models @ git+https://github.com/facebookresearch/perception_models.git@unpin-deps",
     "pydub",
     "torch",
     "torchaudio",
@@ -31,12 +31,18 @@ dependencies = [
     "transformers>=4.54.0",
 ]
 
+[dependency-groups]
+dev = [
+    "ruff",
+    "wheel",
+]
+
 [tool.setuptools.packages.find]
 include = ["sam_audio*"]
 
 [tool.ruff]
 
-target-version = "py311"
+target-version = "py314"
 
 lint.select=[
     "B",
