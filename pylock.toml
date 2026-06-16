@@ -2204,6 +2204,15 @@ wheels = [
 ]
 
 [[packages]]
+name = "nvidia-cuda-nvrtc"
+version = "13.3.33"
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8b/2c/86916c8a34dcdb0c3ddd1c0e30545041bd781184e437b9cb76fcda70560b/nvidia_cuda_nvrtc-13.3.33-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", upload-time = 2026-05-26T16:38:16Z, size = 51110910, hashes = { sha256 = "82530788b8c6164a54d3fd9ae8bcca8893d397c4aeb998861982a03bbe41e204" } },
+    { url = "https://files.pythonhosted.org/packages/e7/b6/60a3641111d39ebfcfcd8b8bfd0290d7623c4b8b5f90952c2d84776f8ca4/nvidia_cuda_nvrtc-13.3.33-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", upload-time = 2026-05-26T16:37:51Z, size = 49260054, hashes = { sha256 = "7b05ecda494c6dabc44231a608b060a71008a730d9dfda932cc508e6d29159e0" } },
+    { url = "https://files.pythonhosted.org/packages/a1/42/edce72f2c5a0f587168109c867f25f4a9a6cd7289ecf0d68ed2b1070f273/nvidia_cuda_nvrtc-13.3.33-py3-none-win_amd64.whl", upload-time = 2026-05-26T17:02:49Z, size = 45319163, hashes = { sha256 = "7d2af818851c0c224d5f92221e9226e51ee23c236df4b51f9194563979c888be" } },
+]
+
+[[packages]]
 name = "nvidia-cuda-nvrtc-cu12"
 version = "12.9.86"
 marker = "sys_platform == 'linux'"

@@ -21,6 +21,7 @@ dependencies = [
     "imagebind @ git+https://github.com/facebookresearch/ImageBind.git@main",
     "laion-clap @ git+https://github.com/lematt1991/CLAP.git@main",
     "numpy",
+    "nvidia-cuda-nvrtc",
     "perception-models @ git+https://github.com/facebookresearch/perception_models.git@unpin-deps",
     "pydub",
     "torch",

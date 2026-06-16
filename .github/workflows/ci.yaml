@@ -32,6 +32,11 @@ jobs:
           uv pip sync pylock.toml --group dev --torch-backend cu129 --strict
         if: steps.cache.outputs.cache-hit != 'true'
 
+      - name: Configure CUDA runtime library path
+        shell: bash -l {0}
+        run: |
+          echo "LD_LIBRARY_PATH=${CONDA_PREFIX}/lib/python3.14/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
       - name: Import smoke test
         shell: bash -l {0}
         run: |
