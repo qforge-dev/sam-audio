@@ -48,8 +48,9 @@ jobs:
             --python-platform x86_64-manylinux_2_28 \
             --torch-backend "${UV_TORCH_BACKEND}" \
             --format pylock.toml \
-            --output-file /tmp/pylock.toml
-          cmp pylock.toml /tmp/pylock.toml
+            --output-file /tmp/pylock.toml \
+            --quiet
+          diff -u <(tail -n +3 pylock.toml) <(tail -n +3 /tmp/pylock.toml)
 
       - name: Check locked install plan
         run: |
