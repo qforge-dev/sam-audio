@@ -8,7 +8,7 @@ env:
 
 jobs:
   build:
-    runs-on: 32-core-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
