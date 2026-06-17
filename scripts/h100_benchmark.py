@@ -378,6 +378,7 @@ def stage_percentages(stage_ms: dict[str, float]) -> dict[str, float]:
     }
 
 
+@torch.inference_mode()
 def profile_standard_separation(
     model: Any,
     batch: Any,
