@@ -211,7 +211,7 @@ def unsupported_reason(model: Any, args: argparse.Namespace) -> str | None:
 
 def write_jsonl(path: Path, row: dict[str, Any]) -> None:
     with path.open("a") as fout:
-        fout.write(json.dumps(row, sort_keys=True) + "\n")
+        fout.write(json.dumps(row, default=str, sort_keys=True) + "\n")
 
 
 def write_summary(path: Path, metrics: list[dict[str, Any]]) -> None:
@@ -646,7 +646,9 @@ def main() -> int:
         },
         "args": vars(args),
     }
-    (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest, default=str, indent=2, sort_keys=True)
+    )
 
     reason = unsupported_reason(model, args)
     if reason is not None:
