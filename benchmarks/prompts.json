@@ -1,0 +1,15 @@
+{
+  "description": "Default SAM-Audio H100 benchmark prompts. Keep labels short to match SAM-Audio text prompting guidance.",
+  "prompts": [
+    "music",
+    "human voice",
+    "speech",
+    "sound effects",
+    "footsteps",
+    "engine",
+    "applause",
+    "wind",
+    "water",
+    "thunder"
+  ]
+}
