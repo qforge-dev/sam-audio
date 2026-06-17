@@ -22,6 +22,33 @@ from sam_audio.ranking import create_ranker
 DFLT_ODE_OPT = {"method": "midpoint", "options": {"step_size": 2 / 32}}
 
 
+def _fixed_midpoint_integrate(vector_field, y0: torch.Tensor, options: Dict[str, Any]):
+    """Fixed-grid midpoint integration specialized for the default inference path."""
+    t0 = float(options.get("t0", 0.0))
+    t1 = float(options.get("t1", 1.0))
+    if "steps" in options:
+        steps = int(options["steps"])
+        if steps <= 0:
+            raise ValueError(f"`steps` must be positive, got {steps}")
+        step_size = (t1 - t0) / steps
+    else:
+        step_size = float(options.get("step_size", 2 / 32))
+        if step_size <= 0:
+            raise ValueError(f"`step_size` must be positive, got {step_size}")
+        steps = math.ceil((t1 - t0) / step_size)
+
+    y = y0
+    current_t = t0
+    for _ in range(steps):
+        dt = min(step_size, t1 - current_t)
+        if dt <= 0:
+            break
+        midpoint_t = y.new_tensor(current_t + 0.5 * dt)
+        y = y + dt * vector_field(midpoint_t, y)
+        current_t += dt
+    return y
+
+
 class SinusoidalEmbedding(torch.nn.Module):
     def __init__(self, dim, theta=10000):
         super().__init__()
@@ -75,6 +102,7 @@ class SeparationResult:
 class SAMAudio(BaseModel):
     config_cls = SAMAudioConfig
     revision = None
+    _h100_fixed_midpoint_supported = True
 
     def __init__(self, cfg: SAMAudioConfig):
         super().__init__()
@@ -294,13 +322,19 @@ class SAMAudio(BaseModel):
             )
             return res
 
-        states = odeint(
-            vector_field,
-            noise,
-            torch.tensor([0.0, 1.0], device=noise.device),
-            **ode_opt,
-        )
-        generated_features = states[-1].transpose(1, 2)
+        if ode_opt.get("method") == "fixed_midpoint":
+            generated = _fixed_midpoint_integrate(
+                vector_field, noise, ode_opt.get("options", {})
+            )
+        else:
+            states = odeint(
+                vector_field,
+                noise,
+                torch.tensor([0.0, 1.0], device=noise.device),
+                **ode_opt,
+            )
+            generated = states[-1]
+        generated_features = generated.transpose(1, 2)
         # generated_features has shape [B, 2C, T].  Reshape to stack along the batch dimension
         wavs = self.audio_codec.decode(generated_features.reshape(2 * B, C, T)).view(
             B, 2, -1
