@@ -157,7 +157,10 @@ def compile_transformer_if_requested(model: Any, mode: str) -> None:
         return
     if not hasattr(torch, "compile"):
         raise RuntimeError("torch.compile is unavailable in this PyTorch build")
-    model.transformer = torch.compile(model.transformer, mode=mode)
+    if hasattr(model, "compile_h100"):
+        model.compile_h100(mode=mode)
+    else:
+        model.transformer = torch.compile(model.transformer, mode=mode)
 
 
 def sdpa_context(name: str):
@@ -415,6 +418,13 @@ def main() -> int:
         "audio_count": len(audio_files),
         "prompt_count": len(prompts),
         "load_ms": round(load_ms, 3),
+        "capabilities": {
+            "fixed_midpoint": getattr(model, "_h100_fixed_midpoint_supported", False),
+            "conditioning_cache": hasattr(model, "prepare_audio")
+            and hasattr(model, "separate_prepared"),
+            "compile_h100": hasattr(model, "compile_h100"),
+            "adaptive_rerank": hasattr(model, "separate_adaptive_rerank"),
+        },
         "args": vars(args),
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))

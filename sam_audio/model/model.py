@@ -114,6 +114,7 @@ class SAMAudio(BaseModel):
     config_cls = SAMAudioConfig
     revision = None
     _h100_fixed_midpoint_supported = True
+    _h100_compile_kernels_supported = True
 
     def __init__(self, cfg: SAMAudioConfig):
         super().__init__()
@@ -139,6 +140,12 @@ class SAMAudio(BaseModel):
             self.span_predictor_transform = PEAudioFrameTransform.from_config(
                 cfg.span_predictor
             )
+
+    def compile_h100(self, mode: str = "default"):
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("torch.compile is unavailable in this PyTorch build")
+        self.transformer = torch.compile(self.transformer, mode=mode)
+        return self
 
     @property
     def sample_rate(self):

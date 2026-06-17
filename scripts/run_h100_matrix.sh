@@ -48,6 +48,7 @@ run_case fixed-midpoint --dtype-policy fp32 --reranking 4 --predict-spans --fixe
 run_case fixed-midpoint-cache --dtype-policy fp32 --reranking 4 --predict-spans --fixed-midpoint --cache-conditioning
 run_case compile-default --dtype-policy fp32 --reranking 4 --predict-spans --compile-transformer default
 run_case compile-reduce-overhead --dtype-policy fp32 --reranking 4 --predict-spans --compile-transformer reduce-overhead
+run_case compile-max-autotune --dtype-policy fp32 --reranking 4 --predict-spans --compile-transformer max-autotune
 run_case sdpa-flash --dtype-policy fp32 --reranking 4 --predict-spans --sdpa-backend flash
 run_case adaptive-rerank --dtype-policy fp32 --reranking adaptive --predict-spans
 
