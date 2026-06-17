@@ -73,6 +73,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--record-cold", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-warm-seconds", type=float, default=0.0)
     parser.add_argument("--min-warm-runs", type=int, default=1)
+    parser.add_argument(
+        "--disable-visual-ranker",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Avoid loading ImageBind visual reranker for audio-only text benchmarks.",
+    )
     return parser.parse_args()
 
 
@@ -607,7 +613,15 @@ def main() -> int:
     from sam_audio import SAMAudio, SAMAudioProcessor
 
     load_start = now_ms()
-    model = SAMAudio.from_pretrained(args.model_id, proxies=None, resume_download=False).eval().cuda()
+    model_kwargs: dict[str, Any] = {}
+    if args.disable_visual_ranker:
+        model_kwargs["visual_ranker"] = None
+    model = SAMAudio.from_pretrained(
+        args.model_id,
+        proxies=None,
+        resume_download=False,
+        **model_kwargs,
+    ).eval().cuda()
     if dtype != torch.float32:
         model = model.to(dtype)
         keep_rankers_fp32(model)
