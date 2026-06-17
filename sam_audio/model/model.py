@@ -115,6 +115,7 @@ class SAMAudio(BaseModel):
     revision = None
     _h100_fixed_midpoint_supported = True
     _h100_compile_kernels_supported = True
+    _h100_adaptive_rerank_supported = True
 
     def __init__(self, cfg: SAMAudioConfig):
         super().__init__()
@@ -626,6 +627,186 @@ class SAMAudio(BaseModel):
             ],
             noise=noise,
         )
+
+    def _generate_prepared_candidate_wavs(
+        self,
+        prepared: PreparedSeparation,
+        noise: Optional[torch.Tensor],
+        ode_opt: Dict[str, Any],
+    ):
+        audio_features = prepared.forward_args["audio_features"]
+        B, T, C = audio_features.shape
+        C = C // 2
+
+        if noise is None:
+            noise = torch.randn_like(audio_features)
+
+        def vector_field(t, noisy_audio):
+            return self.forward_prepared(
+                noisy_audio=noisy_audio,
+                prepared=prepared,
+                time=t.expand(noisy_audio.size(0)),
+            )
+
+        if ode_opt.get("method") == "fixed_midpoint":
+            generated = _fixed_midpoint_integrate(
+                vector_field, noise, ode_opt.get("options", {})
+            )
+        else:
+            states = odeint(
+                vector_field,
+                noise,
+                torch.tensor([0.0, 1.0], device=noise.device),
+                **ode_opt,
+            )
+            generated = states[-1]
+
+        generated_features = generated.transpose(1, 2)
+        wavs = self.audio_codec.decode(generated_features.reshape(2 * B, C, T)).view(
+            B, 2, -1
+        )
+        bsz = wavs.size(0) // prepared.candidates
+        sizes = self.audio_codec.feature_idx_to_wav_idx(prepared.batch.sizes)
+        target_wavs = self.unbatch(
+            wavs[:, 0].view(bsz, prepared.candidates, -1), sizes
+        )
+        residual_wavs = self.unbatch(
+            wavs[:, 1].view(bsz, prepared.candidates, -1), sizes
+        )
+        return target_wavs, residual_wavs, noise
+
+    def _score_candidate_wavs(
+        self,
+        batch: Batch,
+        target_wavs: list[torch.Tensor],
+        candidates: int,
+    ) -> Optional[torch.Tensor]:
+        if (
+            candidates > 1
+            and batch.masked_video is not None
+            and self.visual_ranker is not None
+        ):
+            return self.visual_ranker(
+                extracted_audio=target_wavs,
+                videos=batch.masked_video,
+                sample_rate=self.audio_codec.sample_rate,
+            )
+        if candidates > 1 and self.text_ranker is not None:
+            sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
+            input_audio = [
+                audio[:, :size].expand(candidates, -1)
+                for audio, size in zip(batch.audios, sizes, strict=False)
+            ]
+            return self.text_ranker(
+                extracted_audio=target_wavs,
+                input_audio=input_audio,
+                descriptions=batch.descriptions,
+                sample_rate=self.audio_codec.sample_rate,
+            )
+        return None
+
+    def _select_candidate_wavs(
+        self,
+        target_wavs: list[torch.Tensor],
+        residual_wavs: list[torch.Tensor],
+        scores: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> SeparationResult:
+        if scores is None:
+            idxs = torch.zeros(len(target_wavs), dtype=torch.long, device=device)
+        else:
+            idxs = scores.argmax(dim=1)
+        return SeparationResult(
+            target=[wav[idx] for wav, idx in zip(target_wavs, idxs, strict=False)],
+            residual=[
+                wavs[idx] for wavs, idx in zip(residual_wavs, idxs, strict=False)
+            ],
+            noise=torch.empty(0, device=device),
+        )
+
+    @torch.inference_mode()
+    def separate_adaptive_rerank(
+        self,
+        batch: Batch,
+        noise: Optional[torch.Tensor] = None,
+        ode_opt: Dict[str, Any] = DFLT_ODE_OPT,
+        initial_candidates: int = 4,
+        max_candidates: int = 8,
+        margin: float = 0.05,
+        predict_spans: bool = False,
+    ) -> SeparationResult:
+        if initial_candidates < 1:
+            raise ValueError("`initial_candidates` must be >= 1")
+        if max_candidates < initial_candidates:
+            raise ValueError("`max_candidates` must be >= `initial_candidates`")
+
+        prepared = self.prepare_audio(
+            batch,
+            candidates=initial_candidates,
+            predict_spans=predict_spans,
+        )
+        target_wavs, residual_wavs, first_noise = self._generate_prepared_candidate_wavs(
+            prepared, noise, ode_opt
+        )
+        scores = self._score_candidate_wavs(
+            prepared.batch, target_wavs, initial_candidates
+        )
+
+        if (
+            scores is None
+            or initial_candidates == max_candidates
+            or initial_candidates < 2
+        ):
+            result = self._select_candidate_wavs(
+                target_wavs, residual_wavs, scores, first_noise.device
+            )
+            result.noise = first_noise
+            return result
+
+        top2 = scores.topk(k=2, dim=1).values
+        confident = (top2[:, 0] - top2[:, 1]).ge(margin)
+        if bool(confident.all()):
+            result = self._select_candidate_wavs(
+                target_wavs, residual_wavs, scores, first_noise.device
+            )
+            result.noise = first_noise
+            return result
+
+        extra_candidates = max_candidates - initial_candidates
+        extra_prepared = self.prepare_audio(
+            prepared.batch,
+            candidates=extra_candidates,
+            predict_spans=False,
+        )
+        extra_target_wavs, extra_residual_wavs, _ = (
+            self._generate_prepared_candidate_wavs(extra_prepared, None, ode_opt)
+        )
+        extra_scores = self._score_candidate_wavs(
+            prepared.batch, extra_target_wavs, extra_candidates
+        )
+        if extra_scores is None:
+            result = self._select_candidate_wavs(
+                target_wavs, residual_wavs, scores, first_noise.device
+            )
+            result.noise = first_noise
+            return result
+
+        all_target_wavs = [
+            torch.cat([target, extra], dim=0)
+            for target, extra in zip(target_wavs, extra_target_wavs, strict=False)
+        ]
+        all_residual_wavs = [
+            torch.cat([residual, extra], dim=0)
+            for residual, extra in zip(
+                residual_wavs, extra_residual_wavs, strict=False
+            )
+        ]
+        all_scores = torch.cat([scores, extra_scores], dim=1)
+        result = self._select_candidate_wavs(
+            all_target_wavs, all_residual_wavs, all_scores, first_noise.device
+        )
+        result.noise = first_noise
+        return result
 
     def unbatch(self, wavs: torch.Tensor, sizes: torch.Tensor, time_dim: int = -1):
         result = []

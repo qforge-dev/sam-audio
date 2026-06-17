@@ -59,6 +59,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-conditioning", action="store_true")
     parser.add_argument("--compile-transformer", choices=["none", "default", "reduce-overhead", "max-autotune"], default="none")
     parser.add_argument("--sdpa-backend", choices=["auto", "flash", "cudnn"], default="auto")
+    parser.add_argument("--adaptive-initial-candidates", type=int, default=4)
+    parser.add_argument("--adaptive-max-candidates", type=int, default=8)
+    parser.add_argument("--adaptive-margin", type=float, default=0.05)
     return parser.parse_args()
 
 
@@ -326,7 +329,13 @@ def run_one(
             )
             result = model.separate_prepared(handle, prompts=prompts, **make_separate_kwargs(args))
         elif args.reranking == "adaptive":
-            result = model.separate_adaptive_rerank(batch, predict_spans=args.predict_spans)
+            result = model.separate_adaptive_rerank(
+                batch,
+                predict_spans=args.predict_spans,
+                initial_candidates=args.adaptive_initial_candidates,
+                max_candidates=args.adaptive_max_candidates,
+                margin=args.adaptive_margin,
+            )
         else:
             result = model.separate(batch, **make_separate_kwargs(args))
     cuda_sync()
@@ -457,7 +466,13 @@ def main() -> int:
                 )
                 model.separate_prepared(handle, **make_separate_kwargs(args))
             elif args.reranking == "adaptive":
-                model.separate_adaptive_rerank(batch, predict_spans=args.predict_spans)
+                model.separate_adaptive_rerank(
+                    batch,
+                    predict_spans=args.predict_spans,
+                    initial_candidates=args.adaptive_initial_candidates,
+                    max_candidates=args.adaptive_max_candidates,
+                    margin=args.adaptive_margin,
+                )
             else:
                 model.separate(batch, **make_separate_kwargs(args))
         cuda_sync()
