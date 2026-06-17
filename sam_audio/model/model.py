@@ -511,11 +511,11 @@ class SAMAudio(BaseModel):
             idxs = scores.argmax(dim=1)
         elif reranking_candidates > 1 and self.text_ranker is not None:
             input_audio = [
-                audio[:, :size].expand(reranking_candidates, -1)
+                audio[:, :size].float().expand(reranking_candidates, -1)
                 for audio, size in zip(batch.audios, sizes, strict=False)
             ]
             scores = self.text_ranker(
-                extracted_audio=target_wavs,
+                extracted_audio=[wav.float() for wav in target_wavs],
                 input_audio=input_audio,
                 descriptions=batch.descriptions,
                 sample_rate=self.audio_codec.sample_rate,
@@ -610,11 +610,11 @@ class SAMAudio(BaseModel):
             idxs = scores.argmax(dim=1)
         elif reranking_candidates > 1 and self.text_ranker is not None:
             input_audio = [
-                audio[:, :size].expand(reranking_candidates, -1)
+                audio[:, :size].float().expand(reranking_candidates, -1)
                 for audio, size in zip(batch.audios, sizes, strict=False)
             ]
             scores = self.text_ranker(
-                extracted_audio=target_wavs,
+                extracted_audio=[wav.float() for wav in target_wavs],
                 input_audio=input_audio,
                 descriptions=batch.descriptions,
                 sample_rate=self.audio_codec.sample_rate,
@@ -697,11 +697,11 @@ class SAMAudio(BaseModel):
         if candidates > 1 and self.text_ranker is not None:
             sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
             input_audio = [
-                audio[:, :size].expand(candidates, -1)
+                audio[:, :size].float().expand(candidates, -1)
                 for audio, size in zip(batch.audios, sizes, strict=False)
             ]
             return self.text_ranker(
-                extracted_audio=target_wavs,
+                extracted_audio=[wav.float() for wav in target_wavs],
                 input_audio=input_audio,
                 descriptions=batch.descriptions,
                 sample_rate=self.audio_codec.sample_rate,

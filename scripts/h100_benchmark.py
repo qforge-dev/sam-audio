@@ -470,11 +470,11 @@ def profile_standard_separation(
 
         if reranking > 1 and model.text_ranker is not None:
             input_audio = [
-                audio[:, :size].expand(reranking, -1)
+                audio[:, :size].float().expand(reranking, -1)
                 for audio, size in zip(batch.audios, sizes, strict=False)
             ]
             scores = model.text_ranker(
-                extracted_audio=target_wavs,
+                extracted_audio=[wav.float() for wav in target_wavs],
                 input_audio=input_audio,
                 descriptions=batch.descriptions,
                 sample_rate=model.audio_codec.sample_rate,
