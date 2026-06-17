@@ -70,6 +70,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive-max-candidates", type=int, default=8)
     parser.add_argument("--adaptive-margin", type=float, default=0.05)
     parser.add_argument("--stage-profile", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--record-cold", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--min-warm-seconds", type=float, default=0.0)
+    parser.add_argument("--min-warm-runs", type=int, default=1)
     return parser.parse_args()
 
 
@@ -209,7 +212,10 @@ def write_summary(path: Path, metrics: list[dict[str, Any]]) -> None:
     completed = [m for m in metrics if m.get("status") == "ok"]
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in completed:
-        groups[row["run_name"]].append(row)
+        name = row["run_name"]
+        if row.get("phase"):
+            name = f"{name}:{row['phase']}"
+        groups[name].append(row)
 
     fields = [
         "run_name",
@@ -471,6 +477,7 @@ def run_one(
     run_dir: Path,
     metrics_path: Path,
     run_index: int,
+    phase: str = "warm",
 ) -> dict[str, Any]:
     device = "cuda"
     duration = duration_seconds(audio_path)
@@ -481,6 +488,7 @@ def run_one(
             "audio_path": str(audio_path),
             "duration_seconds": duration,
             "run_name": args.run_name,
+            "phase": phase,
         }
         write_jsonl(metrics_path, row)
         return row
@@ -526,7 +534,7 @@ def run_one(
     inference_ms = now_ms() - inference_start
 
     save_start = now_ms()
-    artifact_dir = run_dir / "artifacts" / audio_path.stem
+    artifact_dir = run_dir / "artifacts" / phase / f"{run_index:04d}_{audio_path.stem}"
     artifacts = save_outputs(
         result,
         processor.audio_sampling_rate,
@@ -547,6 +555,7 @@ def run_one(
     row = {
         "status": "ok",
         "run_name": args.run_name,
+        "phase": phase,
         "model_id": args.model_id,
         "audio_path": str(audio_path),
         "duration_seconds": duration,
@@ -639,6 +648,24 @@ def main() -> int:
         print(json.dumps(row, indent=2, sort_keys=True))
         return 0
 
+    metrics = []
+    if args.record_cold:
+        for index, audio_path in enumerate(audio_files):
+            metrics.append(
+                run_one(
+                    model=model,
+                    processor=processor,
+                    audio_path=audio_path,
+                    prompts=prompts,
+                    args=args,
+                    dtype=dtype,
+                    run_dir=run_dir,
+                    metrics_path=metrics_path,
+                    run_index=index,
+                    phase="cold",
+                )
+            )
+
     for warmup_index in range(args.warmup):
         set_seed(args.seed + warmup_index)
         batch = processor(audios=[str(audio_files[0])] * len(prompts), descriptions=prompts).to("cuda")
@@ -664,21 +691,29 @@ def main() -> int:
                 model.separate(batch, **make_separate_kwargs(args))
         cuda_sync()
 
-    metrics = []
-    for index, audio_path in enumerate(audio_files):
-        metrics.append(
-            run_one(
-                model=model,
-                processor=processor,
-                audio_path=audio_path,
-                prompts=prompts,
-                args=args,
-                dtype=dtype,
-                run_dir=run_dir,
-                metrics_path=metrics_path,
-                run_index=index,
+    warm_start = now_ms()
+    warm_runs = 0
+    while True:
+        for audio_index, audio_path in enumerate(audio_files):
+            run_index = warm_runs * len(audio_files) + audio_index
+            metrics.append(
+                run_one(
+                    model=model,
+                    processor=processor,
+                    audio_path=audio_path,
+                    prompts=prompts,
+                    args=args,
+                    dtype=dtype,
+                    run_dir=run_dir,
+                    metrics_path=metrics_path,
+                    run_index=run_index,
+                    phase="warm",
+                )
             )
-        )
+        warm_runs += 1
+        warm_elapsed_seconds = (now_ms() - warm_start) / 1000.0
+        if warm_runs >= args.min_warm_runs and warm_elapsed_seconds >= args.min_warm_seconds:
+            break
     write_summary(summary_path, metrics)
     print(f"Wrote {metrics_path}")
     print(f"Wrote {summary_path}")
