@@ -270,6 +270,12 @@ def make_separate_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     return kwargs
 
 
+def candidate_count(args: argparse.Namespace) -> int:
+    if args.reranking == "adaptive":
+        return 1
+    return int(args.reranking)
+
+
 def run_one(
     *,
     model: Any,
@@ -310,7 +316,11 @@ def run_one(
     inference_start = now_ms()
     with sdpa_context(args.sdpa_backend):
         if args.cache_conditioning:
-            handle = model.prepare_audio(batch)
+            handle = model.prepare_audio(
+                batch,
+                candidates=candidate_count(args),
+                predict_spans=args.predict_spans,
+            )
             result = model.separate_prepared(handle, prompts=prompts, **make_separate_kwargs(args))
         elif args.reranking == "adaptive":
             result = model.separate_adaptive_rerank(batch, predict_spans=args.predict_spans)
@@ -429,7 +439,14 @@ def main() -> int:
         if dtype != torch.float32:
             batch.audios = batch.audios.to(dtype)
         with sdpa_context(args.sdpa_backend):
-            if args.reranking == "adaptive":
+            if args.cache_conditioning:
+                handle = model.prepare_audio(
+                    batch,
+                    candidates=candidate_count(args),
+                    predict_spans=args.predict_spans,
+                )
+                model.separate_prepared(handle, **make_separate_kwargs(args))
+            elif args.reranking == "adaptive":
                 model.separate_adaptive_rerank(batch, predict_spans=args.predict_spans)
             else:
                 model.separate(batch, **make_separate_kwargs(args))

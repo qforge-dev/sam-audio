@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import torch
+import torch.nn.functional as F
 from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
 from torchdiffeq import odeint
 
@@ -99,6 +100,16 @@ class SeparationResult:
     noise: torch.Tensor
 
 
+@dataclass
+class PreparedSeparation:
+    batch: Batch
+    candidates: int
+    forward_args: Dict[str, torch.Tensor]
+    projected_static: torch.Tensor
+    memory_base: Optional[torch.Tensor]
+    predict_spans: bool = False
+
+
 class SAMAudio(BaseModel):
     config_cls = SAMAudioConfig
     revision = None
@@ -155,6 +166,44 @@ class SAMAudio(BaseModel):
         aligned = self.embed_anchors(aligned, anchor_ids, anchor_alignment)
         return aligned
 
+    def _get_projected_static_inputs(
+        self,
+        audio_features: torch.Tensor,
+        masked_video_features: Optional[torch.Tensor] = None,
+        anchor_ids: Optional[torch.Tensor] = None,
+        anchor_alignment: Optional[torch.Tensor] = None,
+    ):
+        feature_channels = audio_features.size(-1)
+        expected_channels = feature_channels * 3
+        if self.proj.in_features == expected_channels:
+            audio_weight = self.proj.weight[
+                :, 2 * feature_channels : 3 * feature_channels
+            ]
+            projected = F.linear(audio_features, audio_weight, self.proj.bias)
+        else:
+            static_input = torch.cat(
+                [
+                    torch.zeros_like(audio_features),
+                    torch.zeros_like(audio_features),
+                    audio_features,
+                ],
+                dim=2,
+            )
+            projected = self.proj(static_input)
+        aligned = self.align_masked_video(projected, masked_video_features)
+        return self.embed_anchors(aligned, anchor_ids, anchor_alignment)
+
+    def _align_prepared_inputs(
+        self,
+        noisy_audio: torch.Tensor,
+        projected_static: torch.Tensor,
+    ):
+        feature_channels = noisy_audio.size(-1)
+        if self.proj.in_features >= feature_channels:
+            noise_weight = self.proj.weight[:, :feature_channels]
+            return projected_static + F.linear(noisy_audio, noise_weight, bias=None)
+        return self.align_inputs(noisy_audio, noisy_audio.new_zeros(noisy_audio.shape))
+
     def forward(
         self,
         noisy_audio: torch.Tensor,
@@ -207,9 +256,39 @@ class SAMAudio(BaseModel):
             memory_padding_mask=text_mask,
         )
 
+    def forward_prepared(
+        self,
+        noisy_audio: torch.Tensor,
+        prepared: PreparedSeparation,
+        time: torch.Tensor,
+    ):
+        aligned_inputs = self._align_prepared_inputs(
+            noisy_audio, prepared.projected_static
+        )
+        timestep_emb = self.timestep_emb(time, pos=time).unsqueeze(1)
+        memory = timestep_emb
+        if prepared.memory_base is not None:
+            memory = prepared.memory_base + timestep_emb
+        return self.transformer(
+            aligned_inputs,
+            time,
+            padding_mask=prepared.forward_args["audio_pad_mask"],
+            memory=memory,
+            memory_padding_mask=prepared.forward_args["text_mask"],
+        )
+
     def _get_audio_features(self, audios: torch.Tensor):
         audio_features = self.audio_codec(audios).transpose(1, 2)
         return torch.cat([audio_features, audio_features], dim=2)
+
+    def _get_audio_features_dedup(self, audios: torch.Tensor):
+        if audios.size(0) <= 1:
+            return self._get_audio_features(audios)
+        first = audios[:1]
+        if torch.equal(audios, first.expand_as(audios)):
+            features = self._get_audio_features(first)
+            return features.expand(audios.size(0), *features.shape[1:])
+        return self._get_audio_features(audios)
 
     def _get_video_features(self, video, audio_features):
         B, T, _ = audio_features.shape
@@ -255,6 +334,65 @@ class SAMAudio(BaseModel):
                 batch.audio_pad_mask, candidates
             ),
         }
+
+    def prepare_audio(
+        self,
+        batch: Batch,
+        candidates: int = 1,
+        predict_spans: bool = False,
+    ) -> PreparedSeparation:
+        audio_features = self._get_audio_features_dedup(batch.audios)
+        text_features, text_mask = self.text_encoder(batch.descriptions)
+        masked_video_features = self._get_video_features(
+            batch.masked_video, audio_features
+        )
+
+        forward_args = {
+            "audio_features": self._repeat_for_reranking(audio_features, candidates),
+            "text_features": self._repeat_for_reranking(text_features, candidates),
+            "text_mask": self._repeat_for_reranking(text_mask, candidates),
+            "masked_video_features": self._repeat_for_reranking(
+                masked_video_features, candidates
+            ),
+            "anchor_ids": self._repeat_for_reranking(batch.anchor_ids, candidates),
+            "anchor_alignment": self._repeat_for_reranking(
+                batch.anchor_alignment, candidates
+            ),
+            "audio_pad_mask": self._repeat_for_reranking(
+                batch.audio_pad_mask, candidates
+            ),
+        }
+
+        if predict_spans and hasattr(self, "span_predictor") and batch.anchors is None:
+            batch = self.predict_spans(
+                batch=batch,
+                audio_features=audio_features,
+                audio_pad_mask=batch.audio_pad_mask,
+            )
+            forward_args["anchor_ids"] = self._repeat_for_reranking(
+                batch.anchor_ids, candidates
+            )
+            forward_args["anchor_alignment"] = self._repeat_for_reranking(
+                batch.anchor_alignment, candidates
+            )
+
+        memory_base = None
+        if forward_args["text_features"] is not None:
+            memory_base = self.memory_proj(forward_args["text_features"])
+        projected_static = self._get_projected_static_inputs(
+            forward_args["audio_features"],
+            masked_video_features=forward_args["masked_video_features"],
+            anchor_ids=forward_args["anchor_ids"],
+            anchor_alignment=forward_args["anchor_alignment"],
+        )
+        return PreparedSeparation(
+            batch=batch,
+            candidates=candidates,
+            forward_args=forward_args,
+            projected_static=projected_static,
+            memory_base=memory_base,
+            predict_spans=predict_spans,
+        )
 
     def predict_spans(
         self, batch: Batch, audio_features: torch.Tensor, audio_pad_mask: torch.Tensor
@@ -340,6 +478,105 @@ class SAMAudio(BaseModel):
             B, 2, -1
         )
 
+        bsz = wavs.size(0) // reranking_candidates
+        sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
+        target_wavs = self.unbatch(
+            wavs[:, 0].view(bsz, reranking_candidates, -1), sizes
+        )
+        residual_wavs = self.unbatch(
+            wavs[:, 1].view(bsz, reranking_candidates, -1), sizes
+        )
+
+        if (
+            reranking_candidates > 1
+            and batch.masked_video is not None
+            and self.visual_ranker is not None
+        ):
+            scores = self.visual_ranker(
+                extracted_audio=target_wavs,
+                videos=batch.masked_video,
+                sample_rate=self.audio_codec.sample_rate,
+            )
+            idxs = scores.argmax(dim=1)
+        elif reranking_candidates > 1 and self.text_ranker is not None:
+            input_audio = [
+                audio[:, :size].expand(reranking_candidates, -1)
+                for audio, size in zip(batch.audios, sizes, strict=False)
+            ]
+            scores = self.text_ranker(
+                extracted_audio=target_wavs,
+                input_audio=input_audio,
+                descriptions=batch.descriptions,
+                sample_rate=self.audio_codec.sample_rate,
+            )
+            idxs = scores.argmax(dim=1)
+        else:
+            idxs = torch.zeros(bsz, dtype=torch.long, device=noise.device)
+
+        return SeparationResult(
+            target=[wav[idx] for wav, idx in zip(target_wavs, idxs, strict=False)],
+            residual=[
+                wavs[idx] for wavs, idx in zip(residual_wavs, idxs, strict=False)
+            ],
+            noise=noise,
+        )
+
+    @torch.inference_mode()
+    def separate_prepared(
+        self,
+        prepared: PreparedSeparation,
+        prompts: Optional[list[str]] = None,
+        noise: Optional[torch.Tensor] = None,
+        ode_opt: Dict[str, Any] = DFLT_ODE_OPT,
+        reranking_candidates: Optional[int] = None,
+        predict_spans: bool = False,
+    ) -> SeparationResult:
+        del prompts
+        if reranking_candidates is None:
+            reranking_candidates = prepared.candidates
+        if reranking_candidates != prepared.candidates:
+            raise ValueError(
+                "`reranking_candidates` must match the candidate count used by `prepare_audio`"
+            )
+        if predict_spans and not prepared.predict_spans and prepared.batch.anchors is None:
+            prepared = self.prepare_audio(
+                prepared.batch,
+                candidates=prepared.candidates,
+                predict_spans=True,
+            )
+
+        audio_features = prepared.forward_args["audio_features"]
+        B, T, C = audio_features.shape
+        C = C // 2
+
+        if noise is None:
+            noise = torch.randn_like(audio_features)
+
+        def vector_field(t, noisy_audio):
+            return self.forward_prepared(
+                noisy_audio=noisy_audio,
+                prepared=prepared,
+                time=t.expand(noisy_audio.size(0)),
+            )
+
+        if ode_opt.get("method") == "fixed_midpoint":
+            generated = _fixed_midpoint_integrate(
+                vector_field, noise, ode_opt.get("options", {})
+            )
+        else:
+            states = odeint(
+                vector_field,
+                noise,
+                torch.tensor([0.0, 1.0], device=noise.device),
+                **ode_opt,
+            )
+            generated = states[-1]
+        generated_features = generated.transpose(1, 2)
+        wavs = self.audio_codec.decode(generated_features.reshape(2 * B, C, T)).view(
+            B, 2, -1
+        )
+
+        batch = prepared.batch
         bsz = wavs.size(0) // reranking_candidates
         sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
         target_wavs = self.unbatch(
