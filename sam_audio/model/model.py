@@ -44,8 +44,11 @@ def _fixed_midpoint_integrate(vector_field, y0: torch.Tensor, options: Dict[str,
         dt = min(step_size, t1 - current_t)
         if dt <= 0:
             break
+        start_t = y.new_tensor(current_t)
         midpoint_t = y.new_tensor(current_t + 0.5 * dt)
-        y = y + dt * vector_field(midpoint_t, y)
+        k1 = vector_field(start_t, y)
+        midpoint_y = y + 0.5 * dt * k1
+        y = y + dt * vector_field(midpoint_t, midpoint_y)
         current_t += dt
     return y
 
