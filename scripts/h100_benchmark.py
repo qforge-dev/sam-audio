@@ -38,6 +38,13 @@ DTYPES = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
 }
+STAGE_KEYS = [
+    "encoding",
+    "span_prediction",
+    "ode_generation",
+    "audio_decoding",
+    "reranking",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive-initial-candidates", type=int, default=4)
     parser.add_argument("--adaptive-max-candidates", type=int, default=8)
     parser.add_argument("--adaptive-margin", type=float, default=0.05)
+    parser.add_argument("--stage-profile", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -212,6 +220,11 @@ def write_summary(path: Path, metrics: list[dict[str, Any]]) -> None:
         "mean_inference_ms",
         "max_peak_allocated_gb",
         "max_peak_reserved_gb",
+        "mean_encoding_ms",
+        "mean_span_prediction_ms",
+        "mean_ode_generation_ms",
+        "mean_audio_decoding_ms",
+        "mean_reranking_ms",
     ]
     with path.open("w", newline="") as fout:
         writer = csv.DictWriter(fout, fieldnames=fields)
@@ -230,8 +243,24 @@ def write_summary(path: Path, metrics: list[dict[str, Any]]) -> None:
                     "mean_inference_ms": round(statistics.mean(infs), 3),
                     "max_peak_allocated_gb": max(r.get("peak_allocated_gb") or 0 for r in rows),
                     "max_peak_reserved_gb": max(r.get("peak_reserved_gb") or 0 for r in rows),
+                    **mean_stage_columns(rows),
                 }
             )
+
+
+def mean_stage_columns(rows: list[dict[str, Any]]) -> dict[str, float | str]:
+    result: dict[str, float | str] = {}
+    for stage in STAGE_KEYS:
+        values = [
+            row.get("stage_ms", {}).get(stage)
+            for row in rows
+            if isinstance(row.get("stage_ms"), dict)
+            and row.get("stage_ms", {}).get(stage) is not None
+        ]
+        result[f"mean_{stage}_ms"] = (
+            round(statistics.mean(values), 3) if values else ""
+        )
+    return result
 
 
 def save_outputs(
@@ -282,6 +311,155 @@ def candidate_count(args: argparse.Namespace) -> int:
     return int(args.reranking)
 
 
+def solve_ode(vector_field: Any, noise: torch.Tensor, ode_opt: dict[str, Any]):
+    if ode_opt.get("method") == "fixed_midpoint":
+        from sam_audio.model.model import _fixed_midpoint_integrate
+
+        return _fixed_midpoint_integrate(vector_field, noise, ode_opt.get("options", {}))
+
+    from torchdiffeq import odeint
+
+    states = odeint(
+        vector_field,
+        noise,
+        torch.tensor([0.0, 1.0], device=noise.device),
+        **ode_opt,
+    )
+    return states[-1]
+
+
+def timed_stage(stage_ms: dict[str, float], name: str, fn: Any):
+    cuda_sync()
+    start = now_ms()
+    result = fn()
+    cuda_sync()
+    stage_ms[name] = round(now_ms() - start, 3)
+    return result
+
+
+def stage_percentages(stage_ms: dict[str, float]) -> dict[str, float]:
+    total = sum(stage_ms.get(stage, 0.0) for stage in STAGE_KEYS)
+    if total <= 0:
+        return {}
+    return {
+        stage: round(stage_ms.get(stage, 0.0) / total * 100.0, 1)
+        for stage in STAGE_KEYS
+    }
+
+
+def profile_standard_separation(
+    model: Any,
+    batch: Any,
+    args: argparse.Namespace,
+) -> tuple[Any, dict[str, float], dict[str, float]]:
+    from sam_audio.model.model import DFLT_ODE_OPT, SeparationResult
+
+    if args.reranking == "adaptive" or args.cache_conditioning:
+        raise ValueError("stage profiling is only implemented for the standard separation path")
+
+    reranking = int(args.reranking)
+    stage_ms: dict[str, float] = {}
+
+    forward_args = timed_stage(
+        stage_ms,
+        "encoding",
+        lambda: model._get_forward_args(batch, candidates=reranking),
+    )
+
+    def maybe_predict_spans():
+        nonlocal batch, forward_args
+        if args.predict_spans and hasattr(model, "span_predictor") and batch.anchors is None:
+            batch = model.predict_spans(
+                batch=batch,
+                audio_features=model._unrepeat_from_reranking(
+                    forward_args["audio_features"], reranking
+                ),
+                audio_pad_mask=model._unrepeat_from_reranking(
+                    forward_args["audio_pad_mask"], reranking
+                ),
+            )
+            forward_args.update(
+                {
+                    "anchor_ids": model._repeat_for_reranking(
+                        batch.anchor_ids, reranking
+                    ),
+                    "anchor_alignment": model._repeat_for_reranking(
+                        batch.anchor_alignment, reranking
+                    ),
+                }
+            )
+
+    timed_stage(stage_ms, "span_prediction", maybe_predict_spans)
+
+    audio_features = forward_args["audio_features"]
+    batch_size, feature_steps, channels = audio_features.shape
+    latent_channels = channels // 2
+    noise = torch.randn_like(audio_features)
+
+    def vector_field(t, noisy_audio):
+        return model.forward(
+            noisy_audio=noisy_audio,
+            time=t.expand(noisy_audio.size(0)),
+            **forward_args,
+        )
+
+    ode_opt = make_separate_kwargs(args).get("ode_opt", DFLT_ODE_OPT)
+    generated = timed_stage(
+        stage_ms,
+        "ode_generation",
+        lambda: solve_ode(vector_field, noise, ode_opt),
+    )
+
+    def decode():
+        generated_features = generated.transpose(1, 2)
+        return model.audio_codec.decode(
+            generated_features.reshape(2 * batch_size, latent_channels, feature_steps)
+        ).view(batch_size, 2, -1)
+
+    wavs = timed_stage(stage_ms, "audio_decoding", decode)
+
+    bsz = wavs.size(0) // reranking
+    sizes = model.audio_codec.feature_idx_to_wav_idx(batch.sizes)
+    target_wavs = model.unbatch(wavs[:, 0].view(bsz, reranking, -1), sizes)
+    residual_wavs = model.unbatch(wavs[:, 1].view(bsz, reranking, -1), sizes)
+
+    def rerank():
+        if (
+            reranking > 1
+            and batch.masked_video is not None
+            and model.visual_ranker is not None
+        ):
+            scores = model.visual_ranker(
+                extracted_audio=target_wavs,
+                videos=batch.masked_video,
+                sample_rate=model.audio_codec.sample_rate,
+            )
+            return scores.argmax(dim=1)
+
+        if reranking > 1 and model.text_ranker is not None:
+            input_audio = [
+                audio[:, :size].expand(reranking, -1)
+                for audio, size in zip(batch.audios, sizes, strict=False)
+            ]
+            scores = model.text_ranker(
+                extracted_audio=target_wavs,
+                input_audio=input_audio,
+                descriptions=batch.descriptions,
+                sample_rate=model.audio_codec.sample_rate,
+            )
+            return scores.argmax(dim=1)
+
+        return torch.zeros(bsz, dtype=torch.long, device=noise.device)
+
+    idxs = timed_stage(stage_ms, "reranking", rerank)
+    result = SeparationResult(
+        target=[wav[idx] for wav, idx in zip(target_wavs, idxs, strict=False)],
+        residual=[wav[idx] for wav, idx in zip(residual_wavs, idxs, strict=False)],
+        noise=noise,
+    )
+    return result, stage_ms, stage_percentages(stage_ms)
+
+
 def run_one(
     *,
     model: Any,
@@ -320,8 +498,14 @@ def run_one(
         torch.cuda.reset_peak_memory_stats()
 
     inference_start = now_ms()
+    stage_ms = None
+    stage_percent = None
     with sdpa_context(args.sdpa_backend):
-        if args.cache_conditioning:
+        if args.stage_profile and args.reranking != "adaptive" and not args.cache_conditioning:
+            result, stage_ms, stage_percent = profile_standard_separation(
+                model, batch, args
+            )
+        elif args.cache_conditioning:
             handle = model.prepare_audio(
                 batch,
                 candidates=candidate_count(args),
@@ -380,6 +564,9 @@ def run_one(
         "total_ms": round(total_ms, 3),
         "peak_allocated_gb": peak_allocated,
         "peak_reserved_gb": peak_reserved,
+        "stage_profile": stage_ms is not None,
+        "stage_ms": stage_ms,
+        "stage_percent": stage_percent,
         "artifacts": artifacts,
     }
     write_jsonl(metrics_path, row)

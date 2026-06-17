@@ -74,6 +74,11 @@ fields = [
     "mean_inference_ms",
     "max_peak_allocated_gb",
     "max_peak_reserved_gb",
+    "mean_encoding_ms",
+    "mean_span_prediction_ms",
+    "mean_ode_generation_ms",
+    "mean_audio_decoding_ms",
+    "mean_reranking_ms",
 ]
 with out.open("w", newline="") as fout:
     writer = csv.DictWriter(fout, fieldnames=fields)
