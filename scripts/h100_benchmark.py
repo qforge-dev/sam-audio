@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--limit-audios", type=int, default=None)
+    parser.add_argument(
+        "--prompt-batch-size",
+        type=int,
+        default=1,
+        help="Number of prompts to process simultaneously for one audio file.",
+    )
     parser.add_argument("--max-audio-seconds", type=float, default=35.0)
     parser.add_argument("--max-save-items", type=int, default=3)
     parser.add_argument("--fixed-midpoint", action="store_true")
@@ -308,6 +314,19 @@ def save_outputs(
     return artifacts
 
 
+def add_stage_timings(
+    aggregate: dict[str, float] | None,
+    stage_ms: dict[str, float] | None,
+) -> dict[str, float] | None:
+    if stage_ms is None:
+        return aggregate
+    if aggregate is None:
+        aggregate = {}
+    for stage, value in stage_ms.items():
+        aggregate[stage] = round(aggregate.get(stage, 0.0) + float(value), 3)
+    return aggregate
+
+
 def make_separate_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"predict_spans": args.predict_spans}
     if args.reranking != "adaptive":
@@ -501,56 +520,88 @@ def run_one(
 
     set_seed(args.seed + run_index)
     total_start = now_ms()
-    process_start = now_ms()
-    batch = processor(audios=[str(audio_path)] * len(prompts), descriptions=prompts).to(device)
-    if dtype != torch.float32:
-        batch.audios = batch.audios.to(dtype)
-    cuda_sync()
-    process_ms = now_ms() - process_start
+    total_process_ms = 0.0
+    total_inference_ms = 0.0
+    total_save_ms = 0.0
+    stage_ms = None
+    artifacts: list[dict[str, str]] = []
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    inference_start = now_ms()
-    stage_ms = None
-    stage_percent = None
-    with sdpa_context(args.sdpa_backend):
-        if args.stage_profile and args.reranking != "adaptive" and not args.cache_conditioning:
-            result, stage_ms, stage_percent = profile_standard_separation(
-                model, batch, args
-            )
-        elif args.cache_conditioning:
-            handle = model.prepare_audio(
-                batch,
-                candidates=candidate_count(args),
-                predict_spans=args.predict_spans,
-            )
-            result = model.separate_prepared(handle, prompts=prompts, **make_separate_kwargs(args))
-        elif args.reranking == "adaptive":
-            result = model.separate_adaptive_rerank(
-                batch,
-                predict_spans=args.predict_spans,
-                initial_candidates=args.adaptive_initial_candidates,
-                max_candidates=args.adaptive_max_candidates,
-                margin=args.adaptive_margin,
-            )
-        else:
-            result = model.separate(batch, **make_separate_kwargs(args))
-    cuda_sync()
-    inference_ms = now_ms() - inference_start
+    for chunk_index, prompt_start in enumerate(
+        range(0, len(prompts), args.prompt_batch_size)
+    ):
+        chunk_prompts = prompts[prompt_start : prompt_start + args.prompt_batch_size]
 
-    save_start = now_ms()
-    artifact_dir = run_dir / "artifacts" / phase / f"{run_index:04d}_{audio_path.stem}"
-    artifacts = save_outputs(
-        result,
-        processor.audio_sampling_rate,
-        artifact_dir,
-        audio_path,
-        prompts,
-        args.max_save_items,
-    )
-    save_ms = now_ms() - save_start
+        process_start = now_ms()
+        batch = processor(
+            audios=[str(audio_path)] * len(chunk_prompts),
+            descriptions=chunk_prompts,
+        ).to(device)
+        if dtype != torch.float32:
+            batch.audios = batch.audios.to(dtype)
+        cuda_sync()
+        total_process_ms += now_ms() - process_start
+
+        inference_start = now_ms()
+        chunk_stage_ms = None
+        with sdpa_context(args.sdpa_backend):
+            if (
+                args.stage_profile
+                and args.reranking != "adaptive"
+                and not args.cache_conditioning
+            ):
+                result, chunk_stage_ms, _ = profile_standard_separation(
+                    model, batch, args
+                )
+            elif args.cache_conditioning:
+                handle = model.prepare_audio(
+                    batch,
+                    candidates=candidate_count(args),
+                    predict_spans=args.predict_spans,
+                )
+                result = model.separate_prepared(
+                    handle, prompts=chunk_prompts, **make_separate_kwargs(args)
+                )
+            elif args.reranking == "adaptive":
+                result = model.separate_adaptive_rerank(
+                    batch,
+                    predict_spans=args.predict_spans,
+                    initial_candidates=args.adaptive_initial_candidates,
+                    max_candidates=args.adaptive_max_candidates,
+                    margin=args.adaptive_margin,
+                )
+            else:
+                result = model.separate(batch, **make_separate_kwargs(args))
+        cuda_sync()
+        total_inference_ms += now_ms() - inference_start
+        stage_ms = add_stage_timings(stage_ms, chunk_stage_ms)
+
+        save_start = now_ms()
+        artifact_dir = (
+            run_dir
+            / "artifacts"
+            / phase
+            / f"{run_index:04d}_{audio_path.stem}"
+            / f"prompt_chunk_{chunk_index:02d}"
+        )
+        artifacts.extend(
+            save_outputs(
+                result,
+                processor.audio_sampling_rate,
+                artifact_dir,
+                audio_path,
+                chunk_prompts,
+                args.max_save_items,
+            )
+        )
+        total_save_ms += now_ms() - save_start
+        del result, batch
+        cuda_sync()
+
     total_ms = now_ms() - total_start
+    stage_percent = stage_percentages(stage_ms) if stage_ms is not None else None
 
     peak_allocated = None
     peak_reserved = None
@@ -569,13 +620,14 @@ def run_one(
         "dtype_policy": args.dtype_policy,
         "reranking": args.reranking,
         "predict_spans": args.predict_spans,
+        "prompt_batch_size": args.prompt_batch_size,
         "fixed_midpoint": args.fixed_midpoint,
         "cache_conditioning": args.cache_conditioning,
         "compile_transformer": args.compile_transformer,
         "sdpa_backend": args.sdpa_backend,
-        "process_ms": round(process_ms, 3),
-        "inference_ms": round(inference_ms, 3),
-        "save_ms": round(save_ms, 3),
+        "process_ms": round(total_process_ms, 3),
+        "inference_ms": round(total_inference_ms, 3),
+        "save_ms": round(total_save_ms, 3),
         "total_ms": round(total_ms, 3),
         "peak_allocated_gb": peak_allocated,
         "peak_reserved_gb": peak_reserved,
@@ -590,6 +642,8 @@ def run_one(
 
 def main() -> int:
     args = parse_args()
+    if args.prompt_batch_size < 1:
+        raise ValueError("--prompt-batch-size must be >= 1")
     args.run_name = args.run_name or (
         f"{args.dtype_policy}_rerank-{args.reranking}"
         f"{'_fixed' if args.fixed_midpoint else ''}"
@@ -684,28 +738,34 @@ def main() -> int:
 
     for warmup_index in range(args.warmup):
         set_seed(args.seed + warmup_index)
-        batch = processor(audios=[str(audio_files[0])] * len(prompts), descriptions=prompts).to("cuda")
-        if dtype != torch.float32:
-            batch.audios = batch.audios.to(dtype)
-        with sdpa_context(args.sdpa_backend):
-            if args.cache_conditioning:
-                handle = model.prepare_audio(
-                    batch,
-                    candidates=candidate_count(args),
-                    predict_spans=args.predict_spans,
-                )
-                model.separate_prepared(handle, **make_separate_kwargs(args))
-            elif args.reranking == "adaptive":
-                model.separate_adaptive_rerank(
-                    batch,
-                    predict_spans=args.predict_spans,
-                    initial_candidates=args.adaptive_initial_candidates,
-                    max_candidates=args.adaptive_max_candidates,
-                    margin=args.adaptive_margin,
-                )
-            else:
-                model.separate(batch, **make_separate_kwargs(args))
-        cuda_sync()
+        for prompt_start in range(0, len(prompts), args.prompt_batch_size):
+            chunk_prompts = prompts[prompt_start : prompt_start + args.prompt_batch_size]
+            batch = processor(
+                audios=[str(audio_files[0])] * len(chunk_prompts),
+                descriptions=chunk_prompts,
+            ).to("cuda")
+            if dtype != torch.float32:
+                batch.audios = batch.audios.to(dtype)
+            with sdpa_context(args.sdpa_backend):
+                if args.cache_conditioning:
+                    handle = model.prepare_audio(
+                        batch,
+                        candidates=candidate_count(args),
+                        predict_spans=args.predict_spans,
+                    )
+                    model.separate_prepared(handle, **make_separate_kwargs(args))
+                elif args.reranking == "adaptive":
+                    model.separate_adaptive_rerank(
+                        batch,
+                        predict_spans=args.predict_spans,
+                        initial_candidates=args.adaptive_initial_candidates,
+                        max_candidates=args.adaptive_max_candidates,
+                        margin=args.adaptive_margin,
+                    )
+                else:
+                    model.separate(batch, **make_separate_kwargs(args))
+            del batch
+            cuda_sync()
 
     warm_start = now_ms()
     warm_runs = 0
