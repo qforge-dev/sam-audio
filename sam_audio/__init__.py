@@ -2,3 +2,4 @@
 
 from .model import *  # noqa
 from .processor import *  # noqa
+from .batching import *  # noqa

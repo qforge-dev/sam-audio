@@ -1,4 +1,5 @@
 __pycache__
+.DS_Store
 *.egg-info
 *.pyc
 *.so
@@ -6,3 +7,4 @@ build
 dist
 .checkpoints
 .ipynb_checkpoints
+h100_benchmark_artifacts/

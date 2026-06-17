@@ -63,16 +63,22 @@ class Batch:
     def _wav_to_feature_idx(self, wav_idx: int):
         return math.ceil(wav_idx / self.hop_length)
 
-    def to(self, device: torch.device):
-        self.audios = self.audios.to(device)
-        self.anchor_ids = self.anchor_ids.to(device)
-        self.anchor_alignment = self.anchor_alignment.to(device)
-        self.sizes = self.sizes.to(device)
-        self.wav_sizes = self.wav_sizes.to(device)
+    def to(self, device: torch.device, non_blocking: bool = False):
+        self.audios = self.audios.to(device, non_blocking=non_blocking)
+        self.anchor_ids = self.anchor_ids.to(device, non_blocking=non_blocking)
+        self.anchor_alignment = self.anchor_alignment.to(
+            device, non_blocking=non_blocking
+        )
+        self.sizes = self.sizes.to(device, non_blocking=non_blocking)
+        self.wav_sizes = self.wav_sizes.to(device, non_blocking=non_blocking)
         if self.audio_pad_mask is not None:
-            self.audio_pad_mask = self.audio_pad_mask.to(device)
+            self.audio_pad_mask = self.audio_pad_mask.to(
+                device, non_blocking=non_blocking
+            )
         if self.masked_video is not None:
-            self.masked_video = [v.to(device) for v in self.masked_video]
+            self.masked_video = [
+                v.to(device, non_blocking=non_blocking) for v in self.masked_video
+            ]
         return self
 
     def process_anchors(self, anchors: Optional[list[list[Anchor]]]):

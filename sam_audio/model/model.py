@@ -53,6 +53,30 @@ def _fixed_midpoint_integrate(vector_field, y0: torch.Tensor, options: Dict[str,
     return y
 
 
+def _fixed_midpoint_step(
+    vector_field,
+    y: torch.Tensor,
+    step_index: int,
+    steps: int,
+    options: Dict[str, Any],
+):
+    """Advance one fixed-grid midpoint step for externally scheduled inference."""
+    if steps <= 0:
+        raise ValueError(f"`steps` must be positive, got {steps}")
+    t0 = float(options.get("t0", 0.0))
+    t1 = float(options.get("t1", 1.0))
+    step_size = (t1 - t0) / steps
+    current_t = t0 + step_index * step_size
+    dt = min(step_size, t1 - current_t)
+    if dt <= 0:
+        return y
+    start_t = y.new_tensor(current_t)
+    midpoint_t = y.new_tensor(current_t + 0.5 * dt)
+    k1 = vector_field(start_t, y)
+    midpoint_y = y + 0.5 * dt * k1
+    return y + dt * vector_field(midpoint_t, midpoint_y)
+
+
 class SinusoidalEmbedding(torch.nn.Module):
     def __init__(self, dim, theta=10000):
         super().__init__()
@@ -677,6 +701,53 @@ class SAMAudio(BaseModel):
             wavs[:, 1].view(bsz, prepared.candidates, -1), sizes
         )
         return target_wavs, residual_wavs, noise
+
+    def continuous_fixed_midpoint_step(
+        self,
+        prepared: PreparedSeparation,
+        noisy_audio: torch.Tensor,
+        step_index: int,
+        steps: int,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        options = options or {}
+
+        def vector_field(t, current_noisy_audio):
+            return self.forward_prepared(
+                noisy_audio=current_noisy_audio,
+                prepared=prepared,
+                time=t.expand(current_noisy_audio.size(0)),
+            )
+
+        return _fixed_midpoint_step(
+            vector_field,
+            noisy_audio,
+            step_index=step_index,
+            steps=steps,
+            options=options,
+        )
+
+    def decode_prepared_candidate_wavs(
+        self,
+        prepared: PreparedSeparation,
+        generated: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        audio_features = prepared.forward_args["audio_features"]
+        B, T, C = audio_features.shape
+        C = C // 2
+        generated_features = generated.transpose(1, 2)
+        wavs = self.audio_codec.decode(generated_features.reshape(2 * B, C, T)).view(
+            B, 2, -1
+        )
+        bsz = wavs.size(0) // prepared.candidates
+        sizes = self.audio_codec.feature_idx_to_wav_idx(prepared.batch.sizes)
+        target_wavs = self.unbatch(
+            wavs[:, 0].view(bsz, prepared.candidates, -1), sizes
+        )
+        residual_wavs = self.unbatch(
+            wavs[:, 1].view(bsz, prepared.candidates, -1), sizes
+        )
+        return target_wavs, residual_wavs
 
     def _score_candidate_wavs(
         self,
