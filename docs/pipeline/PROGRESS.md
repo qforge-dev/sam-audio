@@ -28,6 +28,8 @@ was an example batch size, not a workflow limit.
   voice transcription with diarization.
 - [x] Acquire and persist a reproducible AudioSet reference/calibration set.
 - [x] Implement job/queue dashboard and keyboard-first review UI.
+- [x] Add exact review backlog counts, dataset size/processing metrics, and the
+  original-plus-stems source explorer.
 - [x] Add persistent datasets, successive upload jobs, and reconciliation of
   uploaded/stale work from DynamoDB back into SQS.
 - [x] Provision AWS, deploy services, and run a multi-file end-to-end test.
@@ -48,6 +50,23 @@ was an example batch size, not a workflow limit.
   and a least-privilege instance profile attached to the H100 host.
 - AudioSet calibration set `references/audioset/v1/` contains 8 private WAVs,
   `manifest.json`, and `manifest.sha256`.
+- Seeded AudioSet validation set `references/audioset/random-100-v1/` contains
+  100 private WAVs from 100 unique YouTube videos plus the manifest/checksum.
+  All 100 records retain their official AudioSet start/end timestamps and
+  labels; 28 unavailable candidates remain in the manifest as provenance. The
+  successful clips total 996.795 seconds, and the 102 reference objects total
+  191,551,793 bytes.
+- Dataset `991945c1f082446a9ff66d482838f964`, job
+  `3f0233f2442f4044a0f2967c68cb5a89`, completed all 100 sources and chunks with
+  zero failed chunks. It stored 284 audible stems (94 music, 91 voice, 99 SFX)
+  and omitted 16 below-gate outputs (6 music, 9 voice, 1 SFX). The selected
+  route was music-first for 63 sounds and voice-first for 37.
+- The completed random dataset contains 624.4 MiB of indexed originals,
+  normalized chunks, and stems. Automatic verification placed 161 stems in
+  success, 54 in uncertain, and 69 in failure, leaving 123 review items.
+- Browser verification confirms the review screen shows exact remaining,
+  failure, and uncertain counts; the dataset screen shows 100 sounds and its
+  storage breakdown; and gated stems are absent from the stacked track view.
 - Multi-file job `bd85486f9d314c258956cac9b81a730f` completed: one 30-second
   audible source produced exactly one chunk and three stems; one silent source
   was sound-gated without GPU work; all three Audio Flamingo tasks completed.
@@ -57,7 +76,8 @@ was an example batch size, not a workflow limit.
 - Recovery job `1d07979ee96a45a98cf220b102fd7006` was uploaded without the
   completion callback. Reconciliation found the S3 object, enqueued ingestion,
   and completed it as sound-gated. All three queues were empty afterward.
-- Remote validation: 13 pipeline tests and 12 SAM batching tests pass.
+- Local and remote validation: 24 pipeline tests pass; the existing 12 SAM
+  batching tests also pass.
 - Docker build execution remains unverified because neither the local Mac nor
   the current H100 host has a Docker daemon. Both Dockerfiles remain model-free.
 

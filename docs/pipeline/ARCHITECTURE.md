@@ -36,9 +36,15 @@ rule are persisted under `adaptive_routing`.
    analysis per audible source, one description per music stem, and one
    speaker-labelled transcript per voice stem. Tasks exist in DynamoDB before
    SQS delivery and are reconciled after worker/message loss.
-8. A browser dashboard shows job/queue progress. Its reviewer mode pulls the
-   next `uncertain` or `failure` assertion, starts audio automatically, displays
-   the prompt/assertion, and accepts one-key decisions.
+8. A browser dashboard shows job/queue progress and exact remaining review
+   counts. Its reviewer mode pulls the next `uncertain` or `failure` assertion,
+   starts audio automatically, displays the prompt/assertion, and accepts
+   one-key decisions.
+9. The dataset explorer reports source count, duration, input/chunk/stem storage,
+   processing counts, stem mix, and review backlog. Each source displays the
+   original recording first, then only the music/voice/SFX stems that passed the
+   output sound gate, grouped by chunk, followed by its processing route and
+   model annotations.
 
 ## AWS resources
 
@@ -117,6 +123,14 @@ The deployed `references/audioset/v1/` set contains eight 10-second WAVs
 manifest, and a manifest checksum. AudioSet metadata is CC BY 4.0 and its
 ontology is CC BY-SA 4.0; the underlying YouTube media retains its source rights
 and therefore remains private rather than being redistributed with the code.
+
+The acquisition CLI also supports a seeded random cross-ontology sample with
+`--total` and `--seed`. It shuffles official evaluation/balanced metadata,
+downloads the published YouTube time ranges, records successful and unavailable
+source IDs, hashes every retrieved WAV, and can upload the private set and
+manifest to S3. The companion manifest submitter retains video ID, labels,
+source start/end timestamps, licenses, and checksums on each pipeline source
+record.
 
 ## Model licensing
 

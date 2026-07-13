@@ -94,7 +94,11 @@ class PipelineAWS:
             kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 
     def query_index(
-        self, index_pk: str, *, limit: int = 50, newest_first: bool = False
+        self,
+        index_pk: str,
+        *,
+        limit: int | None = 50,
+        newest_first: bool = False,
     ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         kwargs: dict[str, Any] = {
@@ -102,14 +106,29 @@ class PipelineAWS:
             "KeyConditionExpression": Key("GSI1PK").eq(index_pk),
             "ScanIndexForward": not newest_first,
         }
-        while len(items) < limit:
-            kwargs["Limit"] = limit - len(items)
+        while limit is None or len(items) < limit:
+            if limit is not None:
+                kwargs["Limit"] = limit - len(items)
             response = self.table.query(**kwargs)
             items.extend(_plain(item) for item in response.get("Items", []))
             if "LastEvaluatedKey" not in response:
                 break
             kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
         return items
+
+    def count_index(self, index_pk: str) -> int:
+        total = 0
+        kwargs: dict[str, Any] = {
+            "IndexName": "GSI1",
+            "KeyConditionExpression": Key("GSI1PK").eq(index_pk),
+            "Select": "COUNT",
+        }
+        while True:
+            response = self.table.query(**kwargs)
+            total += int(response.get("Count", 0))
+            if "LastEvaluatedKey" not in response:
+                return total
+            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 
     def ensure_dataset(self, dataset_id: str, name: str) -> dict[str, Any]:
         existing = self.get(f"DATASET#{dataset_id}", "META")
@@ -162,7 +181,12 @@ class PipelineAWS:
         )
 
     def create_source(
-        self, job_id: str, source_id: str, filename: str, s3_key: str
+        self,
+        job_id: str,
+        source_id: str,
+        filename: str,
+        s3_key: str,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         self.put(
             {
@@ -173,6 +197,7 @@ class PipelineAWS:
                 "source_id": source_id,
                 "filename": filename,
                 "s3_key": s3_key,
+                "source_metadata": metadata or {},
                 "status": "uploading",
                 "created_at": utc_now(),
             }
@@ -199,10 +224,10 @@ class PipelineAWS:
         self.put(item)
         return review_id
 
-    def put_model_task(self, task: QueueTask, queue_name: str) -> None:
+    def put_model_task(self, task: QueueTask, queue_name: str) -> bool:
         existing = self.get(f"JOB#{task.job_id}", f"TASK#{task.task_id}")
         if existing:
-            return
+            return False
         self.put(
             {
                 "PK": f"JOB#{task.job_id}",
@@ -220,6 +245,7 @@ class PipelineAWS:
                 "updated_at": task.created_at,
             }
         )
+        return True
 
     def record_review(
         self,
@@ -286,6 +312,15 @@ class PipelineAWS:
                 return False
             raise
         return True
+
+    def object_size(self, key: str) -> int:
+        try:
+            response = self.s3.head_object(Bucket=self.settings.bucket, Key=key)
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") in {"404", "NoSuchKey"}:
+                return 0
+            raise
+        return int(response.get("ContentLength", 0))
 
     def upload_file(self, path: Path, key: str, content_type: str) -> None:
         self.s3.upload_file(

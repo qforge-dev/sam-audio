@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import uuid
+from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,43 @@ PROMPTS = {
 }
 
 
+def _terminal_job_summary(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the durable terminal summary once every source has been split."""
+    sources = [item for item in items if item.get("entity") == "source"]
+    chunks = [item for item in items if item.get("entity") == "chunk"]
+    if (
+        not sources
+        or not chunks
+        or not all(
+            source.get("status") in {"chunked", "complete"} for source in sources
+        )
+        or not all(chunk.get("status") in TERMINAL_CHUNK_STATES for chunk in chunks)
+    ):
+        return None
+    stems = [item for item in items if item.get("entity") == "stem"]
+    tasks = [item for item in items if item.get("entity") == "model_task"]
+    expected_tasks = sum(
+        1 for source in sources if source.get("audible_chunk_count", 0) > 0
+    ) + sum(1 for stem in stems if stem.get("stem_type") in {"music", "voice"})
+    annotations_complete = (
+        expected_tasks > 0
+        and len(tasks) >= expected_tasks
+        and all(task.get("status") == "complete" for task in tasks)
+    )
+    failed_chunks = sum(chunk.get("status") == "failed" for chunk in chunks)
+    if failed_chunks:
+        status = "partial" if annotations_complete else "stems_ready"
+    else:
+        status = "complete" if annotations_complete else "stems_ready"
+    return {
+        "status": status,
+        "completed_sources": len(sources),
+        "completed_chunks": len(chunks),
+        "failed_chunks": failed_chunks,
+        "updated_at": utc_now(),
+    }
+
+
 class IngestHandler:
     def __init__(self, settings: Settings, aws: PipelineAWS):
         self.settings = settings
@@ -48,11 +86,13 @@ class IngestHandler:
             source_key,
             {"status": "running", "updated_at": utc_now()},
         )
+        separation_tasks: list[QueueTask] = []
         with tempfile.TemporaryDirectory(prefix="sam-ingest-") as temporary:
             root = Path(temporary)
             suffix = Path(source["filename"]).suffix or ".audio"
             local_source = root / f"source{suffix}"
             self.aws.download_file(source["s3_key"], local_source)
+            source_bytes = local_source.stat().st_size
             chunks = chunk_audio(
                 local_source,
                 root / "chunks",
@@ -67,9 +107,35 @@ class IngestHandler:
                 chunk_key = (
                     f"jobs/{task.job_id}/chunks/{task.source_id}/{chunk.chunk_id}.wav"
                 )
+                chunk_sk = f"CHUNK#{task.source_id}#{chunk.chunk_id}"
+                existing = self.aws.get(f"JOB#{task.job_id}", chunk_sk)
+                if existing:
+                    if existing.get("gate", {}).get("audible"):
+                        audible_count += 1
+                        if not self.aws.object_exists(str(existing["s3_key"])):
+                            self.aws.upload_file(chunk.path, chunk_key, "audio/wav")
+                        if existing.get("status") == "failed":
+                            self.aws.update(
+                                f"JOB#{task.job_id}",
+                                chunk_sk,
+                                {"status": "queued", "updated_at": utc_now()},
+                            )
+                            separation_tasks.append(
+                                QueueTask(
+                                    task_id=(
+                                        f"sam:{task.job_id}:{task.source_id}:"
+                                        f"{chunk.chunk_id}"
+                                    ),
+                                    task_type="separate_chunk",
+                                    job_id=task.job_id,
+                                    source_id=task.source_id,
+                                    chunk_id=chunk.chunk_id,
+                                )
+                            )
+                    continue
                 item = {
                     "PK": f"JOB#{task.job_id}",
-                    "SK": f"CHUNK#{task.source_id}#{chunk.chunk_id}",
+                    "SK": chunk_sk,
                     "entity": "chunk",
                     "job_id": task.job_id,
                     "source_id": task.source_id,
@@ -80,6 +146,7 @@ class IngestHandler:
                     "gate": chunk.gate.model_dump(mode="json"),
                     "status": "queued" if chunk.gate.audible else "skipped",
                     "s3_key": chunk_key if chunk.gate.audible else None,
+                    "bytes": chunk.path.stat().st_size if chunk.gate.audible else 0,
                     "created_at": utc_now(),
                     "updated_at": utc_now(),
                 }
@@ -95,17 +162,7 @@ class IngestHandler:
                     source_id=task.source_id,
                     chunk_id=chunk.chunk_id,
                 )
-                self.aws.send_task(self.settings.sam_queue_url, separation_task)
-
-        if audible_count:
-            scene_task = QueueTask(
-                task_id=f"scene:{task.job_id}:{task.source_id}",
-                task_type="describe_scene",
-                job_id=task.job_id,
-                source_id=task.source_id,
-            )
-            self.aws.put_model_task(scene_task, "flamingo")
-            self.aws.send_task(self.settings.flamingo_queue_url, scene_task)
+                separation_tasks.append(separation_task)
         status = "chunked" if audible_count else "complete"
         self.aws.update(
             f"JOB#{task.job_id}",
@@ -114,10 +171,25 @@ class IngestHandler:
                 "status": status,
                 "chunk_count": len(chunks),
                 "audible_chunk_count": audible_count,
+                "bytes": source_bytes,
+                "duration_seconds": max(
+                    (chunk.end_seconds for chunk in chunks), default=0.0
+                ),
                 "source_sha256": source_sha256,
                 "updated_at": utc_now(),
             },
         )
+        for separation_task in separation_tasks:
+            self.aws.send_task(self.settings.sam_queue_url, separation_task)
+        if audible_count:
+            scene_task = QueueTask(
+                task_id=f"scene:{task.job_id}:{task.source_id}",
+                task_type="describe_scene",
+                job_id=task.job_id,
+                source_id=task.source_id,
+            )
+            if self.aws.put_model_task(scene_task, "flamingo"):
+                self.aws.send_task(self.settings.flamingo_queue_url, scene_task)
         self._refresh_job(task.job_id)
 
     def _refresh_job(self, job_id: str) -> None:
@@ -227,6 +299,7 @@ class SeparationHandler:
                     assertion=ASSERTIONS[stem_type],
                     s3_key=stem_key,
                     sha256=sha256_file(stem_path),
+                    bytes=stem_path.stat().st_size,
                     automatic_status=statuses[stem_type],
                     effective_status=statuses[stem_type],
                     model=result.metadata.get("model", "unknown"),
@@ -367,34 +440,15 @@ class SeparationHandler:
             source_id=task.source_id,
             chunk_id=task.chunk_id,
         )
-        self.aws.put_model_task(flamingo_task, "flamingo")
-        self.aws.send_task(self.settings.flamingo_queue_url, flamingo_task)
+        if self.aws.put_model_task(flamingo_task, "flamingo"):
+            self.aws.send_task(self.settings.flamingo_queue_url, flamingo_task)
 
     def _refresh_job(self, job_id: str) -> None:
         items = self.aws.query_partition(f"JOB#{job_id}")
-        chunks = [item for item in items if item.get("entity") == "chunk"]
-        sources = [item for item in items if item.get("entity") == "source"]
-        if (
-            not chunks
-            or not sources
-            or not all(
-                source.get("status") in {"chunked", "complete"} for source in sources
-            )
-            or not all(chunk.get("status") in TERMINAL_CHUNK_STATES for chunk in chunks)
-        ):
+        summary = _terminal_job_summary(items)
+        if not summary:
             return
-        failures = [chunk for chunk in chunks if chunk.get("status") == "failed"]
-        status = "partial" if failures else "stems_ready"
-        self.aws.update(
-            f"JOB#{job_id}",
-            "META",
-            {
-                "status": status,
-                "completed_chunks": len(chunks),
-                "failed_chunks": len(failures),
-                "updated_at": utc_now(),
-            },
-        )
+        self.aws.update(f"JOB#{job_id}", "META", summary)
 
 
 class Reconciler:
@@ -420,10 +474,29 @@ class Reconciler:
         recovered = {"ingest": 0, "sam": 0}
         jobs = self.aws.query_index("JOBS", limit=10_000, newest_first=False)
         for job in jobs:
-            if job.get("status") in {"complete", "failed"}:
+            if job.get("status") == "failed" or (
+                job.get("status") == "complete"
+                and int(job.get("completed_sources") or 0)
+                >= int(job.get("source_count") or 0)
+            ):
                 continue
             job_id = job["job_id"]
             items = self.aws.query_partition(f"JOB#{job_id}")
+            stems_by_chunk: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(
+                list
+            )
+            results_by_chunk: dict[
+                tuple[str, str], list[dict[str, Any]]
+            ] = defaultdict(list)
+            for stem in items:
+                if stem.get("entity") == "stem":
+                    stems_by_chunk[
+                        (str(stem["source_id"]), str(stem["chunk_id"]))
+                    ].append(stem)
+                elif stem.get("entity") == "stem_result":
+                    results_by_chunk[
+                        (str(stem["source_id"]), str(stem["chunk_id"]))
+                    ].append(stem)
             for item in items:
                 entity = item.get("entity")
                 status = item.get("status")
@@ -434,13 +507,50 @@ class Reconciler:
                     elif status in {"queued", "running"} and self._stale(item, now):
                         self._enqueue_ingest(job_id, item)
                         recovered["ingest"] += 1
-                elif (
-                    entity == "chunk"
-                    and status in {"queued", "running"}
-                    and self._stale(item, now)
-                ):
-                    self._enqueue_sam(job_id, item)
-                    recovered["sam"] += 1
+                elif entity == "chunk" and status in {"queued", "running"}:
+                    chunk_stems = stems_by_chunk.get(
+                        (str(item["source_id"]), str(item["chunk_id"])), []
+                    )
+                    chunk_results = results_by_chunk.get(
+                        (str(item["source_id"]), str(item["chunk_id"])), []
+                    )
+                    metadata_key = (
+                        f"jobs/{job_id}/metadata/{item['source_id']}/"
+                        f"{item['chunk_id']}.json"
+                    )
+                    if (chunk_stems or chunk_results) and self.aws.object_exists(
+                        metadata_key
+                    ):
+                        sfx = next(
+                            (
+                                stem
+                                for stem in chunk_stems
+                                if stem.get("stem_type") == "sfx"
+                            ),
+                            None,
+                        )
+                        self.aws.update(
+                            f"JOB#{job_id}",
+                            item["SK"],
+                            {
+                                "status": "complete",
+                                "stored_stems": sorted(
+                                    str(stem["stem_type"]) for stem in chunk_stems
+                                ),
+                                "verification_status": (
+                                    sfx.get("automatic_status", "uncertain")
+                                    if sfx
+                                    else "uncertain"
+                                ),
+                                "metadata_s3_key": metadata_key,
+                                "updated_at": utc_now(),
+                            },
+                        )
+                        recovered.setdefault("sam_completed", 0)
+                        recovered["sam_completed"] += 1
+                    elif self._stale(item, now):
+                        self._enqueue_sam(job_id, item)
+                        recovered["sam"] += 1
                 elif (
                     entity == "model_task"
                     and item.get("queue") == "flamingo"
@@ -456,6 +566,10 @@ class Reconciler:
                     self.aws.send_task(self.settings.flamingo_queue_url, task)
                     recovered.setdefault("flamingo", 0)
                     recovered["flamingo"] += 1
+            refreshed_items = self.aws.query_partition(f"JOB#{job_id}")
+            summary = _terminal_job_summary(refreshed_items)
+            if summary:
+                self.aws.update(f"JOB#{job_id}", "META", summary)
         return recovered
 
     def _enqueue_ingest(self, job_id: str, source: dict[str, Any]) -> None:
@@ -601,21 +715,6 @@ class FlamingoHandler:
 
     def _refresh_job(self, job_id: str) -> None:
         items = self.aws.query_partition(f"JOB#{job_id}")
-        tasks = [item for item in items if item.get("entity") == "model_task"]
-        chunks = [item for item in items if item.get("entity") == "chunk"]
-        sources = [item for item in items if item.get("entity") == "source"]
-        stems = [item for item in items if item.get("entity") == "stem"]
-        expected_tasks = sum(
-            1 for item in sources if item.get("audible_chunk_count", 0) > 0
-        ) + sum(1 for item in stems if item.get("stem_type") in {"music", "voice"})
-        if (
-            expected_tasks > 0
-            and len(tasks) >= expected_tasks
-            and all(item.get("status") == "complete" for item in tasks)
-            and all(item.get("status") in TERMINAL_CHUNK_STATES for item in chunks)
-        ):
-            self.aws.update(
-                f"JOB#{job_id}",
-                "META",
-                {"status": "complete", "updated_at": utc_now()},
-            )
+        summary = _terminal_job_summary(items)
+        if summary and summary["status"] in {"complete", "partial"}:
+            self.aws.update(f"JOB#{job_id}", "META", summary)

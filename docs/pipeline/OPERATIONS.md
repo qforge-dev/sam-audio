@@ -48,11 +48,44 @@ ssh ubuntu@ec2-44-211-31-38.compute-1.amazonaws.com \
 ```bash
 curl -fsS http://127.0.0.1:18080/v1/overview | jq
 curl -fsS http://127.0.0.1:18080/v1/jobs/JOB_ID | jq
+curl -fsS http://127.0.0.1:18080/v1/review/stats | jq
+curl -fsS http://127.0.0.1:18080/v1/datasets/DATASET_ID/overview | jq
 ```
 
 DynamoDB is authoritative. A successful HTTP upload confirmation only means the
 source tasks are durable and queued; callers should poll the job endpoint rather
 than keep an inference request open.
+
+## AudioSet validation batches
+
+Acquire a reproducible random sample from the official AudioSet segment CSVs.
+Unavailable YouTube videos are retained as failed provenance entries and
+replacement candidates are tried until the requested successful count exists:
+
+```bash
+cd pipeline
+uv run sam-pipeline-audioset \
+  --output ~/Downloads/audioset-random-100 \
+  --total 100 \
+  --seed 20260713 \
+  --s3-bucket sam-audio-pipeline-artifactbucket-ndb3jfc3asyk \
+  --s3-prefix references/audioset/random-100-v1
+```
+
+Submit every successful manifest entry as one persistent dataset job while
+retaining its AudioSet labels and YouTube timestamps:
+
+```bash
+uv run sam-pipeline-submit \
+  --api http://127.0.0.1:18080 \
+  --manifest ~/Downloads/audioset-random-100/manifest.json \
+  --dataset-name "AudioSet random 100 · seed 20260713"
+```
+
+The verified seeded run is available in the panel as dataset
+`991945c1f082446a9ff66d482838f964`; its completed job is
+`3f0233f2442f4044a0f2967c68cb5a89`. The private reference prefix contains the
+100 timestamped WAVs plus `manifest.json` and `manifest.sha256`.
 
 ## Review controls
 

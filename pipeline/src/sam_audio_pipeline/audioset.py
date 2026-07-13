@@ -7,10 +7,13 @@ import csv
 import hashlib
 import json
 import logging
+import random
+import re
 import subprocess
 import sys
 import tempfile
 import urllib.request
+import wave
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -137,6 +140,64 @@ def select_manifest(cache_dir: Path, per_class: int) -> list[dict[str, Any]]:
     return manifest
 
 
+def select_random_manifest(
+    cache_dir: Path,
+    total: int,
+    *,
+    seed: int,
+    candidate_multiplier: int = 8,
+) -> list[dict[str, Any]]:
+    """Select reproducible random AudioSet segments across all labels."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    ontology_path = cache_dir / "ontology.json"
+    if not ontology_path.exists():
+        _download(ONTOLOGY_URL, ontology_path)
+    ontology_sha256 = sha256_file(ontology_path)
+    ontology = json.loads(ontology_path.read_text())
+    names = {item["id"]: item["name"] for item in ontology}
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for url in CSV_URLS:
+        csv_path = cache_dir / url.rsplit("/", 1)[-1]
+        if not csv_path.exists():
+            _download(url, csv_path)
+        for segment in _segments(csv_path):
+            if segment["video_id"] in seen:
+                continue
+            seen.add(segment["video_id"])
+            candidates.append(
+                {
+                    **segment,
+                    "label_names": [
+                        names.get(label, label) for label in segment["labels"]
+                    ],
+                    "dataset_csv": url,
+                    "ontology_url": ONTOLOGY_URL,
+                    "ontology_sha256": ontology_sha256,
+                    "source_url": (
+                        f"https://www.youtube.com/watch?v={segment['video_id']}"
+                    ),
+                    "selection": "seeded_random",
+                    "selection_seed": seed,
+                    "audioset_metadata_license": "CC BY 4.0",
+                    "audioset_ontology_license": "CC BY-SA 4.0",
+                    "source_audio_rights": (
+                        "Underlying media remains subject to its source terms."
+                    ),
+                }
+            )
+    random.Random(seed).shuffle(candidates)
+    wanted = min(len(candidates), max(total, total * candidate_multiplier))
+    selected = candidates[:wanted]
+    for index, item in enumerate(selected):
+        item["selection_index"] = index
+    if len(selected) < total:
+        raise RuntimeError(
+            f"AudioSet only yielded {len(selected)} random candidates for {total} clips"
+        )
+    return selected
+
+
 def _acquire(item: dict[str, Any], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     section = f"*{item['start_seconds']}-{item['end_seconds']}"
@@ -177,6 +238,8 @@ def _acquire(item: dict[str, Any], output: Path) -> None:
                 "pcm_s16le",
                 "-ar",
                 "48000",
+                "-t",
+                str(float(item["end_seconds"]) - float(item["start_seconds"])),
                 str(output),
             ],
             check=True,
@@ -214,6 +277,52 @@ def acquire(output_dir: Path, per_class: int) -> Path:
     missing = [name for name in REFERENCE_CLASSES if successes[name] < per_class]
     if missing:
         raise RuntimeError(f"Could not acquire AudioSet references for: {missing}")
+    return manifest_path
+
+
+def _wav_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as source:
+        return source.getnframes() / source.getframerate()
+
+
+def acquire_random(output_dir: Path, total: int, *, seed: int) -> Path:
+    cache = output_dir / "metadata"
+    candidates = select_random_manifest(cache, total, seed=seed)
+    manifest: list[dict[str, Any]] = []
+    successes = 0
+    for item in candidates:
+        if successes >= total:
+            break
+        label = item.get("label_names", ["sound"])[0]
+        slug = re.sub(r"[^a-z0-9]+", "-", str(label).lower()).strip("-")[:45]
+        filename = (
+            f"random/{successes:03d}_{slug or 'sound'}_{item['video_id']}_"
+            f"{int(item['start_seconds'])}.wav"
+        )
+        destination = output_dir / "audio" / filename
+        item["local_path"] = str(destination.relative_to(output_dir))
+        try:
+            _acquire(item, destination)
+            item["retrieval_status"] = "success"
+            item["sha256"] = sha256_file(destination)
+            item["bytes"] = destination.stat().st_size
+            item["retrieved_duration_seconds"] = _wav_duration(destination)
+            item["random_sound_index"] = successes
+            successes += 1
+        except (OSError, subprocess.CalledProcessError, wave.Error) as error:
+            logger.warning("Could not retrieve %s: %s", item["source_url"], error)
+            item["retrieval_status"] = "unavailable"
+            item["error"] = type(error).__name__
+            destination.unlink(missing_ok=True)
+        manifest.append(item)
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    (output_dir / "manifest.sha256").write_text(f"{digest}  manifest.json\n")
+    if successes < total:
+        raise RuntimeError(
+            f"Could only acquire {successes} of {total} random AudioSet clips"
+        )
     return manifest_path
 
 
@@ -262,22 +371,40 @@ def upload_reference_set(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--per-class", type=int, default=3)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--per-class", type=int)
+    selection.add_argument("--total", type=int)
+    parser.add_argument("--seed", type=int, default=20260713)
     parser.add_argument("--metadata-only", action="store_true")
     parser.add_argument("--s3-bucket")
     parser.add_argument("--s3-prefix", default="references/audioset")
     parser.add_argument("--aws-region", default="us-east-1")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    if args.per_class < 1:
+    per_class = args.per_class if args.per_class is not None else 3
+    if per_class < 1:
         parser.error("--per-class must be at least one")
+    if args.total is not None and args.total < 1:
+        parser.error("--total must be at least one")
     if args.metadata_only:
-        manifest = select_manifest(args.output / "metadata", args.per_class)
+        if args.total is not None:
+            manifest = select_random_manifest(
+                args.output / "metadata",
+                args.total,
+                seed=args.seed,
+                candidate_multiplier=1,
+            )
+        else:
+            manifest = select_manifest(args.output / "metadata", per_class)
         args.output.mkdir(parents=True, exist_ok=True)
         path = args.output / "manifest.json"
         path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     else:
-        path = acquire(args.output, args.per_class)
+        path = (
+            acquire_random(args.output, args.total, seed=args.seed)
+            if args.total is not None
+            else acquire(args.output, per_class)
+        )
     if args.s3_bucket:
         if args.metadata_only:
             parser.error("--s3-bucket requires audio acquisition")

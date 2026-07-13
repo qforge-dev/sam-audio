@@ -137,3 +137,27 @@ def test_job_stays_running_when_any_source_has_audible_chunks() -> None:
     handler._refresh_job("job-1")
 
     assert aws.updates[-1]["status"] == "running"
+
+
+def test_final_sam_chunk_closes_job_when_annotations_already_finished() -> None:
+    aws = RefreshAWS(
+        [
+            {"entity": "source", "status": "chunked", "audible_chunk_count": 1},
+            {"entity": "chunk", "status": "complete"},
+            {"entity": "stem", "stem_type": "music"},
+            {"entity": "stem", "stem_type": "voice"},
+            {"entity": "stem", "stem_type": "sfx"},
+            {"entity": "model_task", "status": "complete"},
+            {"entity": "model_task", "status": "complete"},
+            {"entity": "model_task", "status": "complete"},
+        ]
+    )
+    handler = object.__new__(SeparationHandler)
+    handler.aws = aws
+
+    handler._refresh_job("job-1")
+
+    assert aws.updates[-1]["status"] == "complete"
+    assert aws.updates[-1]["completed_sources"] == 1
+    assert aws.updates[-1]["completed_chunks"] == 1
+    assert aws.updates[-1]["failed_chunks"] == 0

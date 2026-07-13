@@ -9,7 +9,7 @@ from sam_audio_pipeline.handlers import FlamingoHandler
 class FakeAWS:
     def __init__(self):
         self.items: list[dict[str, Any]] = [
-            {"entity": "source", "audible_chunk_count": 1},
+            {"entity": "source", "status": "chunked", "audible_chunk_count": 1},
             {"entity": "chunk", "status": "complete"},
             {"entity": "stem", "stem_type": "music"},
             {"entity": "stem", "stem_type": "voice"},

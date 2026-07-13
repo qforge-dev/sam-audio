@@ -66,16 +66,23 @@ class FakeAWS:
         )
 
     def create_source(
-        self, job_id: str, source_id: str, filename: str, s3_key: str
+        self,
+        job_id: str,
+        source_id: str,
+        filename: str,
+        s3_key: str,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         self.put(
             {
                 "PK": f"JOB#{job_id}",
                 "SK": f"SOURCE#{source_id}",
                 "entity": "source",
+                "job_id": job_id,
                 "source_id": source_id,
                 "filename": filename,
                 "s3_key": s3_key,
+                "source_metadata": metadata or {},
                 "status": "uploading",
             }
         )
@@ -86,11 +93,24 @@ class FakeAWS:
     def object_exists(self, key: str) -> bool:
         return key in self.existing_objects
 
+    def object_size(self, key: str) -> int:
+        item = next(
+            (value for value in self.items.values() if value.get("s3_key") == key),
+            {},
+        )
+        return int(item.get("bytes") or 0)
+
     def send_task(self, queue_url: str, task: Any) -> None:
         self.sent.append((queue_url, task))
 
     def queue_metrics(self, _: str):
         return {"queued": 0, "in_flight": 0, "delayed": 0}
+
+    def count_index(self, index_pk: str) -> int:
+        return sum(item.get("GSI1PK") == index_pk for item in self.items.values())
+
+    def presign_download(self, key: str) -> str:
+        return f"https://downloads.invalid/{key}"
 
 
 def settings() -> Settings:
@@ -152,3 +172,107 @@ def test_upload_confirmation_is_durable_before_enqueue() -> None:
     for item in aws.query_partition(f"JOB#{job['job_id']}"):
         statuses[item.get("status")] += 1
     assert statuses["queued"] == 3  # job plus two source records
+
+
+def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
+    config = settings()
+    aws = FakeAWS(config)
+    with TestClient(create_app(config, aws)) as client:
+        dataset = client.post("/v1/datasets", json={"name": "AudioSet 100"}).json()
+        created = client.post(
+            "/v1/jobs",
+            json={
+                "dataset_id": dataset["dataset_id"],
+                "filenames": ["dog.wav"],
+                "source_metadata": {
+                    "dog.wav": {
+                        "video_id": "abc123",
+                        "start_seconds": 30,
+                        "end_seconds": 40,
+                    }
+                },
+            },
+        ).json()
+        job_id = created["job_id"]
+        source_id = created["uploads"][0]["source_id"]
+        pk = f"JOB#{job_id}"
+        aws.update(
+            pk,
+            f"SOURCE#{source_id}",
+            {
+                "status": "complete",
+                "bytes": 1000,
+                "duration_seconds": 10.0,
+            },
+        )
+        aws.put(
+            {
+                "PK": pk,
+                "SK": f"CHUNK#{source_id}#000000",
+                "entity": "chunk",
+                "source_id": source_id,
+                "chunk_id": "000000",
+                "status": "complete",
+                "start_seconds": 0,
+                "end_seconds": 10,
+                "s3_key": "chunk.wav",
+                "bytes": 50,
+                "gate": {"audible": True},
+            }
+        )
+        for index, stem_type in enumerate(("music", "sfx"), start=1):
+            aws.put(
+                {
+                    "PK": pk,
+                    "SK": f"STEM#{source_id}#000000#{stem_type}",
+                    "entity": "stem",
+                    "job_id": job_id,
+                    "source_id": source_id,
+                    "chunk_id": "000000",
+                    "stem_type": stem_type,
+                    "s3_key": f"{stem_type}.wav",
+                    "bytes": index * 100,
+                    "automatic_status": "success",
+                    "effective_status": "success",
+                    "settings": {},
+                }
+            )
+        aws.put(
+            {
+                "PK": pk,
+                "SK": f"STEM_RESULT#{source_id}#000000#voice",
+                "entity": "stem_result",
+                "source_id": source_id,
+                "chunk_id": "000000",
+                "stem_type": "voice",
+                "status": "skipped",
+            }
+        )
+
+        overview = client.get(f"/v1/datasets/{dataset['dataset_id']}/overview").json()
+        detail = client.get(f"/v1/jobs/{job_id}/sources/{source_id}").json()
+
+    assert overview["summary"] == {
+        "jobs": 1,
+        "sources": 1,
+        "duration_seconds": 10.0,
+        "input_bytes": 1000,
+        "chunk_bytes": 50,
+        "stem_bytes": 300,
+        "total_bytes": 1350,
+        "chunks": 1,
+        "audible_chunks": 1,
+        "skipped_chunks": 0,
+        "stems": 2,
+        "stems_by_type": {"music": 1, "sfx": 1},
+        "stems_by_status": {"success": 2},
+        "selected_routes": {},
+        "job_statuses": {"uploading": 1},
+        "review_remaining": 0,
+    }
+    assert detail["source"]["source_metadata"]["video_id"] == "abc123"
+    assert [stem["stem_type"] for stem in detail["chunks"][0]["stems"]] == [
+        "music",
+        "sfx",
+    ]
+    assert detail["chunks"][0]["omitted_stems"] == ["voice"]

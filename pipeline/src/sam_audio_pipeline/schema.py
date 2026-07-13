@@ -46,6 +46,7 @@ class SourceUpload(BaseModel):
 class JobCreateRequest(BaseModel):
     filenames: list[str] = Field(min_length=1)
     dataset_id: str = "default"
+    source_metadata: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class DatasetCreateRequest(BaseModel):
@@ -103,6 +104,7 @@ class StemRecord(BaseModel):
     assertion: str
     s3_key: str
     sha256: str
+    bytes: int
     automatic_status: VerificationStatus
     effective_status: VerificationStatus
     model: str

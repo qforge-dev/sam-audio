@@ -5,6 +5,7 @@ from __future__ import annotations
 import mimetypes
 import re
 import uuid
+from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -54,6 +55,159 @@ def _review_item(aws: PipelineAWS, item: dict[str, Any]) -> ReviewItem:
     )
 
 
+def _review_counts(aws: PipelineAWS) -> dict[str, int]:
+    failure = aws.count_index("REVIEW#failure")
+    uncertain = aws.count_index("REVIEW#uncertain")
+    return {
+        "failure": failure,
+        "uncertain": uncertain,
+        "total": failure + uncertain,
+    }
+
+
+def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
+    dataset = aws.get(f"DATASET#{dataset_id}", "META")
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    jobs = [
+        job
+        for job in aws.query_index("JOBS", limit=None, newest_first=True)
+        if job.get("dataset_id") == dataset_id
+    ]
+    all_sources: list[dict[str, Any]] = []
+    all_chunks: list[dict[str, Any]] = []
+    all_stems: list[dict[str, Any]] = []
+    job_summaries: list[dict[str, Any]] = []
+    for job in jobs:
+        items = aws.query_partition(f"JOB#{job['job_id']}")
+        sources = [item for item in items if item.get("entity") == "source"]
+        chunks = [item for item in items if item.get("entity") == "chunk"]
+        stems = [item for item in items if item.get("entity") == "stem"]
+        for chunk in chunks:
+            if not chunk.get("bytes") and chunk.get("s3_key"):
+                chunk["bytes"] = aws.object_size(str(chunk["s3_key"]))
+        for stem in stems:
+            if not stem.get("bytes") and stem.get("s3_key"):
+                stem["bytes"] = aws.object_size(str(stem["s3_key"]))
+        chunks_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        stems_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for chunk in chunks:
+            chunks_by_source[str(chunk["source_id"])].append(chunk)
+        for stem in stems:
+            stems_by_source[str(stem["source_id"])].append(stem)
+        for source in sources:
+            source_id = str(source["source_id"])
+            source_chunks = chunks_by_source[source_id]
+            source_stems = stems_by_source[source_id]
+            source_bytes = int(source.get("bytes") or 0)
+            if not source_bytes and source.get("s3_key"):
+                source_bytes = aws.object_size(str(source["s3_key"]))
+            duration = float(source.get("duration_seconds") or 0.0)
+            if not duration and source_chunks:
+                duration = max(
+                    float(chunk.get("end_seconds") or 0.0) for chunk in source_chunks
+                )
+            route = next(
+                (
+                    stem.get("settings", {})
+                    .get("adaptive_routing", {})
+                    .get("selected_order")
+                    for stem in source_stems
+                    if stem.get("settings", {}).get("adaptive_routing")
+                ),
+                None,
+            )
+            all_sources.append(
+                {
+                    **source,
+                    "bytes": source_bytes,
+                    "duration_seconds": duration,
+                    "pipeline_status": (
+                        "complete"
+                        if source_chunks
+                        and all(
+                            chunk.get("status") in {"complete", "failed", "skipped"}
+                            for chunk in source_chunks
+                        )
+                        else source.get("status")
+                    ),
+                    "chunk_count": len(source_chunks),
+                    "audible_chunk_count": sum(
+                        chunk.get("status") != "skipped" for chunk in source_chunks
+                    ),
+                    "stem_count": len(source_stems),
+                    "stem_statuses": dict(
+                        Counter(
+                            str(stem.get("effective_status")) for stem in source_stems
+                        )
+                    ),
+                    "selected_order": route,
+                }
+            )
+        job_summaries.append(
+            {
+                **job,
+                "chunk_count": len(chunks),
+                "stem_count": len(stems),
+                "review_remaining": sum(
+                    stem.get("effective_status") in {"failure", "uncertain"}
+                    for stem in stems
+                ),
+            }
+        )
+        all_chunks.extend(chunks)
+        all_stems.extend(stems)
+    input_bytes = sum(int(source.get("bytes") or 0) for source in all_sources)
+    chunk_bytes = sum(int(chunk.get("bytes") or 0) for chunk in all_chunks)
+    stem_bytes = sum(int(stem.get("bytes") or 0) for stem in all_stems)
+    review_remaining = sum(
+        stem.get("effective_status") in {"failure", "uncertain"} for stem in all_stems
+    )
+    return {
+        "dataset": dataset,
+        "summary": {
+            "jobs": len(jobs),
+            "sources": len(all_sources),
+            "duration_seconds": sum(
+                float(source.get("duration_seconds") or 0.0) for source in all_sources
+            ),
+            "input_bytes": input_bytes,
+            "chunk_bytes": chunk_bytes,
+            "stem_bytes": stem_bytes,
+            "total_bytes": input_bytes + chunk_bytes + stem_bytes,
+            "chunks": len(all_chunks),
+            "audible_chunks": sum(
+                chunk.get("status") != "skipped" for chunk in all_chunks
+            ),
+            "skipped_chunks": sum(
+                chunk.get("status") == "skipped" for chunk in all_chunks
+            ),
+            "stems": len(all_stems),
+            "stems_by_type": dict(
+                Counter(str(stem.get("stem_type")) for stem in all_stems)
+            ),
+            "stems_by_status": dict(
+                Counter(str(stem.get("effective_status")) for stem in all_stems)
+            ),
+            "selected_routes": dict(
+                Counter(
+                    str(source.get("selected_order"))
+                    for source in all_sources
+                    if source.get("selected_order")
+                )
+            ),
+            "job_statuses": dict(Counter(str(job.get("status")) for job in jobs)),
+            "review_remaining": review_remaining,
+        },
+        "jobs": job_summaries,
+        "sources": sorted(
+            all_sources,
+            key=lambda source: str(source.get("created_at", "")),
+            reverse=True,
+        ),
+    }
+
+
 def create_app(
     settings: Settings | None = None, aws: PipelineAWS | None = None
 ) -> FastAPI:
@@ -95,6 +249,7 @@ def create_app(
         store = backend(request)
         return {
             "jobs": store.query_index("JOBS", limit=100, newest_first=True),
+            "review_queue": _review_counts(store),
             "queues": {
                 "ingest": store.queue_metrics(store.settings.ingest_queue_url),
                 "sam": store.queue_metrics(store.settings.sam_queue_url),
@@ -125,7 +280,13 @@ def create_app(
             content_type = (
                 mimetypes.guess_type(filename)[0] or "application/octet-stream"
             )
-            store.create_source(job_id, source_id, filename, key)
+            store.create_source(
+                job_id,
+                source_id,
+                filename,
+                key,
+                payload.source_metadata.get(submitted_filename, {}),
+            )
             uploads.append(
                 SourceUpload(
                     source_id=source_id,
@@ -158,6 +319,10 @@ def create_app(
             DatasetResponse.model_validate(item)
             for item in store.query_index("DATASETS", limit=1000)
         ]
+
+    @app.get("/v1/datasets/{dataset_id}/overview")
+    def dataset_overview(dataset_id: str, request: Request) -> dict[str, Any]:
+        return _dataset_snapshot(backend(request), dataset_id)
 
     @app.post("/v1/jobs/{job_id}/uploads-complete", status_code=202)
     def uploads_complete(
@@ -230,6 +395,9 @@ def create_app(
             "sources": [item for item in items if item.get("entity") == "source"],
             "chunks": [item for item in items if item.get("entity") == "chunk"],
             "stems": [item for item in items if item.get("entity") == "stem"],
+            "stem_results": [
+                item for item in items if item.get("entity") == "stem_result"
+            ],
             "annotations": [
                 item for item in items if item.get("entity") == "annotation"
             ],
@@ -237,6 +405,119 @@ def create_app(
                 item for item in items if item.get("entity") == "model_task"
             ],
         }
+
+    @app.get("/v1/jobs/{job_id}/sources/{source_id}")
+    def get_source(job_id: str, source_id: str, request: Request) -> dict[str, Any]:
+        store = backend(request)
+        items = store.query_partition(f"JOB#{job_id}")
+        source = next(
+            (
+                item
+                for item in items
+                if item.get("entity") == "source" and item.get("source_id") == source_id
+            ),
+            None,
+        )
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        job = next(item for item in items if item["SK"] == "META")
+        source = {
+            **source,
+            "audio_url": (
+                store.presign_download(source["s3_key"])
+                if source.get("s3_key") and source.get("status") != "failed"
+                else None
+            ),
+        }
+        chunks = sorted(
+            [
+                item
+                for item in items
+                if item.get("entity") == "chunk" and item.get("source_id") == source_id
+            ],
+            key=lambda chunk: float(chunk.get("start_seconds") or 0.0),
+        )
+        source_duration = float(source.get("duration_seconds") or 0.0)
+        if not source_duration and chunks:
+            source_duration = max(
+                float(chunk.get("end_seconds") or 0.0) for chunk in chunks
+            )
+        source["bytes"] = int(source.get("bytes") or 0) or store.object_size(
+            str(source["s3_key"])
+        )
+        source["duration_seconds"] = source_duration
+        source["pipeline_status"] = (
+            "complete"
+            if chunks
+            and all(
+                chunk.get("status") in {"complete", "failed", "skipped"}
+                for chunk in chunks
+            )
+            else source.get("status")
+        )
+        stems = [
+            item
+            for item in items
+            if item.get("entity") == "stem" and item.get("source_id") == source_id
+        ]
+        stem_results = [
+            item
+            for item in items
+            if item.get("entity") == "stem_result"
+            and item.get("source_id") == source_id
+        ]
+        stems_by_chunk: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        omitted_by_chunk: dict[str, list[str]] = defaultdict(list)
+        for stem in stems:
+            stems_by_chunk[str(stem["chunk_id"])].append(
+                {**stem, "audio_url": store.presign_download(stem["s3_key"])}
+            )
+        for result in stem_results:
+            if result.get("status") == "skipped":
+                omitted_by_chunk[str(result["chunk_id"])].append(
+                    str(result["stem_type"])
+                )
+        expanded_chunks = []
+        for chunk in chunks:
+            chunk_id = str(chunk["chunk_id"])
+            expanded_chunks.append(
+                {
+                    **chunk,
+                    "audio_url": (
+                        store.presign_download(chunk["s3_key"])
+                        if chunk.get("s3_key")
+                        else None
+                    ),
+                    "stems": sorted(
+                        stems_by_chunk[chunk_id],
+                        key=lambda stem: {"music": 0, "voice": 1, "sfx": 2}.get(
+                            str(stem.get("stem_type")), 9
+                        ),
+                    ),
+                    "omitted_stems": sorted(omitted_by_chunk[chunk_id]),
+                }
+            )
+        annotations = [
+            item
+            for item in items
+            if item.get("entity") == "annotation" and item.get("source_id") == source_id
+        ]
+        model_tasks = [
+            item
+            for item in items
+            if item.get("entity") == "model_task" and item.get("source_id") == source_id
+        ]
+        return {
+            "job": job,
+            "source": source,
+            "chunks": expanded_chunks,
+            "annotations": annotations,
+            "model_tasks": model_tasks,
+        }
+
+    @app.get("/v1/review/stats")
+    def review_stats(request: Request) -> dict[str, int]:
+        return _review_counts(backend(request))
 
     @app.get("/v1/review/next", response_model=ReviewItem | None)
     def next_review(request: Request) -> ReviewItem | None:
