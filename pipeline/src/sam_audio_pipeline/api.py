@@ -89,6 +89,10 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
         for stem in stems:
             if not stem.get("bytes") and stem.get("s3_key"):
                 stem["bytes"] = aws.object_size(str(stem["s3_key"]))
+            if stem.get("stereo_s3_key") and not stem.get("stereo_bytes"):
+                stem["stereo_bytes"] = aws.object_size(
+                    str(stem["stereo_s3_key"])
+                )
         chunks_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
         stems_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for chunk in chunks:
@@ -160,6 +164,7 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
     input_bytes = sum(int(source.get("bytes") or 0) for source in all_sources)
     chunk_bytes = sum(int(chunk.get("bytes") or 0) for chunk in all_chunks)
     stem_bytes = sum(int(stem.get("bytes") or 0) for stem in all_stems)
+    stereo_bytes = sum(int(stem.get("stereo_bytes") or 0) for stem in all_stems)
     review_remaining = sum(
         stem.get("effective_status") in {"failure", "uncertain"} for stem in all_stems
     )
@@ -174,7 +179,8 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
             "input_bytes": input_bytes,
             "chunk_bytes": chunk_bytes,
             "stem_bytes": stem_bytes,
-            "total_bytes": input_bytes + chunk_bytes + stem_bytes,
+            "stereo_bytes": stereo_bytes,
+            "total_bytes": input_bytes + chunk_bytes + stem_bytes + stereo_bytes,
             "chunks": len(all_chunks),
             "audible_chunks": sum(
                 chunk.get("status") != "skipped" for chunk in all_chunks
@@ -183,6 +189,7 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
                 chunk.get("status") == "skipped" for chunk in all_chunks
             ),
             "stems": len(all_stems),
+            "stereo_stems": sum(bool(stem.get("stereo_s3_key")) for stem in all_stems),
             "stems_by_type": dict(
                 Counter(str(stem.get("stem_type")) for stem in all_stems)
             ),
@@ -470,7 +477,15 @@ def create_app(
         omitted_by_chunk: dict[str, list[str]] = defaultdict(list)
         for stem in stems:
             stems_by_chunk[str(stem["chunk_id"])].append(
-                {**stem, "audio_url": store.presign_download(stem["s3_key"])}
+                {
+                    **stem,
+                    "audio_url": store.presign_download(stem["s3_key"]),
+                    "stereo_audio_url": (
+                        store.presign_download(stem["stereo_s3_key"])
+                        if stem.get("stereo_s3_key")
+                        else None
+                    ),
+                }
             )
         for result in stem_results:
             if result.get("status") == "skipped":

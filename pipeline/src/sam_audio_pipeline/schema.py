@@ -105,6 +105,10 @@ class StemRecord(BaseModel):
     s3_key: str
     sha256: str
     bytes: int
+    stereo_s3_key: str | None = None
+    stereo_sha256: str | None = None
+    stereo_bytes: int = 0
+    stereo_mapping: dict[str, Any] = Field(default_factory=dict)
     automatic_status: VerificationStatus
     effective_status: VerificationStatus
     model: str

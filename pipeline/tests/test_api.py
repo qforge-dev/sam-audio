@@ -235,6 +235,15 @@ def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
                     "automatic_status": "success",
                     "effective_status": "success",
                     "settings": {},
+                    **(
+                        {
+                            "stereo_s3_key": "music.stereo.wav",
+                            "stereo_bytes": 220,
+                            "stereo_mapping": {"frequency_bands": 32},
+                        }
+                        if stem_type == "music"
+                        else {}
+                    ),
                 }
             )
         aws.put(
@@ -259,11 +268,13 @@ def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
         "input_bytes": 1000,
         "chunk_bytes": 50,
         "stem_bytes": 300,
-        "total_bytes": 1350,
+        "stereo_bytes": 220,
+        "total_bytes": 1570,
         "chunks": 1,
         "audible_chunks": 1,
         "skipped_chunks": 0,
         "stems": 2,
+        "stereo_stems": 1,
         "stems_by_type": {"music": 1, "sfx": 1},
         "stems_by_status": {"success": 2},
         "selected_routes": {},
@@ -275,4 +286,8 @@ def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
         "music",
         "sfx",
     ]
+    assert detail["chunks"][0]["stems"][0]["stereo_audio_url"].endswith(
+        "music.stereo.wav"
+    )
+    assert detail["chunks"][0]["stems"][1]["stereo_audio_url"] is None
     assert detail["chunks"][0]["omitted_stems"] == ["voice"]

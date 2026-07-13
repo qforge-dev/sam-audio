@@ -56,6 +56,33 @@ DynamoDB is authoritative. A successful HTTP upload confirmation only means the
 source tasks are durable and queued; callers should poll the job endpoint rather
 than keep an inference request open.
 
+## Stereo mapping
+
+New audible stems automatically keep both versions:
+
+- `{stem}.wav` is the untouched mono model output used by review and existing
+  integrations.
+- `{stem}.stereo.wav` is the frequency-aware stereo/loudness reconstruction.
+- The stem record and chunk metadata contain the mapping settings and
+  pan/loudness curve; a backfill also writes `{chunk}.stereo.json`.
+
+In **Split data**, select a source and use **Raw / Stereo mapped** above the
+players. The original player never changes. The maps below the players show the
+smoothed trajectory; left is below the center line and right is above it.
+
+Backfill a completed job after deploying the mapper. The command is idempotent
+and skips stems that already have a mapped object unless `--force` is supplied:
+
+```bash
+ssh ubuntu@ec2-44-211-31-38.compute-1.amazonaws.com \
+  "sudo bash -c 'set -a; source /etc/sam-audio-pipeline.env; set +a; \
+   cd /home/ubuntu/sam-audio-deploy/pipeline; \
+   .venv/bin/sam-pipeline-stereo-backfill --job-id JOB_ID'"
+```
+
+Use `--max-chunks N` for a canary. Mapping is CPU-only and does not require a
+SAM or Audio Flamingo restart.
+
 ## AudioSet validation batches
 
 Acquire a reproducible random sample from the official AudioSet segment CSVs.

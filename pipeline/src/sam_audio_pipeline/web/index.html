@@ -89,6 +89,10 @@
       .source-header > div { min-width: 0; }
       .source-header h2 { overflow-wrap: anywhere; }
       .source-meta { color: var(--muted); }
+      .source-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
+      .mode-toggle { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: #111318; }
+      .mode-toggle button { border: 0; padding: 6px 10px; background: transparent; }
+      .mode-toggle button.active { background: #26302d; }
       .track-stack { border: 1px solid #3a404a; border-radius: 16px; overflow: hidden; background: #111318; }
       .track-row { display: grid; grid-template-columns: 125px minmax(0, 1fr); min-height: 64px; border-top: 1px solid var(--line); }
       .track-row:first-child { border-top: 0; }
@@ -101,6 +105,13 @@
       .track-row.sfx .track-label { border-left: 4px solid var(--sfx); }
       .chunk { margin-top: 15px; }
       .chunk-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 4px 7px; color: var(--muted); font-size: 12px; }
+      .stereo-maps { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-top: 8px; }
+      .stereo-map { padding: 10px 12px; border: 1px solid var(--line); border-radius: 11px; background: #13161a; }
+      .stereo-map-head { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11px; margin-bottom: 5px; }
+      .stereo-map svg { display: block; width: 100%; height: 58px; }
+      .stereo-map .center-line { stroke: #59606b; stroke-width: 1; stroke-dasharray: 4 4; }
+      .stereo-map .pan-line { fill: none; stroke-width: 2.5; vector-effect: non-scaling-stroke; }
+      .stereo-map-foot { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
       .gate-skip { border: 1px dashed var(--line); border-radius: 12px; padding: 20px; color: var(--muted); text-align: center; }
       .pipeline-overview { margin-top: 16px; }
       .steps { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
@@ -167,6 +178,8 @@
       let currentReview = null;
       let currentDataset = null;
       let currentSourceId = null;
+      let currentJobId = null;
+      let stereoMappingEnabled = false;
       let activeView = "dashboard";
 
       function escapeHtml(value) {
@@ -298,9 +311,9 @@
         $("#dataset-metrics").innerHTML = [
           metric("Sounds", summary.sources, `${summary.jobs} upload job(s)`),
           metric("Duration", formatDuration(summary.duration_seconds), "original audio"),
-          metric("Storage", formatBytes(summary.total_bytes), `${formatBytes(summary.input_bytes)} originals · ${formatBytes(summary.chunk_bytes)} chunks · ${formatBytes(summary.stem_bytes)} stems`),
+          metric("Storage", formatBytes(summary.total_bytes), `${formatBytes(summary.input_bytes)} originals · ${formatBytes(summary.chunk_bytes)} chunks · ${formatBytes(summary.stem_bytes)} raw stems · ${formatBytes(summary.stereo_bytes)} stereo`),
           metric("Chunks", summary.chunks, `${summary.skipped_chunks} sound-gated`),
-          metric("Stems", summary.stems, Object.entries(summary.stems_by_type).map(([key, value]) => `${value} ${key}`).join(" · ")),
+          metric("Stems", summary.stems, `${Object.entries(summary.stems_by_type).map(([key, value]) => `${value} ${key}`).join(" · ")} · ${summary.stereo_stems} stereo mapped`),
           metric("Needs review", summary.review_remaining, "failure + uncertain")
         ].join("");
         $("#source-list").innerHTML = currentDataset.sources.map(source => {
@@ -323,12 +336,45 @@
         if (source) await loadSource(source.job_id, source.source_id);
       }
 
-      function trackRow(kind, label, subtitle, url) {
-        if (!url) return "";
-        return `<div class="track-row ${escapeHtml(kind)}"><div class="track-label"><b>${escapeHtml(label)}</b>${escapeHtml(subtitle)}</div><div class="track-body"><audio controls preload="metadata" src="${escapeHtml(url)}"></audio></div></div>`;
+      function trackRow(kind, label, subtitle, rawUrl, stereoUrl = null) {
+        if (!rawUrl) return "";
+        const mapped = stereoMappingEnabled && stereoUrl;
+        const mode = stereoUrl ? (mapped ? " · stereo mapped" : " · raw") : "";
+        const url = mapped ? stereoUrl : rawUrl;
+        return `<div class="track-row ${escapeHtml(kind)}"><div class="track-label"><b>${escapeHtml(label)}</b>${escapeHtml(subtitle + mode)}</div><div class="track-body"><audio controls preload="metadata" src="${escapeHtml(url)}"></audio></div></div>`;
+      }
+
+      function panSide(value) {
+        const pan = Number(value || 0);
+        if (pan < -.08) return `${Math.round(Math.abs(pan) * 100)}% left`;
+        if (pan > .08) return `${Math.round(pan * 100)}% right`;
+        return "center";
+      }
+
+      function stereoMapCard(stem) {
+        const mapping = stem.stereo_mapping || {};
+        const curve = mapping.pan_curve || [];
+        if (!curve.length) return "";
+        const width = 360;
+        const height = 58;
+        const duration = Math.max(...curve.map(point => Number(point.time_seconds || 0)), 1);
+        const points = curve.map(point => {
+          const x = Number(point.time_seconds || 0) / duration * width;
+          const y = height / 2 - Number(point.pan || 0) * (height / 2 - 3);
+          return `${x.toFixed(1)},${y.toFixed(1)}`;
+        }).join(" ");
+        const summary = mapping.pan_summary || {};
+        const color = {music: "var(--music)", voice: "var(--voice)", sfx: "var(--sfx)"}[stem.stem_type] || "var(--accent)";
+        return `<div class="stereo-map"><div class="stereo-map-head"><b>${escapeHtml(stem.stem_type)} stereo map</b><span>${mapping.frequency_bands || "–"} bands · EMA ${mapping.smoothing?.alpha ?? "–"}</span></div><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-label="Smoothed left-right trajectory"><line class="center-line" x1="0" y1="${height / 2}" x2="${width}" y2="${height / 2}"></line><polyline class="pan-line" style="stroke:${color}" points="${points}"></polyline></svg><div class="stereo-map-foot"><span>starts ${panSide(summary.start)}</span><span>ends ${panSide(summary.end)}</span></div></div>`;
+      }
+
+      function setStereoMapping(enabled) {
+        stereoMappingEnabled = enabled;
+        if (currentJobId && currentSourceId) loadSource(currentJobId, currentSourceId);
       }
 
       async function loadSource(jobId, sourceId) {
+        currentJobId = jobId;
         currentSourceId = sourceId;
         document.querySelectorAll(".source-item").forEach(item => item.classList.toggle("active", item.dataset.source === sourceId));
         $("#source-detail").innerHTML = '<div class="empty">Loading sound and stems…</div>';
@@ -342,6 +388,7 @@
           ? `AudioSet · ${labels.join(", ") || "labelled sound"} · source ${provenance.start_seconds}s–${provenance.end_seconds}s`
           : `${formatDuration(source.duration_seconds)} · ${formatBytes(source.bytes)}`;
         const original = trackRow("original", "Original", "OG sound", source.audio_url);
+        const hasStereo = data.chunks.some(chunk => chunk.stems.some(stem => stem.stereo_audio_url));
         const chunks = data.chunks.map(chunk => {
           if (chunk.status === "skipped") {
             return `<div class="chunk"><div class="chunk-head"><span>Chunk ${escapeHtml(chunk.chunk_id)} · ${chunk.start_seconds}s–${chunk.end_seconds}s</span><span class="status">sound-gated</span></div><div class="gate-skip">No audible signal passed the gate, so no stems were generated.</div></div>`;
@@ -350,10 +397,11 @@
           const rows = chunk.stems.map(stem => {
             const labelsByType = {music: ["Music", "music stem"], voice: ["Voice", "dialogue stem"], sfx: ["Residual", "SFX / ambience"]};
             const [label, subtitle] = labelsByType[stem.stem_type] || [stem.stem_type, "stem"];
-            return trackRow(stem.stem_type, label, `${subtitle} · ${stem.effective_status}`, stem.audio_url);
+            return trackRow(stem.stem_type, label, `${subtitle} · ${stem.effective_status}`, stem.audio_url, stem.stereo_audio_url);
           }).join("");
+          const stereoMaps = chunk.stems.map(stereoMapCard).join("");
           const gate = chunk.gate ? ` · peak ${Number(chunk.gate.peak_dbfs).toFixed(1)} dBFS` : "";
-          return `<div class="chunk"><div class="chunk-head"><span>Chunk ${escapeHtml(chunk.chunk_id)} · ${chunk.start_seconds}s–${chunk.end_seconds}s${escapeHtml(gate)}</span><span>${route ? escapeHtml(route.replace("_", " ")) : escapeHtml(chunk.status)}</span></div><div class="track-stack">${rows || '<div class="gate-skip">All generated stems were below the output sound gate.</div>'}</div></div>`;
+          return `<div class="chunk"><div class="chunk-head"><span>Chunk ${escapeHtml(chunk.chunk_id)} · ${chunk.start_seconds}s–${chunk.end_seconds}s${escapeHtml(gate)}</span><span>${route ? escapeHtml(route.replace("_", " ")) : escapeHtml(chunk.status)}</span></div><div class="track-stack">${rows || '<div class="gate-skip">All generated stems were below the output sound gate.</div>'}</div>${stereoMaps ? `<div class="stereo-maps">${stereoMaps}</div>` : ""}</div>`;
         }).join("");
         const steps = [
           ["source", source.pipeline_status],
@@ -363,7 +411,7 @@
         ].map(([label, status]) => `<span class="step ${escapeHtml(status)}">${escapeHtml(label)} · ${escapeHtml(status)}</span>`).join("");
         const annotations = data.annotations.map(annotation => `<div class="annotation"><b>${escapeHtml(annotation.task_type.replaceAll("_", " "))}</b><div>${escapeHtml(annotation.text)}</div></div>`).join("");
         $("#source-detail").innerHTML = `
-          <div class="source-header"><div><div class="eyebrow">Sound detail</div><h2>${escapeHtml(source.filename)}</h2><div class="source-meta">${escapeHtml(provenanceText)}</div></div><span class="status ${escapeHtml(source.pipeline_status)}">${escapeHtml(source.pipeline_status)}</span></div>
+          <div class="source-header"><div><div class="eyebrow">Sound detail</div><h2>${escapeHtml(source.filename)}</h2><div class="source-meta">${escapeHtml(provenanceText)}</div></div><div class="source-actions">${hasStereo ? `<div class="mode-toggle" aria-label="Stem playback mode"><button class="${stereoMappingEnabled ? "" : "active"}" onclick="setStereoMapping(false)">Raw</button><button class="${stereoMappingEnabled ? "active" : ""}" onclick="setStereoMapping(true)">Stereo mapped</button></div>` : ""}<span class="status ${escapeHtml(source.pipeline_status)}">${escapeHtml(source.pipeline_status)}</span></div></div>
           <div class="track-stack">${original || '<div class="gate-skip">Original upload is not available.</div>'}</div>
           ${chunks}
           <div class="card pipeline-overview"><div class="eyebrow">How it moved through the pipeline</div><div class="steps">${steps}</div><div class="annotations">${annotations || '<div class="muted">No model annotations yet.</div>'}</div></div>`;

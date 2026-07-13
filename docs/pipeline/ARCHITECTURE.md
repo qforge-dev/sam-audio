@@ -29,22 +29,32 @@ rule are persisted under `adaptive_routing`.
    evidence determine `success`, `uncertain`, or `failure` independently for
    each stage. A failed complete cascade triggers the bounded reverse-order
    attempt described above; it never recursively separates the SFX residual.
-6. Music, voice, and final residual (SFX) WAVs, inference metadata, timings, and
-   review assertions are stored in S3 and indexed in DynamoDB.
-7. Description and transcription tasks share one Audio Flamingo queue so that a
+6. Music, voice, and final residual (SFX) WAVs are retained as the original mono
+   model outputs. A CPU post-process also creates a stereo companion for every
+   audible stem by matching it against the original stereo chunk in 32
+   log-frequency bands. Per-band left/right correlation and loudness are
+   smoothed with a bidirectional EMA (`alpha=0.03`) in time and a three-bin
+   frequency kernel before equal-power panning. Only a final peak limiter is
+   allowed to alter the reconstructed level.
+7. Raw and stereo-mapped WAVs, the 120-point pan/loudness trajectory, inference
+   metadata, timings, and review assertions are stored in S3 and indexed in
+   DynamoDB. A stereo mapping failure never discards or delays the raw result.
+8. Description and transcription tasks share one Audio Flamingo queue so that a
    single loaded model processes one item at a time. It creates one source-scene
    analysis per audible source, one description per music stem, and one
    speaker-labelled transcript per voice stem. Tasks exist in DynamoDB before
    SQS delivery and are reconciled after worker/message loss.
-8. A browser dashboard shows job/queue progress and exact remaining review
+9. A browser dashboard shows job/queue progress and exact remaining review
    counts. Its reviewer mode pulls the next `uncertain` or `failure` assertion,
    starts audio automatically, displays the prompt/assertion, and accepts
    one-key decisions.
-9. The dataset explorer reports source count, duration, input/chunk/stem storage,
+10. The dataset explorer reports source count, duration, input/chunk/stem storage,
    processing counts, stem mix, and review backlog. Each source displays the
    original recording first, then only the music/voice/SFX stems that passed the
    output sound gate, grouped by chunk, followed by its processing route and
-   model annotations.
+   model annotations. Raw mono playback is the default; a `Stereo mapped`
+   toggle swaps only the stem players and leaves the original recording
+   untouched. Each stem also shows its smoothed left/right trajectory.
 
 ## AWS resources
 
@@ -82,12 +92,16 @@ Objects use stable, content-address-aware prefixes:
 jobs/{job_id}/sources/{source_id}/{filename}
 jobs/{job_id}/chunks/{source_id}/{chunk_index}.wav
 jobs/{job_id}/stems/{source_id}/{chunk_index}/{music|voice|sfx}.wav
+jobs/{job_id}/stems/{source_id}/{chunk_index}/{music|voice|sfx}.stereo.wav
 jobs/{job_id}/metadata/{source_id}/{chunk_index}.json
+jobs/{job_id}/metadata/{source_id}/{chunk_index}.stereo.json
 ```
 
 Source and stem records include SHA-256 hashes. A stem record includes the
 source chunk hash, prompt, model/settings fingerprint, automated status,
-reviewer status, S3 version/key, timings, and raw Judge/CLAP evidence.
+reviewer status, raw and stereo S3 keys/hashes/sizes, stereo mapping summary,
+timings, and raw Judge/CLAP evidence. The raw `s3_key` is never replaced by its
+mapped companion.
 
 ## Review contract
 

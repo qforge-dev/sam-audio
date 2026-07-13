@@ -30,6 +30,8 @@ was an example batch size, not a workflow limit.
 - [x] Implement job/queue dashboard and keyboard-first review UI.
 - [x] Add exact review backlog counts, dataset size/processing metrics, and the
   original-plus-stems source explorer.
+- [x] Add frequency-aware stereo/loudness reconstruction while preserving every
+  raw mono stem, plus a dashboard playback toggle and smoothed trajectory plots.
 - [x] Add persistent datasets, successive upload jobs, and reconciliation of
   uploaded/stale work from DynamoDB back into SQS.
 - [x] Provision AWS, deploy services, and run a multi-file end-to-end test.
@@ -62,11 +64,23 @@ was an example batch size, not a workflow limit.
   and omitted 16 below-gate outputs (6 music, 9 voice, 1 SFX). The selected
   route was music-first for 63 sounds and voice-first for 37.
 - The completed random dataset contains 624.4 MiB of indexed originals,
-  normalized chunks, and stems. Automatic verification placed 161 stems in
+  normalized chunks, and raw stems plus 543,877,704 bytes of mapped stereo
+  companions. All 284 audible stems were backfilled without replacing their
+  raw keys. Automatic verification placed 161 stems in
   success, 54 in uncertain, and 69 in failure, leaving 123 review items.
 - Browser verification confirms the review screen shows exact remaining,
   failure, and uncertain counts; the dataset screen shows 100 sounds and its
   storage breakdown; and gated stems are absent from the stacked track view.
+- Live reference job `ae31001eec754ee6850e3727134de84e` processed the supplied
+  30-second `chunk_ours/og.wav` through the normal production handler and
+  created raw plus stereo music, voice, and SFX objects. The rendered dashboard
+  defaults to Raw, swaps only stem URLs when Stereo mapped is selected, and
+  displays three 32-band/EMA-0.03 trajectory plots.
+- The mapper was separately checked against the previously supplied raw
+  `humanvoices.wav`: its smoothed pan moves from `-0.33` (left) to `+0.39`
+  (right), matching the attached chunk-zero analysis. All three 30-second stems
+  map in about 0.58 seconds locally; the fresh remote job mapped its three stems
+  in about 1.02 seconds.
 - Multi-file job `bd85486f9d314c258956cac9b81a730f` completed: one 30-second
   audible source produced exactly one chunk and three stems; one silent source
   was sound-gated without GPU work; all three Audio Flamingo tasks completed.
@@ -76,7 +90,7 @@ was an example batch size, not a workflow limit.
 - Recovery job `1d07979ee96a45a98cf220b102fd7006` was uploaded without the
   completion callback. Reconciliation found the S3 object, enqueued ingestion,
   and completed it as sound-gated. All three queues were empty afterward.
-- Local and remote validation: 24 pipeline tests pass; the existing 12 SAM
+- Local and remote validation: 28 pipeline tests pass; the existing 12 SAM
   batching tests also pass.
 - Docker build execution remains unverified because neither the local Mac nor
   the current H100 host has a Docker daemon. Both Dockerfiles remain model-free.

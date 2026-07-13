@@ -16,6 +16,7 @@ from .config import Settings
 from .flamingo_client import AudioFlamingoClient
 from .model_client import SAMAudioClient
 from .schema import QueueTask, StemRecord, VerificationStatus, utc_now
+from .stereo import StereoMappedStem, map_stems_to_stereo
 
 logger = logging.getLogger(__name__)
 
@@ -246,13 +247,33 @@ class SeparationHandler:
                     result.metadata.get("cascade_order", []), start=1
                 )
             }
-            stored_stems: list[str] = []
-            for stem_type, stem_path in result.stems.items():
-                gate = gate_wav(
+            gates = {
+                stem_type: gate_wav(
                     stem_path,
                     peak_threshold_dbfs=self.settings.gate_peak_dbfs,
                     rms_threshold_dbfs=self.settings.gate_rms_dbfs,
                 )
+                for stem_type, stem_path in result.stems.items()
+            }
+            stereo_stems: dict[str, StereoMappedStem] = {}
+            try:
+                stereo_stems = map_stems_to_stereo(
+                    input_path, result.stems, root / "stereo"
+                )
+                result.metadata["stereo_mapping"] = {
+                    "algorithm": "frequency_masked_pan_v1",
+                    "stems": {
+                        stem_type: mapped.metadata
+                        for stem_type, mapped in stereo_stems.items()
+                    },
+                }
+            except Exception:
+                logger.exception(
+                    "Stereo mapping failed; raw stems remain durable for backfill"
+                )
+            stored_stems: list[str] = []
+            for stem_type, stem_path in result.stems.items():
+                gate = gates[stem_type]
                 stem_key = (
                     f"jobs/{task.job_id}/stems/{task.source_id}/"
                     f"{task.chunk_id}/{stem_type}.wav"
@@ -278,6 +299,14 @@ class SeparationHandler:
                     )
                     continue
                 self.aws.upload_file(stem_path, stem_key, "audio/wav")
+                stereo = stereo_stems.get(stem_type)
+                stereo_key = None
+                if stereo:
+                    stereo_key = (
+                        f"jobs/{task.job_id}/stems/{task.source_id}/"
+                        f"{task.chunk_id}/{stem_type}.stereo.wav"
+                    )
+                    self.aws.upload_file(stereo.path, stereo_key, "audio/wav")
                 stage_name = stage_by_kind.get(stem_type)
                 stage = (
                     result.metadata.get("stages", {}).get(stage_name, {})
@@ -290,6 +319,9 @@ class SeparationHandler:
                     if stage_name
                     else result.metadata.get("inference_timings_ms", {})
                 )
+                timings = dict(timings)
+                if stereo:
+                    timings["stereo_mapping"] = stereo.metadata["processing_ms"]
                 record = StemRecord(
                     job_id=task.job_id,
                     source_id=task.source_id,
@@ -300,6 +332,10 @@ class SeparationHandler:
                     s3_key=stem_key,
                     sha256=sha256_file(stem_path),
                     bytes=stem_path.stat().st_size,
+                    stereo_s3_key=stereo_key,
+                    stereo_sha256=stereo.sha256 if stereo else None,
+                    stereo_bytes=stereo.bytes if stereo else 0,
+                    stereo_mapping=stereo.metadata if stereo else {},
                     automatic_status=statuses[stem_type],
                     effective_status=statuses[stem_type],
                     model=result.metadata.get("model", "unknown"),
