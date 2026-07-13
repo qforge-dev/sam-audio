@@ -1,0 +1,18 @@
+[Unit]
+Description=SAM Audio CPU ingestion worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
+ExecStart=/home/ubuntu/sam-audio-deploy/deploy/pipeline/start-pipeline.sh sam-pipeline-worker --role ingest
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+

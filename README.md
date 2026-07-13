@@ -47,10 +47,12 @@ docker run --gpus all --rm -p 8000:8000 \
   sam-audio-api
 ```
 
-The API runs the configured two-stage cascade (`human voices`, then
-`music soundtrack`) through one continuous batcher. Submit an audio file; the response
-ZIP contains `stage1_voices.wav`, `stage1_residual.wav`, `stage2_music.wav`,
-`stage2_residual.wav`, and `metadata.json`:
+The API runs the configured two-stage cascade (`music soundtrack`, then
+`human voices`) through one continuous batcher. Submit an audio file; the response
+ZIP contains `stage1_music.wav`, `stage1_residual.wav`, `stage2_voice.wav`,
+`stage2_residual.wav`, and `metadata.json`. The metadata includes
+`cascade_order` and a canonical stem-to-file mapping so clients do not need to
+infer content from stage numbers:
 
 ```bash
 curl -f http://localhost:8000/v1/separate \

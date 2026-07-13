@@ -60,10 +60,10 @@ class InferenceService:
         self.model_id = os.environ.get(MODEL_ENV, DEFAULT_MODEL)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype_policy = os.environ.get("SAM_AUDIO_DTYPE_POLICY", "tf32")
-        self.stage1_prompt = os.environ.get("SAM_AUDIO_PROMPT_STAGE1", "human voices")
-        self.stage2_prompt = os.environ.get(
-            "SAM_AUDIO_PROMPT_STAGE2", "music soundtrack"
+        self.stage1_prompt = os.environ.get(
+            "SAM_AUDIO_PROMPT_STAGE1", "music soundtrack"
         )
+        self.stage2_prompt = os.environ.get("SAM_AUDIO_PROMPT_STAGE2", "human voices")
         self.predict_spans = _env_bool("SAM_AUDIO_PREDICT_SPANS", True)
         self.stage1_steps = int(os.environ.get("SAM_AUDIO_STAGE1_STEPS", "16"))
         self.stage1_initial_candidates = int(
@@ -85,16 +85,16 @@ class InferenceService:
             os.environ.get("SAM_AUDIO_CANDIDATE_INCREMENT", "4")
         )
         self.stage1_success_threshold = float(
-            os.environ.get("SAM_AUDIO_STAGE1_SUCCESS_THRESHOLD", "4.5")
+            os.environ.get("SAM_AUDIO_STAGE1_SUCCESS_THRESHOLD", "4.4")
         )
         self.stage1_failure_threshold = float(
-            os.environ.get("SAM_AUDIO_STAGE1_FAILURE_THRESHOLD", "4.3")
+            os.environ.get("SAM_AUDIO_STAGE1_FAILURE_THRESHOLD", "4.1")
         )
         self.stage2_success_threshold = float(
-            os.environ.get("SAM_AUDIO_STAGE2_SUCCESS_THRESHOLD", "4.4")
+            os.environ.get("SAM_AUDIO_STAGE2_SUCCESS_THRESHOLD", "4.5")
         )
         self.stage2_failure_threshold = float(
-            os.environ.get("SAM_AUDIO_STAGE2_FAILURE_THRESHOLD", "4.1")
+            os.environ.get("SAM_AUDIO_STAGE2_FAILURE_THRESHOLD", "4.3")
         )
         if self.stage1_failure_threshold > self.stage1_success_threshold:
             raise ValueError(
@@ -195,10 +195,14 @@ class InferenceService:
             timeout=self.request_timeout,
         )
         cascade_ms = (time.perf_counter() - cascade_started) * 1000
+        stage1_kind = _prompt_stem_kind(self.stage1_prompt)
+        stage2_kind = _prompt_stem_kind(self.stage2_prompt)
+        stage1_target_file = f"stage1_{stage1_kind}.wav"
+        stage2_target_file = f"stage2_{stage2_kind}.wav"
         artifacts = {
-            "stage1_voices.wav": result.stage1.target[0],
+            stage1_target_file: result.stage1.target[0],
             "stage1_residual.wav": result.stage1.residual[0],
-            "stage2_music.wav": result.stage2.target[0],
+            stage2_target_file: result.stage2.target[0],
             "stage2_residual.wav": result.stage2.residual[0],
         }
         stage1_metadata = result.stage1.metadata or {}
@@ -231,6 +235,18 @@ class InferenceService:
             "model": self.model_id,
             "dtype_policy": self.dtype_policy,
             "predict_spans": self.predict_spans,
+            "cascade_order": [stage1_kind, stage2_kind],
+            "artifacts": {
+                "stage1_target": stage1_target_file,
+                "stage1_residual": "stage1_residual.wav",
+                "stage2_target": stage2_target_file,
+                "stage2_residual": "stage2_residual.wav",
+                "canonical_stems": {
+                    stage1_kind: stage1_target_file,
+                    stage2_kind: stage2_target_file,
+                    "sfx": "stage2_residual.wav",
+                },
+            },
             "score_semantics": {
                 "judge": (
                     "Continuous quality estimates where higher is better; these are "
@@ -271,6 +287,15 @@ class InferenceService:
 
 
 service = InferenceService()
+
+
+def _prompt_stem_kind(prompt: str) -> str:
+    normalized = prompt.casefold()
+    if any(token in normalized for token in ("music", "soundtrack")):
+        return "music"
+    if any(token in normalized for token in ("voice", "speech", "human")):
+        return "voice"
+    return "target"
 
 
 @asynccontextmanager

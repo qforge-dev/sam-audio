@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SAM Audio Pipeline</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #101216;
+        --panel: #191c22;
+        --line: #2b3039;
+        --muted: #9299a6;
+        --text: #f5f7fa;
+        --accent: #84f2c2;
+        --danger: #ff7777;
+        --warn: #ffd479;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: radial-gradient(circle at 20% -10%, #25312e 0, transparent 35%), var(--bg);
+        color: var(--text);
+        font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      button, input, select { font: inherit; }
+      .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+      header { display: flex; align-items: center; justify-content: space-between; padding: 28px 0 18px; }
+      h1 { margin: 0; font-size: 20px; letter-spacing: -.02em; }
+      nav { display: flex; gap: 8px; }
+      button {
+        border: 1px solid var(--line); border-radius: 9px; padding: 9px 13px;
+        background: #20242b; color: var(--text); cursor: pointer;
+      }
+      button:hover, button.active { border-color: var(--accent); color: var(--accent); }
+      button.primary { background: var(--accent); border-color: var(--accent); color: #08120e; font-weight: 700; }
+      button.danger { border-color: #713b3b; color: var(--danger); }
+      main { padding-bottom: 60px; }
+      .view[hidden] { display: none; }
+      .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+      .card { background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+      .queue-name, .eyebrow { color: var(--muted); text-transform: uppercase; letter-spacing: .1em; font-size: 11px; }
+      .queue-count { font-size: 30px; font-weight: 750; margin-top: 8px; }
+      .queue-detail { color: var(--muted); margin-top: 3px; }
+      .upload { margin: 18px 0; display: flex; align-items: center; gap: 12px; }
+      input[type=file] { flex: 1; border: 1px dashed #414753; border-radius: 10px; padding: 12px; color: var(--muted); }
+      select { border: 1px solid var(--line); border-radius: 9px; padding: 9px 12px; background: #20242b; color: var(--text); }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--line); }
+      th { color: var(--muted); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+      .status { display: inline-flex; border-radius: 999px; padding: 3px 9px; background: #242932; }
+      .status.success, .status.complete, .status.stems_ready { color: var(--accent); }
+      .status.failure, .status.failed { color: var(--danger); }
+      .status.uncertain, .status.partial { color: var(--warn); }
+      .review { max-width: 820px; margin: 7vh auto 0; text-align: center; }
+      .review h2 { font-size: clamp(25px, 4vw, 42px); line-height: 1.12; margin: 14px 0 8px; }
+      .prompt { color: var(--muted); font-size: 17px; margin-bottom: 24px; }
+      audio { width: 100%; margin: 10px 0 24px; }
+      .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      .actions button { padding: 20px; font-size: 17px; }
+      .pending { margin-top: 12px; width: 100%; }
+      .key { display: inline-grid; place-items: center; width: 24px; height: 24px; border: 1px solid currentColor; border-radius: 5px; margin-right: 8px; font-size: 12px; }
+      pre { text-align: left; white-space: pre-wrap; color: #bac0ca; background: #111318; padding: 14px; border-radius: 9px; overflow: auto; }
+      .empty { color: var(--muted); padding: 52px 0; }
+      #notice { min-height: 24px; color: var(--muted); }
+      @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } .upload { align-items: stretch; flex-direction: column; } }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <header>
+        <h1>SAM Audio Pipeline</h1>
+        <nav>
+          <button id="dashboard-tab" class="active">Pipeline</button>
+          <button id="review-tab">Review</button>
+        </nav>
+      </header>
+      <main>
+        <section id="dashboard" class="view">
+          <div id="queues" class="grid"></div>
+          <div class="card upload">
+            <select id="dataset" aria-label="Dataset"></select>
+            <button id="new-dataset">New dataset</button>
+            <input id="files" type="file" accept="audio/*" multiple />
+            <button id="submit" class="primary">Upload & queue</button>
+          </div>
+          <div id="notice"></div>
+          <div class="card">
+            <table>
+              <thead><tr><th>Job</th><th>Status</th><th>Files</th><th>Created</th></tr></thead>
+              <tbody id="jobs"></tbody>
+            </table>
+          </div>
+        </section>
+        <section id="review" class="view" hidden>
+          <div id="review-card" class="card review"></div>
+        </section>
+      </main>
+    </div>
+    <script>
+      const $ = (selector) => document.querySelector(selector);
+      let currentReview = null;
+      let activeView = "dashboard";
+
+      function escapeHtml(value) {
+        const node = document.createElement("div");
+        node.textContent = value ?? "";
+        return node.innerHTML;
+      }
+
+      function show(view) {
+        activeView = view;
+        $("#dashboard").hidden = view !== "dashboard";
+        $("#review").hidden = view !== "review";
+        $("#dashboard-tab").classList.toggle("active", view === "dashboard");
+        $("#review-tab").classList.toggle("active", view === "review");
+        if (view === "review") loadReview();
+      }
+
+      async function refresh() {
+        const response = await fetch("/v1/overview");
+        if (!response.ok) return;
+        const data = await response.json();
+        $("#queues").innerHTML = Object.entries(data.queues).map(([name, queue]) => `
+          <div class="card">
+            <div class="queue-name">${escapeHtml(name.replace("_", " "))}</div>
+            <div class="queue-count">${queue.queued}</div>
+            <div class="queue-detail">waiting · ${queue.in_flight} processing</div>
+          </div>`).join("");
+        $("#jobs").innerHTML = data.jobs.map(job => `
+          <tr>
+            <td><code>${escapeHtml(job.job_id.slice(0, 12))}</code></td>
+            <td><span class="status ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></td>
+            <td>${job.source_count}</td>
+            <td>${new Date(job.created_at).toLocaleString()}</td>
+          </tr>`).join("") || '<tr><td colspan="4" class="empty">No jobs yet.</td></tr>';
+      }
+
+      async function loadDatasets(selected) {
+        const response = await fetch("/v1/datasets");
+        if (!response.ok) return;
+        const datasets = await response.json();
+        $("#dataset").innerHTML = datasets.map(dataset =>
+          `<option value="${escapeHtml(dataset.dataset_id)}">${escapeHtml(dataset.name)}</option>`
+        ).join("");
+        if (selected) $("#dataset").value = selected;
+      }
+
+      async function newDataset() {
+        const name = prompt("Dataset name");
+        if (!name?.trim()) return;
+        const response = await fetch("/v1/datasets", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({name: name.trim()})
+        });
+        if (!response.ok) return alert(await response.text());
+        const dataset = await response.json();
+        await loadDatasets(dataset.dataset_id);
+      }
+
+      async function submitFiles() {
+        const files = [...$("#files").files];
+        if (!files.length) return;
+        $("#submit").disabled = true;
+        $("#notice").textContent = `Preparing ${files.length} upload(s)…`;
+        try {
+          const create = await fetch("/v1/jobs", {
+            method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+              dataset_id: $("#dataset").value,
+              filenames: files.map(file => file.name)
+            })
+          });
+          if (!create.ok) throw new Error(await create.text());
+          const job = await create.json();
+          for (let index = 0; index < files.length; index++) {
+            $("#notice").textContent = `Uploading ${index + 1}/${files.length}: ${files[index].name}`;
+            const upload = await fetch(job.uploads[index].upload_url, {
+              method: "PUT",
+              headers: {"Content-Type": job.uploads[index].content_type},
+              body: files[index]
+            });
+            if (!upload.ok) throw new Error(`Upload failed: ${files[index].name}`);
+          }
+          const complete = await fetch(`/v1/jobs/${job.job_id}/uploads-complete`, {
+            method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"
+          });
+          if (!complete.ok) throw new Error(await complete.text());
+          $("#notice").textContent = `${files.length} file(s) accepted. The durable queues have no HTTP timeout.`;
+          $("#files").value = "";
+          await refresh();
+        } catch (error) {
+          $("#notice").textContent = error.message;
+        } finally {
+          $("#submit").disabled = false;
+        }
+      }
+
+      async function loadReview() {
+        $("#review-card").innerHTML = '<div class="empty">Loading next item…</div>';
+        const response = await fetch("/v1/review/next");
+        currentReview = response.ok ? await response.json() : null;
+        if (!currentReview) {
+          $("#review-card").innerHTML = '<div class="empty">Review queue is clear.</div>';
+          return;
+        }
+        const item = currentReview;
+        $("#review-card").innerHTML = `
+          <div class="eyebrow">${escapeHtml(item.stem_type)} · automatic ${escapeHtml(item.automatic_status)}</div>
+          <h2>${escapeHtml(item.assertion)}</h2>
+          <div class="prompt">Prompt: “${escapeHtml(item.prompt)}”</div>
+          <audio id="review-audio" src="${escapeHtml(item.audio_url)}" controls autoplay></audio>
+          <div class="actions">
+            <button class="primary" onclick="decide('pass')"><span class="key">1</span>Correct</button>
+            <button class="danger" onclick="decide('fail')"><span class="key">2</span>Incorrect</button>
+          </div>
+          <button class="pending" onclick="decide('pending')"><span class="key">3</span>Keep pending</button>
+          <details><summary>Scores and timings</summary><pre>${escapeHtml(JSON.stringify({scores: item.scores, timings_ms: item.timings_ms}, null, 2))}</pre></details>`;
+        $("#review-audio").play().catch(() => {});
+      }
+
+      async function decide(decision) {
+        if (!currentReview) return;
+        const response = await fetch(`/v1/review/${encodeURIComponent(currentReview.review_id)}`, {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({decision})
+        });
+        if (!response.ok) return alert(await response.text());
+        currentReview = null;
+        await loadReview();
+      }
+
+      $("#dashboard-tab").onclick = () => show("dashboard");
+      $("#review-tab").onclick = () => show("review");
+      $("#submit").onclick = submitFiles;
+      $("#new-dataset").onclick = newDataset;
+      document.addEventListener("keydown", event => {
+        if (activeView !== "review" || !currentReview || event.repeat) return;
+        if (event.key === "1") decide("pass");
+        if (event.key === "2") decide("fail");
+        if (event.key === "3") decide("pending");
+        if (event.key === " ") { event.preventDefault(); const audio = $("#review-audio"); audio.paused ? audio.play() : audio.pause(); }
+      });
+      loadDatasets();
+      refresh();
+      setInterval(() => { if (activeView === "dashboard") refresh(); }, 5000);
+    </script>
+  </body>
+</html>

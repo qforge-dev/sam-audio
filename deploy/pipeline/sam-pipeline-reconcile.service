@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile durable SAM Audio pipeline state with queues
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
+ExecStart=/home/ubuntu/sam-audio-deploy/deploy/pipeline/start-pipeline.sh sam-pipeline-worker --role reconcile
+
