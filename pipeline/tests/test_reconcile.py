@@ -55,6 +55,7 @@ def test_reconciler_recovers_uploaded_source_and_stale_chunk() -> None:
         sam_queue_url="sam",
         flamingo_queue_url="flamingo",
         sam_api_url="http://127.0.0.1:8000",
+        flamingo_api_url="http://127.0.0.1:8001",
         chunk_seconds=30,
         overlap_seconds=5,
         gate_peak_dbfs=-52,

@@ -60,6 +60,18 @@ curl -f http://localhost:8000/v1/separate \
   -o separation.zip
 ```
 
+The optional `order` form field accepts `music_first` (default) or
+`voice_first`. The durable pipeline starts music-first and automatically retries
+voice-first when the first result is a failure, then retains the route with the
+stronger final/stage status and Judge evidence:
+
+```bash
+curl -f http://localhost:8000/v1/separate \
+  -F audio=@mixture.wav \
+  -F order=voice_first \
+  -o separation.zip
+```
+
 Generation, prompt, batching, and TF32 policy are configured with the
 `SAM_AUDIO_*` environment variables demonstrated in
 [`deploy/start-sam-audio-api.sh`](deploy/start-sam-audio-api.sh). A supplied
@@ -104,6 +116,22 @@ durations are also stored under `inference_timings_ms` in `metadata.json`.
 For a persistent Linux deployment, customize and install the example
 [`deploy/sam-audio-api.service`](deploy/sam-audio-api.service) systemd unit. It
 binds to localhost by default; use an SSH tunnel to access port 8000 securely.
+
+## Durable AWS pipeline
+
+The model-free [`pipeline`](pipeline) package adds persistent datasets, direct
+S3 multi-file uploads, 30-second chunks with 5-second overlap, sound gating,
+single-consumer SAM and Audio Flamingo queues, DynamoDB reconciliation, an
+operations dashboard, and keyboard-first review. Model checkpoints are runtime
+mounts/downloads on the GPU host and are never part of either Docker build
+context.
+
+The implementation contract, live deployment evidence, and operator commands
+are maintained in:
+
+- [`docs/pipeline/ARCHITECTURE.md`](docs/pipeline/ARCHITECTURE.md)
+- [`docs/pipeline/PROGRESS.md`](docs/pipeline/PROGRESS.md)
+- [`docs/pipeline/OPERATIONS.md`](docs/pipeline/OPERATIONS.md)
 
 ## Usage
 

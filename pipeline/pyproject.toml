@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Durable AWS control plane for the SAM Audio stem pipeline"
 requires-python = ">=3.12"
 dependencies = [
-    "boto3>=1.40",
+    "boto3[crt]>=1.40",
     "fastapi>=0.116",
     "httpx>=0.28",
     "python-multipart>=0.0.20",
@@ -16,6 +16,7 @@ dependencies = [
 sam-pipeline-api = "sam_audio_pipeline.api:main"
 sam-pipeline-worker = "sam_audio_pipeline.worker:main"
 sam-pipeline-audioset = "sam_audio_pipeline.audioset:main"
+sam-audio-flamingo-api = "sam_audio_pipeline.flamingo_api:main"
 
 [dependency-groups]
 dev = [

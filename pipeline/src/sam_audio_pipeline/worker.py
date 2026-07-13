@@ -10,7 +10,7 @@ from collections.abc import Callable
 
 from .aws import PipelineAWS, ReceivedTask
 from .config import Settings
-from .handlers import IngestHandler, Reconciler, SeparationHandler
+from .handlers import FlamingoHandler, IngestHandler, Reconciler, SeparationHandler
 from .schema import QueueTask
 
 logger = logging.getLogger(__name__)
@@ -107,10 +107,8 @@ def main() -> None:
         handler = SeparationHandler(settings, aws).handle
         queue_url = settings.sam_queue_url
     else:
-        raise SystemExit(
-            "Audio Flamingo worker is not deployed yet; refusing to consume its "
-            "durable queue."
-        )
+        handler = FlamingoHandler(settings, aws).handle
+        queue_url = settings.flamingo_queue_url
     run_worker(aws, queue_url, handler)
 
 

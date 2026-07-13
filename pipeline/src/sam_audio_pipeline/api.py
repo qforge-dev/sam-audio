@@ -230,6 +230,12 @@ def create_app(
             "sources": [item for item in items if item.get("entity") == "source"],
             "chunks": [item for item in items if item.get("entity") == "chunk"],
             "stems": [item for item in items if item.get("entity") == "stem"],
+            "annotations": [
+                item for item in items if item.get("entity") == "annotation"
+            ],
+            "model_tasks": [
+                item for item in items if item.get("entity") == "model_task"
+            ],
         }
 
     @app.get("/v1/review/next", response_model=ReviewItem | None)

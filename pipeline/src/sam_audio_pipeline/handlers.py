@@ -12,6 +12,7 @@ from typing import Any
 from .audio import chunk_audio, gate_wav, sha256_file
 from .aws import PipelineAWS
 from .config import Settings
+from .flamingo_client import AudioFlamingoClient
 from .model_client import SAMAudioClient
 from .schema import QueueTask, StemRecord, VerificationStatus, utc_now
 
@@ -103,6 +104,7 @@ class IngestHandler:
                 job_id=task.job_id,
                 source_id=task.source_id,
             )
+            self.aws.put_model_task(scene_task, "flamingo")
             self.aws.send_task(self.settings.flamingo_queue_url, scene_task)
         status = "chunked" if audible_count else "complete"
         self.aws.update(
@@ -116,11 +118,28 @@ class IngestHandler:
                 "updated_at": utc_now(),
             },
         )
-        self.aws.update(
-            f"JOB#{task.job_id}",
-            "META",
-            {"status": "running", "updated_at": utc_now()},
+        self._refresh_job(task.job_id)
+
+    def _refresh_job(self, job_id: str) -> None:
+        items = self.aws.query_partition(f"JOB#{job_id}")
+        sources = [item for item in items if item.get("entity") == "source"]
+        chunks = [item for item in items if item.get("entity") == "chunk"]
+        all_sound_gated = (
+            bool(sources)
+            and all(source.get("status") == "complete" for source in sources)
+            and all(chunk.get("status") == "skipped" for chunk in chunks)
         )
+        values: dict[str, Any] = {"status": "running", "updated_at": utc_now()}
+        if all_sound_gated:
+            values.update(
+                {
+                    "status": "complete",
+                    "completed_sources": len(sources),
+                    "completed_chunks": len(chunks),
+                    "failed_chunks": 0,
+                }
+            )
+        self.aws.update(f"JOB#{job_id}", "META", values)
 
 
 class SeparationHandler:
@@ -147,7 +166,7 @@ class SeparationHandler:
             root = Path(temporary)
             input_path = root / "chunk.wav"
             self.aws.download_file(chunk["s3_key"], input_path)
-            result = self.client.separate(input_path, root / "result")
+            result = self._separate_with_policy(input_path, root)
             statuses = self._statuses(result.metadata)
             stage_by_kind = {
                 kind: f"stage{index}"
@@ -215,6 +234,7 @@ class SeparationHandler:
                         "dtype_policy": result.metadata.get("dtype_policy"),
                         "predict_spans": result.metadata.get("predict_spans"),
                         "cascade_order": result.metadata.get("cascade_order"),
+                        "adaptive_routing": result.metadata.get("adaptive_routing"),
                         "stage": stage_name,
                     },
                     scores=scores,
@@ -242,6 +262,80 @@ class SeparationHandler:
         )
         self._refresh_job(task.job_id)
 
+    def _separate_with_policy(self, input_path: Path, root: Path):
+        primary = self.client.separate(
+            input_path,
+            root / "music-first",
+            order="music_first",
+        )
+        attempts = [self._attempt_summary(primary.metadata)]
+        selected = primary
+        trigger = "primary_accepted"
+        if primary.metadata.get("verification_status") == "failure":
+            fallback = self.client.separate(
+                input_path,
+                root / "voice-first",
+                order="voice_first",
+            )
+            attempts.append(self._attempt_summary(fallback.metadata))
+            trigger = "primary_failure_retry"
+            if self._route_score(fallback.metadata) > self._route_score(
+                primary.metadata
+            ):
+                selected = fallback
+        selected.metadata["adaptive_routing"] = {
+            "policy_version": 1,
+            "default_order": "music_first",
+            "trigger": trigger,
+            "attempts": attempts,
+            "selected_order": selected.metadata.get("requested_order"),
+            "selection_rule": (
+                "Prefer success over uncertain over failure for final and stage "
+                "statuses, then prefer higher stage Judge quality; ties retain "
+                "music_first."
+            ),
+        }
+        return selected
+
+    @staticmethod
+    def _route_score(metadata: dict[str, Any]) -> float:
+        status_points = {"failure": 0.0, "uncertain": 1.0, "success": 2.0}
+        final = status_points.get(str(metadata.get("verification_status")), 0.0)
+        verification = metadata.get("verification", {})
+        stages = verification.get("stage_statuses", {})
+        stage_score = sum(
+            status_points.get(str(stages.get(f"stage{index}")), 0.0) for index in (1, 2)
+        )
+        judge_score = 0.0
+        for stage in metadata.get("stages", {}).values():
+            value = stage.get("verification", {}).get("judge_quality_score")
+            if isinstance(value, (int, float)):
+                judge_score += float(value)
+        return final * 100.0 + stage_score * 10.0 + judge_score
+
+    @classmethod
+    def _attempt_summary(cls, metadata: dict[str, Any]) -> dict[str, Any]:
+        verification = metadata.get("verification", {})
+        stages = verification.get("stage_statuses", {})
+        quality_by_kind: dict[str, Any] = {}
+        status_by_kind: dict[str, Any] = {}
+        for index, kind in enumerate(metadata.get("cascade_order", []), start=1):
+            stage = metadata.get("stages", {}).get(f"stage{index}", {})
+            status_by_kind[kind] = stages.get(f"stage{index}")
+            quality_by_kind[kind] = stage.get("verification", {}).get(
+                "judge_quality_score"
+            )
+        return {
+            "order": metadata.get("requested_order"),
+            "final_status": metadata.get("verification_status"),
+            "status_by_kind": status_by_kind,
+            "judge_quality_by_kind": quality_by_kind,
+            "route_score": cls._route_score(metadata),
+            "service_total_ms": metadata.get("inference_timings_ms", {}).get(
+                "service_total"
+            ),
+        }
+
     @staticmethod
     def _statuses(metadata: dict[str, Any]) -> dict[str, VerificationStatus]:
         verification = metadata.get("verification", {})
@@ -264,19 +358,17 @@ class SeparationHandler:
         }.get(stem_type)
         if not task_type:
             return
-        self.aws.send_task(
-            self.settings.flamingo_queue_url,
-            QueueTask(
-                task_id=(
-                    f"flamingo:{task_type}:{task.job_id}:{task.source_id}:"
-                    f"{task.chunk_id}"
-                ),
-                task_type=task_type,
-                job_id=task.job_id,
-                source_id=task.source_id,
-                chunk_id=task.chunk_id,
+        flamingo_task = QueueTask(
+            task_id=(
+                f"flamingo:{task_type}:{task.job_id}:{task.source_id}:{task.chunk_id}"
             ),
+            task_type=task_type,
+            job_id=task.job_id,
+            source_id=task.source_id,
+            chunk_id=task.chunk_id,
         )
+        self.aws.put_model_task(flamingo_task, "flamingo")
+        self.aws.send_task(self.settings.flamingo_queue_url, flamingo_task)
 
     def _refresh_job(self, job_id: str) -> None:
         items = self.aws.query_partition(f"JOB#{job_id}")
@@ -349,6 +441,21 @@ class Reconciler:
                 ):
                     self._enqueue_sam(job_id, item)
                     recovered["sam"] += 1
+                elif (
+                    entity == "model_task"
+                    and item.get("queue") == "flamingo"
+                    and status in {"queued", "running"}
+                    and self._stale(item, now)
+                ):
+                    task = QueueTask.model_validate(item["task"])
+                    self.aws.update(
+                        f"JOB#{job_id}",
+                        item["SK"],
+                        {"status": "queued", "updated_at": utc_now()},
+                    )
+                    self.aws.send_task(self.settings.flamingo_queue_url, task)
+                    recovered.setdefault("flamingo", 0)
+                    recovered["flamingo"] += 1
         return recovered
 
     def _enqueue_ingest(self, job_id: str, source: dict[str, Any]) -> None:
@@ -379,3 +486,136 @@ class Reconciler:
             {"status": "queued", "updated_at": task.created_at},
         )
         self.aws.send_task(self.settings.sam_queue_url, task)
+
+
+class FlamingoHandler:
+    PROMPTS = {
+        "describe_scene": (
+            "Analyze the complete audio. Return concise JSON with keys "
+            "has_music (boolean), has_voices (boolean), music_description "
+            "(string or null), and scene_description (one sentence)."
+        ),
+        "describe_music": (
+            "Describe only the music in this audio in one concise sentence, "
+            "including genre, instruments, tempo, mood, and whether it is "
+            "foreground or background."
+        ),
+        "transcribe_voice": (
+            "Transcribe all audible speech. Use SPEAKER_1, SPEAKER_2, and so on "
+            "for diarization when multiple speakers are distinguishable. Return "
+            "only the speaker-labelled transcript, or NO_SPEECH if empty."
+        ),
+    }
+
+    def __init__(self, settings: Settings, aws: PipelineAWS):
+        self.settings = settings
+        self.aws = aws
+        self.client = AudioFlamingoClient(settings.flamingo_api_url)
+
+    def handle(self, task: QueueTask) -> None:
+        if task.task_type not in self.PROMPTS:
+            raise ValueError(f"Unsupported Audio Flamingo task: {task.task_type}")
+        task_sk = f"TASK#{task.task_id}"
+        task_item = self.aws.get(f"JOB#{task.job_id}", task_sk)
+        if task_item and task_item.get("status") == "complete":
+            return
+        if not task_item:
+            self.aws.put_model_task(task, "flamingo")
+        self.aws.update(
+            f"JOB#{task.job_id}",
+            task_sk,
+            {"status": "running", "updated_at": utc_now()},
+        )
+        self.aws.update(
+            f"JOB#{task.job_id}",
+            "META",
+            {"status": "annotating", "updated_at": utc_now()},
+        )
+        audio_key, target_sk = self._input(task)
+        with tempfile.TemporaryDirectory(prefix="audio-flamingo-") as temporary:
+            audio_path = Path(temporary) / "input.wav"
+            self.aws.download_file(audio_key, audio_path)
+            result = self.client.ask(audio_path, self.PROMPTS[task.task_type])
+        output_key = (
+            f"jobs/{task.job_id}/annotations/{task.source_id}/"
+            f"{task.chunk_id or 'source'}/{task.task_type}.json"
+        )
+        output = {
+            **result,
+            "job_id": task.job_id,
+            "source_id": task.source_id,
+            "chunk_id": task.chunk_id,
+            "task_type": task.task_type,
+            "created_at": utc_now(),
+        }
+        self.aws.upload_json(output, output_key)
+        self.aws.put(
+            {
+                "PK": f"JOB#{task.job_id}",
+                "SK": (
+                    f"ANNOTATION#{task.source_id}#"
+                    f"{task.chunk_id or 'source'}#{task.task_type}"
+                ),
+                "entity": "annotation",
+                **output,
+                "s3_key": output_key,
+            }
+        )
+        field = {
+            "describe_scene": "scene_description",
+            "describe_music": "music_description",
+            "transcribe_voice": "voice_transcription",
+        }[task.task_type]
+        self.aws.update(
+            f"JOB#{task.job_id}",
+            target_sk,
+            {
+                field: result["text"],
+                f"{field}_s3_key": output_key,
+                "updated_at": utc_now(),
+            },
+        )
+        self.aws.update(
+            f"JOB#{task.job_id}",
+            task_sk,
+            {
+                "status": "complete",
+                "output_s3_key": output_key,
+                "updated_at": utc_now(),
+            },
+        )
+        self._refresh_job(task.job_id)
+
+    def _input(self, task: QueueTask) -> tuple[str, str]:
+        if task.task_type == "describe_scene":
+            target_sk = f"SOURCE#{task.source_id}"
+        else:
+            if not task.chunk_id:
+                raise ValueError(f"{task.task_type} requires chunk_id")
+            stem_type = "music" if task.task_type == "describe_music" else "voice"
+            target_sk = f"STEM#{task.source_id}#{task.chunk_id}#{stem_type}"
+        item = self.aws.get(f"JOB#{task.job_id}", target_sk)
+        if not item or not item.get("s3_key"):
+            raise KeyError(f"Audio input record is missing: {target_sk}")
+        return item["s3_key"], target_sk
+
+    def _refresh_job(self, job_id: str) -> None:
+        items = self.aws.query_partition(f"JOB#{job_id}")
+        tasks = [item for item in items if item.get("entity") == "model_task"]
+        chunks = [item for item in items if item.get("entity") == "chunk"]
+        sources = [item for item in items if item.get("entity") == "source"]
+        stems = [item for item in items if item.get("entity") == "stem"]
+        expected_tasks = sum(
+            1 for item in sources if item.get("audible_chunk_count", 0) > 0
+        ) + sum(1 for item in stems if item.get("stem_type") in {"music", "voice"})
+        if (
+            expected_tasks > 0
+            and len(tasks) >= expected_tasks
+            and all(item.get("status") == "complete" for item in tasks)
+            and all(item.get("status") in TERMINAL_CHUNK_STATES for item in chunks)
+        ):
+            self.aws.update(
+                f"JOB#{job_id}",
+                "META",
+                {"status": "complete", "updated_at": utc_now()},
+            )

@@ -8,10 +8,10 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
+EnvironmentFile=/etc/sam-audio-pipeline.env
 ExecStart=/home/ubuntu/sam-audio-deploy/deploy/pipeline/start-pipeline.sh sam-pipeline-api
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-

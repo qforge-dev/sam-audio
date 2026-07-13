@@ -26,6 +26,7 @@ class Settings:
     sam_queue_url: str
     flamingo_queue_url: str
     sam_api_url: str
+    flamingo_api_url: str
     chunk_seconds: float
     overlap_seconds: float
     gate_peak_dbfs: float
@@ -52,6 +53,9 @@ class Settings:
             flamingo_queue_url=_required("SAM_PIPELINE_FLAMINGO_QUEUE_URL"),
             sam_api_url=os.environ.get(
                 "SAM_PIPELINE_SAM_API_URL", "http://127.0.0.1:8000"
+            ).rstrip("/"),
+            flamingo_api_url=os.environ.get(
+                "SAM_PIPELINE_FLAMINGO_API_URL", "http://127.0.0.1:8001"
             ).rstrip("/"),
             chunk_seconds=chunk_seconds,
             overlap_seconds=overlap_seconds,

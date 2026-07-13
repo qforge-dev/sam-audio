@@ -1,0 +1,21 @@
+[Unit]
+Description=Audio Flamingo Next inference API
+After=network-online.target sam-audio-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
+EnvironmentFile=/etc/audio-flamingo-next.env
+Environment=PYTHONPATH=/home/ubuntu/sam-audio-deploy/pipeline/src
+Environment=LD_LIBRARY_PATH=/home/ubuntu/sam-audio-deploy/.venv/lib/python3.14/site-packages/nvidia/cu13/lib
+ExecStartPre=/bin/bash -c 'until /usr/bin/curl -fsS http://127.0.0.1:8000/healthz >/dev/null; do sleep 5; done'
+ExecStart=/home/ubuntu/sam-audio-deploy/.venv/bin/python -m sam_audio_pipeline.flamingo_api
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

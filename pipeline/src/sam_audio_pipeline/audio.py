@@ -166,6 +166,8 @@ def chunk_audio(
                 gate=gate,
             )
         )
+        if end >= duration:
+            break
         index += 1
         start += step
     return chunks

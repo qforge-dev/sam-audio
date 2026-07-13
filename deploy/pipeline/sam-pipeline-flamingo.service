@@ -1,0 +1,18 @@
+[Unit]
+Description=Audio Flamingo single-consumer queue worker
+After=network-online.target audio-flamingo-next.service
+Wants=network-online.target audio-flamingo-next.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
+EnvironmentFile=/etc/sam-audio-pipeline.env
+ExecStart=/home/ubuntu/sam-audio-deploy/deploy/pipeline/start-pipeline.sh sam-pipeline-worker --role flamingo
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

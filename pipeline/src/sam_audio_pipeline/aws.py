@@ -199,6 +199,28 @@ class PipelineAWS:
         self.put(item)
         return review_id
 
+    def put_model_task(self, task: QueueTask, queue_name: str) -> None:
+        existing = self.get(f"JOB#{task.job_id}", f"TASK#{task.task_id}")
+        if existing:
+            return
+        self.put(
+            {
+                "PK": f"JOB#{task.job_id}",
+                "SK": f"TASK#{task.task_id}",
+                "entity": "model_task",
+                "task_id": task.task_id,
+                "task_type": task.task_type,
+                "job_id": task.job_id,
+                "source_id": task.source_id,
+                "chunk_id": task.chunk_id,
+                "queue": queue_name,
+                "status": "queued",
+                "task": task.model_dump(mode="json"),
+                "created_at": task.created_at,
+                "updated_at": task.created_at,
+            }
+        )
+
     def record_review(
         self,
         stem_item: dict[str, Any],

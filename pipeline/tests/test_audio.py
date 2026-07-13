@@ -49,3 +49,16 @@ def test_chunking_uses_30_seconds_with_5_second_overlap(tmp_path: Path) -> None:
     ]
     assert all(chunk.gate.audible for chunk in chunks)
     assert all(len(chunk.sha256) == 64 for chunk in chunks)
+
+
+def test_chunking_does_not_add_redundant_tail_at_exact_boundary(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "exact.wav"
+    write_tone(source, 30.0, 0.1)
+
+    chunks = chunk_audio(source, tmp_path / "exact-chunks")
+
+    assert [(chunk.start_seconds, chunk.end_seconds) for chunk in chunks] == [
+        (0.0, 30.0)
+    ]

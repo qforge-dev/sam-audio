@@ -8,11 +8,14 @@ import hashlib
 import json
 import logging
 import subprocess
+import sys
 import tempfile
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+
+import boto3
 
 from .audio import sha256_file
 
@@ -141,7 +144,9 @@ def _acquire(item: dict[str, Any], output: Path) -> None:
         template = str(Path(temporary) / "source.%(ext)s")
         subprocess.run(
             [
-                "yt-dlp",
+                sys.executable,
+                "-m",
+                "yt_dlp",
                 "--quiet",
                 "--no-warnings",
                 "--no-playlist",
@@ -180,9 +185,13 @@ def _acquire(item: dict[str, Any], output: Path) -> None:
 
 def acquire(output_dir: Path, per_class: int) -> Path:
     cache = output_dir / "metadata"
-    manifest = select_manifest(cache, per_class)
-    for item in manifest:
+    candidates = select_manifest(cache, per_class * 5)
+    manifest: list[dict[str, Any]] = []
+    successes: dict[str, int] = defaultdict(int)
+    for item in candidates:
         name = item["reference_class"]
+        if successes[name] >= per_class:
+            continue
         video_id = item["video_id"]
         filename = f"{name}/{video_id}_{int(item['start_seconds'])}.wav"
         destination = output_dir / "audio" / filename
@@ -192,15 +201,62 @@ def acquire(output_dir: Path, per_class: int) -> Path:
             item["retrieval_status"] = "success"
             item["sha256"] = sha256_file(destination)
             item["bytes"] = destination.stat().st_size
+            successes[name] += 1
         except (OSError, subprocess.CalledProcessError) as error:
             logger.warning("Could not retrieve %s: %s", item["source_url"], error)
             item["retrieval_status"] = "unavailable"
             item["error"] = type(error).__name__
+        manifest.append(item)
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     (output_dir / "manifest.sha256").write_text(f"{digest}  manifest.json\n")
+    missing = [name for name in REFERENCE_CLASSES if successes[name] < per_class]
+    if missing:
+        raise RuntimeError(f"Could not acquire AudioSet references for: {missing}")
     return manifest_path
+
+
+def upload_reference_set(
+    output_dir: Path,
+    manifest_path: Path,
+    *,
+    bucket: str,
+    prefix: str,
+    region: str,
+) -> None:
+    s3 = boto3.client("s3", region_name=region)
+    manifest = json.loads(manifest_path.read_text())
+    normalized_prefix = prefix.strip("/")
+    for item in manifest:
+        if item.get("retrieval_status") != "success":
+            continue
+        local_path = output_dir / item["local_path"]
+        key = f"{normalized_prefix}/{item['local_path']}"
+        s3.upload_file(
+            str(local_path),
+            bucket,
+            key,
+            ExtraArgs={"ContentType": "audio/wav"},
+        )
+        item["s3_bucket"] = bucket
+        item["s3_key"] = key
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    digest_path = output_dir / "manifest.sha256"
+    digest_path.write_text(f"{digest}  manifest.json\n")
+    s3.upload_file(
+        str(manifest_path),
+        bucket,
+        f"{normalized_prefix}/manifest.json",
+        ExtraArgs={"ContentType": "application/json"},
+    )
+    s3.upload_file(
+        str(digest_path),
+        bucket,
+        f"{normalized_prefix}/manifest.sha256",
+        ExtraArgs={"ContentType": "text/plain"},
+    )
 
 
 def main() -> None:
@@ -208,6 +264,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--per-class", type=int, default=3)
     parser.add_argument("--metadata-only", action="store_true")
+    parser.add_argument("--s3-bucket")
+    parser.add_argument("--s3-prefix", default="references/audioset")
+    parser.add_argument("--aws-region", default="us-east-1")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     if args.per_class < 1:
@@ -219,6 +278,16 @@ def main() -> None:
         path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     else:
         path = acquire(args.output, args.per_class)
+    if args.s3_bucket:
+        if args.metadata_only:
+            parser.error("--s3-bucket requires audio acquisition")
+        upload_reference_set(
+            args.output,
+            path,
+            bucket=args.s3_bucket,
+            prefix=args.s3_prefix,
+            region=args.aws_region,
+        )
     print(path)
 
 

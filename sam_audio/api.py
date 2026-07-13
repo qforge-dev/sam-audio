@@ -164,8 +164,39 @@ class InferenceService:
             )
         return audio
 
+    def _cascade_configs(
+        self, order: str
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        by_kind = {
+            "music": {
+                "prompt": self.stage1_prompt,
+                "steps": self.stage1_steps,
+                "initial_candidates": self.stage1_initial_candidates,
+                "max_candidates": self.stage1_max_candidates,
+                "margin": self.stage1_margin,
+                "success_threshold": self.stage1_success_threshold,
+                "failure_threshold": self.stage1_failure_threshold,
+            },
+            "voice": {
+                "prompt": self.stage2_prompt,
+                "steps": self.stage2_steps,
+                "initial_candidates": self.stage2_initial_candidates,
+                "max_candidates": self.stage2_max_candidates,
+                "margin": self.stage2_margin,
+                "success_threshold": self.stage2_success_threshold,
+                "failure_threshold": self.stage2_failure_threshold,
+            },
+        }
+        kinds = {
+            "music_first": ("music", "voice"),
+            "voice_first": ("voice", "music"),
+        }.get(order)
+        if kinds is None:
+            raise ValueError("order must be 'music_first' or 'voice_first'")
+        return by_kind[kinds[0]], by_kind[kinds[1]]
+
     def separate_cascade(
-        self, audio_path: str
+        self, audio_path: str, order: str = "music_first"
     ) -> tuple[dict[str, torch.Tensor], int, dict[str, object]]:
         if self.batcher is None or self.processor is None:
             raise RuntimeError("Model is not loaded")
@@ -175,28 +206,29 @@ class InferenceService:
             self._predecode(audio_path) if self.predecode_inputs else audio_path
         )
         input_decode_ms = (time.perf_counter() - input_decode_started) * 1000
+        stage1_config, stage2_config = self._cascade_configs(order)
         cascade_started = time.perf_counter()
         result = self.batcher.separate_cascade(
             audio=audio,
-            stage1_description=self.stage1_prompt,
-            stage2_description=self.stage2_prompt,
-            stage1_fixed_midpoint_steps=self.stage1_steps,
-            stage1_initial_candidates=self.stage1_initial_candidates,
-            stage1_max_candidates=self.stage1_max_candidates,
-            stage1_margin=self.stage1_margin,
-            stage1_quality_success_threshold=self.stage1_success_threshold,
-            stage1_quality_failure_threshold=self.stage1_failure_threshold,
-            stage2_fixed_midpoint_steps=self.stage2_steps,
-            stage2_initial_candidates=self.stage2_initial_candidates,
-            stage2_max_candidates=self.stage2_max_candidates,
-            stage2_margin=self.stage2_margin,
-            stage2_quality_success_threshold=self.stage2_success_threshold,
-            stage2_quality_failure_threshold=self.stage2_failure_threshold,
+            stage1_description=str(stage1_config["prompt"]),
+            stage2_description=str(stage2_config["prompt"]),
+            stage1_fixed_midpoint_steps=int(stage1_config["steps"]),
+            stage1_initial_candidates=int(stage1_config["initial_candidates"]),
+            stage1_max_candidates=int(stage1_config["max_candidates"]),
+            stage1_margin=float(stage1_config["margin"]),
+            stage1_quality_success_threshold=float(stage1_config["success_threshold"]),
+            stage1_quality_failure_threshold=float(stage1_config["failure_threshold"]),
+            stage2_fixed_midpoint_steps=int(stage2_config["steps"]),
+            stage2_initial_candidates=int(stage2_config["initial_candidates"]),
+            stage2_max_candidates=int(stage2_config["max_candidates"]),
+            stage2_margin=float(stage2_config["margin"]),
+            stage2_quality_success_threshold=float(stage2_config["success_threshold"]),
+            stage2_quality_failure_threshold=float(stage2_config["failure_threshold"]),
             timeout=self.request_timeout,
         )
         cascade_ms = (time.perf_counter() - cascade_started) * 1000
-        stage1_kind = _prompt_stem_kind(self.stage1_prompt)
-        stage2_kind = _prompt_stem_kind(self.stage2_prompt)
+        stage1_kind = _prompt_stem_kind(str(stage1_config["prompt"]))
+        stage2_kind = _prompt_stem_kind(str(stage2_config["prompt"]))
         stage1_target_file = f"stage1_{stage1_kind}.wav"
         stage2_target_file = f"stage2_{stage2_kind}.wav"
         artifacts = {
@@ -235,6 +267,7 @@ class InferenceService:
             "model": self.model_id,
             "dtype_policy": self.dtype_policy,
             "predict_spans": self.predict_spans,
+            "requested_order": order,
             "cascade_order": [stage1_kind, stage2_kind],
             "artifacts": {
                 "stage1_target": stage1_target_file,
@@ -266,15 +299,15 @@ class InferenceService:
             },
             "stages": {
                 "stage1": {
-                    "prompt": self.stage1_prompt,
+                    "prompt": stage1_config["prompt"],
                     "input": "original_audio",
-                    "fixed_midpoint_steps": self.stage1_steps,
+                    "fixed_midpoint_steps": stage1_config["steps"],
                     **stage1_metadata,
                 },
                 "stage2": {
-                    "prompt": self.stage2_prompt,
+                    "prompt": stage2_config["prompt"],
                     "input": "stage1_residual",
-                    "fixed_midpoint_steps": self.stage2_steps,
+                    "fixed_midpoint_steps": stage2_config["steps"],
                     **stage2_metadata,
                 },
             },
@@ -349,6 +382,7 @@ def health() -> dict[str, object]:
             "predecode_inputs": service.predecode_inputs,
             "async_outputs": service.async_outputs,
         },
+        "supported_orders": ["music_first", "voice_first"],
     }
 
 
@@ -452,8 +486,14 @@ def _detailed_timing_headers(
 async def separate(
     audio: Annotated[UploadFile, File()],
     description: Annotated[str, Form(max_length=500)] = "",
+    order: Annotated[str, Form()] = "music_first",
 ) -> StreamingResponse:
     request_started = time.perf_counter()
+    if order not in {"music_first", "voice_first"}:
+        raise HTTPException(
+            status_code=422,
+            detail="order must be 'music_first' or 'voice_first'",
+        )
     suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
     try:
         with tempfile.TemporaryDirectory(prefix="sam-audio-") as directory:
@@ -463,6 +503,7 @@ async def separate(
             artifacts, sample_rate, metadata = await asyncio.to_thread(
                 service.separate_cascade,
                 str(input_path),
+                order,
             )
             inference_finished = time.perf_counter()
     finally:
@@ -475,6 +516,7 @@ async def separate(
     metadata["request"] = {
         "submitted_description": description,
         "submitted_description_used": False,
+        "requested_order": order,
     }
     metadata["timings_ms"] = {
         "upload_handler": upload_ms,
@@ -521,6 +563,7 @@ async def separate(
             "X-SAM-Audio-Package-Ms": f"{package_ms:.1f}",
             "X-SAM-Audio-Server-Ms": f"{server_ms:.1f}",
             "X-SAM-Audio-Verification-Status": str(final_status),
+            "X-SAM-Audio-Cascade-Order": order,
             "X-SAM-Audio-Stage1-Verification-Status": str(
                 stage_statuses.get("stage1", "uncertain")
             ),

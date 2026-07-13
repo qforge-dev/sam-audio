@@ -6,9 +6,13 @@ The first production slice accepts one or many long audio files, processes them
 as durable jobs, and stores reviewable music, voice, and SFX stems. Recursive
 separation of individual sound effects is deliberately out of scope.
 
-The selected separation order is **music first, then voices**. The second stage
+The default separation order is **music first, then voices**. The second stage
 receives the first stage residual. A failed or uncertain stage does not cancel
-later work; every produced stem keeps its own automatic verification state.
+later work; every produced stem keeps its own automatic verification state. If
+the complete music-first cascade fails, the worker retries **voices first, then
+music** and retains the route with the stronger final/stage status and Judge
+quality evidence. Ties retain the default order. Both attempts and the selection
+rule are persisted under `adaptive_routing`.
 
 ## Flow
 
@@ -23,12 +27,15 @@ later work; every produced stem keeps its own automatic verification state.
 5. SAM Audio separates `music soundtrack` from the original chunk, then
    `human voices` from the music residual. Candidate expansion and Judge/CLAP
    evidence determine `success`, `uncertain`, or `failure` independently for
-   each stage.
+   each stage. A failed complete cascade triggers the bounded reverse-order
+   attempt described above; it never recursively separates the SFX residual.
 6. Music, voice, and final residual (SFX) WAVs, inference metadata, timings, and
    review assertions are stored in S3 and indexed in DynamoDB.
 7. Description and transcription tasks share one Audio Flamingo queue so that a
-   single loaded model processes one item at a time. Until that worker is
-   deployed, these tasks remain durable rather than blocking stem creation.
+   single loaded model processes one item at a time. It creates one source-scene
+   analysis per audible source, one description per music stem, and one
+   speaker-labelled transcript per voice stem. Tasks exist in DynamoDB before
+   SQS delivery and are reconciled after worker/message loss.
 8. A browser dashboard shows job/queue progress. Its reviewer mode pulls the
    next `uncertain` or `failure` assertion, starts audio automatically, displays
    the prompt/assertion, and accepts one-key decisions.
@@ -104,6 +111,20 @@ The initial calibration set covers at least Music (`/m/04rlf`), Speech
 (`/m/09x0r`), Silence (`/m/028v0c`), and representative ambience/noise classes.
 These references support score calibration and regression tests; they do not
 replace per-output Judge/CLAP evidence or human review.
+
+The deployed `references/audioset/v1/` set contains eight 10-second WAVs
+(music, speech, silence, dog, engine, door, explosion, and water), a provenance
+manifest, and a manifest checksum. AudioSet metadata is CC BY 4.0 and its
+ontology is CC BY-SA 4.0; the underlying YouTube media retains its source rights
+and therefore remains private rather than being redistributed with the code.
+
+## Model licensing
+
+SAM Audio remains subject to this repository's SAM license. The Audio Flamingo
+code repository is MIT-licensed, while the deployed Audio Flamingo checkpoint is
+under NVIDIA's non-commercial model license. A production/commercial deployment
+must resolve that checkpoint license separately; keeping weights out of the
+images does not change the model license.
 
 ## Security and exposure
 

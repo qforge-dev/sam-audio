@@ -23,7 +23,9 @@ class SAMAudioClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
 
-    def separate(self, audio_path: Path, output_dir: Path) -> SeparationResult:
+    def separate(
+        self, audio_path: Path, output_dir: Path, *, order: str = "music_first"
+    ) -> SeparationResult:
         output_dir.mkdir(parents=True, exist_ok=True)
         archive_path = output_dir / "separation.zip"
         with audio_path.open("rb") as audio, httpx.Client(timeout=None) as client:
@@ -31,6 +33,7 @@ class SAMAudioClient:
                 "POST",
                 f"{self.base_url}/v1/separate",
                 files={"audio": (audio_path.name, audio, "audio/wav")},
+                data={"order": order},
             ) as response:
                 response.raise_for_status()
                 headers = dict(response.headers)
