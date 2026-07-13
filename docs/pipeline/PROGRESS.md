@@ -79,7 +79,7 @@ was an example batch size, not a workflow limit.
 - Live reference job `ae31001eec754ee6850e3727134de84e` processed the supplied
   30-second `chunk_ours/og.wav` through the normal production handler and
   created raw plus stereo music, voice, and SFX objects. The rendered dashboard
-  defaults to Raw, swaps only stem URLs when Stereo mapped is selected, and
+  defaults to Stereo mapped, swaps only stem URLs when Raw is selected, and
   displays three 32-band/EMA-0.03 trajectory plots.
 - The mapper was separately checked against the previously supplied raw
   `humanvoices.wav`: its smoothed pan moves from `-0.33` (left) to `+0.39`

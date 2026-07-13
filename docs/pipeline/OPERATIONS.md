@@ -76,7 +76,8 @@ New audible stems automatically keep both versions:
   pan/loudness curve; a backfill also writes `{chunk}.stereo.json`.
 
 In **Split data**, select a source and use **Raw / Stereo mapped** above the
-players. The original player never changes. The maps below the players show the
+players. Stereo mapped is selected by default; Raw remains available. The
+original player never changes. The maps below the players show the
 smoothed trajectory; left is below the center line and right is above it.
 Version 2 applies frequency-specific panning but only broadband gain, preventing
 the mapper from making stems bass-heavy. A source with neither music nor voices
