@@ -24,7 +24,12 @@ class SAMAudioClient:
         self.base_url = base_url.rstrip("/")
 
     def separate(
-        self, audio_path: Path, output_dir: Path, *, order: str = "music_first"
+        self,
+        audio_path: Path,
+        output_dir: Path,
+        *,
+        order: str = "music_first",
+        targets: tuple[str, ...] = ("music", "voice"),
     ) -> SeparationResult:
         output_dir.mkdir(parents=True, exist_ok=True)
         archive_path = output_dir / "separation.zip"
@@ -33,7 +38,7 @@ class SAMAudioClient:
                 "POST",
                 f"{self.base_url}/v1/separate",
                 files={"audio": (audio_path.name, audio, "audio/wav")},
-                data={"order": order},
+                data={"order": order, "targets": ",".join(targets)},
             ) as response:
                 response.raise_for_status()
                 headers = dict(response.headers)
@@ -51,10 +56,10 @@ class SAMAudioClient:
         metadata = json.loads((extracted / "metadata.json").read_text())
         artifact_metadata = metadata.get("artifacts", {})
         canonical = artifact_metadata.get("canonical_stems", {})
-        required = {"music", "voice", "sfx"}
+        required = set(targets) | {"sfx"}
         if not required.issubset(canonical):
             raise ValueError(
-                "SAM API metadata must map canonical music, voice, and sfx stems"
+                f"SAM API metadata must map canonical stems: {sorted(required)}"
             )
         stems = {stem: extracted / canonical[stem] for stem in sorted(required)}
         missing = [stem for stem, path in stems.items() if not path.is_file()]

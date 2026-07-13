@@ -309,7 +309,7 @@
         const summary = currentDataset.summary;
         $("#dataset-name").textContent = currentDataset.dataset.name;
         $("#dataset-metrics").innerHTML = [
-          metric("Sounds", summary.sources, `${summary.jobs} upload job(s)`),
+          metric("Sounds", summary.sources, `${summary.jobs} upload job(s) · ${summary.non_stereo_sources || 0} non-stereo skipped`),
           metric("Duration", formatDuration(summary.duration_seconds), "original audio"),
           metric("Storage", formatBytes(summary.total_bytes), `${formatBytes(summary.input_bytes)} originals · ${formatBytes(summary.chunk_bytes)} chunks · ${formatBytes(summary.stem_bytes)} raw stems · ${formatBytes(summary.stereo_bytes)} stereo`),
           metric("Chunks", summary.chunks, `${summary.skipped_chunks} sound-gated`),
@@ -319,9 +319,10 @@
         $("#source-list").innerHTML = currentDataset.sources.map(source => {
           const needsReview = (source.stem_statuses.failure || 0) + (source.stem_statuses.uncertain || 0);
           const route = source.selected_order ? ` · ${source.selected_order.replace("_", " ")}` : "";
+          const skipped = source.skip_reason === "non_stereo_input" ? " · skipped: input is not stereo" : "";
           return `<button class="source-item ${source.source_id === currentSourceId ? "active" : ""}" data-source="${escapeHtml(source.source_id)}" onclick="loadSource('${escapeHtml(source.job_id)}', '${escapeHtml(source.source_id)}')">
             <strong>${escapeHtml(source.filename)}</strong>
-            <small>${escapeHtml(source.pipeline_status)} · ${formatDuration(source.duration_seconds)} · ${source.stem_count} stem(s)${escapeHtml(route)}${needsReview ? ` · ${needsReview} need review` : ""}</small>
+            <small>${escapeHtml(source.pipeline_status)} · ${formatDuration(source.duration_seconds)} · ${source.stem_count} stem(s)${escapeHtml(route)}${escapeHtml(skipped)}${needsReview ? ` · ${needsReview} need review` : ""}</small>
           </button>`;
         }).join("") || '<div class="empty">No uploaded sounds yet.</div>';
         const target = preferredSource || currentSourceId;
@@ -365,7 +366,10 @@
         }).join(" ");
         const summary = mapping.pan_summary || {};
         const color = {music: "var(--music)", voice: "var(--voice)", sfx: "var(--sfx)"}[stem.stem_type] || "var(--accent)";
-        return `<div class="stereo-map"><div class="stereo-map-head"><b>${escapeHtml(stem.stem_type)} stereo map</b><span>${mapping.frequency_bands || "–"} bands · EMA ${mapping.smoothing?.alpha ?? "–"}</span></div><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-label="Smoothed left-right trajectory"><line class="center-line" x1="0" y1="${height / 2}" x2="${width}" y2="${height / 2}"></line><polyline class="pan-line" style="stroke:${color}" points="${points}"></polyline></svg><div class="stereo-map-foot"><span>starts ${panSide(summary.start)}</span><span>ends ${panSide(summary.end)}</span></div></div>`;
+        const mappingLabel = mapping.tonal_transfer === "identity"
+          ? "identity · no EQ"
+          : `${mapping.frequency_bands || "–"} bands · EMA ${mapping.smoothing?.alpha ?? "–"} · broadband gain`;
+        return `<div class="stereo-map"><div class="stereo-map-head"><b>${escapeHtml(stem.stem_type)} stereo map</b><span>${escapeHtml(mappingLabel)}</span></div><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-label="Smoothed left-right trajectory"><line class="center-line" x1="0" y1="${height / 2}" x2="${width}" y2="${height / 2}"></line><polyline class="pan-line" style="stroke:${color}" points="${points}"></polyline></svg><div class="stereo-map-foot"><span>starts ${panSide(summary.start)}</span><span>ends ${panSide(summary.end)}</span></div></div>`;
       }
 
       function setStereoMapping(enabled) {
@@ -388,6 +392,9 @@
           ? `AudioSet · ${labels.join(", ") || "labelled sound"} · source ${provenance.start_seconds}s–${provenance.end_seconds}s`
           : `${formatDuration(source.duration_seconds)} · ${formatBytes(source.bytes)}`;
         const original = trackRow("original", "Original", "OG sound", source.audio_url);
+        const sourceSkip = source.skip_reason === "non_stereo_input"
+          ? '<div class="chunk"><div class="chunk-head"><span>Input filter</span><span class="status">skipped</span></div><div class="gate-skip">This source was not processed because the pipeline accepts exactly two-channel stereo input.</div></div>'
+          : "";
         const hasStereo = data.chunks.some(chunk => chunk.stems.some(stem => stem.stereo_audio_url));
         const chunks = data.chunks.map(chunk => {
           if (chunk.status === "skipped") {
@@ -413,6 +420,7 @@
         $("#source-detail").innerHTML = `
           <div class="source-header"><div><div class="eyebrow">Sound detail</div><h2>${escapeHtml(source.filename)}</h2><div class="source-meta">${escapeHtml(provenanceText)}</div></div><div class="source-actions">${hasStereo ? `<div class="mode-toggle" aria-label="Stem playback mode"><button class="${stereoMappingEnabled ? "" : "active"}" onclick="setStereoMapping(false)">Raw</button><button class="${stereoMappingEnabled ? "active" : ""}" onclick="setStereoMapping(true)">Stereo mapped</button></div>` : ""}<span class="status ${escapeHtml(source.pipeline_status)}">${escapeHtml(source.pipeline_status)}</span></div></div>
           <div class="track-stack">${original || '<div class="gate-skip">Original upload is not available.</div>'}</div>
+          ${sourceSkip}
           ${chunks}
           <div class="card pipeline-overview"><div class="eyebrow">How it moved through the pipeline</div><div class="steps">${steps}</div><div class="annotations">${annotations || '<div class="muted">No model annotations yet.</div>'}</div></div>`;
       }

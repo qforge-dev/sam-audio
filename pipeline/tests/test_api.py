@@ -264,6 +264,7 @@ def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
     assert overview["summary"] == {
         "jobs": 1,
         "sources": 1,
+        "non_stereo_sources": 0,
         "duration_seconds": 10.0,
         "input_bytes": 1000,
         "chunk_bytes": 50,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import json
 import logging
 import tempfile
 import uuid
@@ -10,11 +12,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .audio import chunk_audio, gate_wav, sha256_file
+from .audio import chunk_audio, gate_wav, probe_channels, probe_duration, sha256_file
 from .aws import PipelineAWS
 from .config import Settings
 from .flamingo_client import AudioFlamingoClient
-from .model_client import SAMAudioClient
+from .model_client import SAMAudioClient, SeparationResult
 from .schema import QueueTask, StemRecord, VerificationStatus, utc_now
 from .stereo import StereoMappedStem, map_stems_to_stereo
 
@@ -31,6 +33,29 @@ PROMPTS = {
     "voice": "human voices",
     "sfx": "residual after music and voice separation",
 }
+
+
+def _scene_presence(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    value: Any = None
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            value = loader(cleaned)
+        except (ValueError, SyntaxError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            break
+    parsed = isinstance(value, dict) and isinstance(
+        value.get("has_music"), bool
+    ) and isinstance(value.get("has_voices"), bool)
+    return {
+        "has_music": bool(value.get("has_music")) if parsed else True,
+        "has_voices": bool(value.get("has_voices")) if parsed else True,
+        "parsed": parsed,
+        "raw_text": text,
+    }
 
 
 def _terminal_job_summary(items: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -87,13 +112,32 @@ class IngestHandler:
             source_key,
             {"status": "running", "updated_at": utc_now()},
         )
-        separation_tasks: list[QueueTask] = []
         with tempfile.TemporaryDirectory(prefix="sam-ingest-") as temporary:
             root = Path(temporary)
             suffix = Path(source["filename"]).suffix or ".audio"
             local_source = root / f"source{suffix}"
             self.aws.download_file(source["s3_key"], local_source)
             source_bytes = local_source.stat().st_size
+            source_channels = probe_channels(local_source)
+            source_sha256 = sha256_file(local_source)
+            if source_channels != 2:
+                self.aws.update(
+                    f"JOB#{task.job_id}",
+                    source_key,
+                    {
+                        "status": "complete",
+                        "skip_reason": "non_stereo_input",
+                        "input_channels": source_channels,
+                        "chunk_count": 0,
+                        "audible_chunk_count": 0,
+                        "bytes": source_bytes,
+                        "duration_seconds": probe_duration(local_source),
+                        "source_sha256": source_sha256,
+                        "updated_at": utc_now(),
+                    },
+                )
+                self._refresh_job(task.job_id)
+                return
             chunks = chunk_audio(
                 local_source,
                 root / "chunks",
@@ -102,7 +146,6 @@ class IngestHandler:
                 peak_threshold_dbfs=self.settings.gate_peak_dbfs,
                 rms_threshold_dbfs=self.settings.gate_rms_dbfs,
             )
-            source_sha256 = sha256_file(local_source)
             audible_count = 0
             for chunk in chunks:
                 chunk_key = (
@@ -119,19 +162,7 @@ class IngestHandler:
                             self.aws.update(
                                 f"JOB#{task.job_id}",
                                 chunk_sk,
-                                {"status": "queued", "updated_at": utc_now()},
-                            )
-                            separation_tasks.append(
-                                QueueTask(
-                                    task_id=(
-                                        f"sam:{task.job_id}:{task.source_id}:"
-                                        f"{chunk.chunk_id}"
-                                    ),
-                                    task_type="separate_chunk",
-                                    job_id=task.job_id,
-                                    source_id=task.source_id,
-                                    chunk_id=chunk.chunk_id,
-                                )
+                                {"status": "waiting_scene", "updated_at": utc_now()},
                             )
                     continue
                 item = {
@@ -145,7 +176,7 @@ class IngestHandler:
                     "end_seconds": chunk.end_seconds,
                     "sha256": chunk.sha256,
                     "gate": chunk.gate.model_dump(mode="json"),
-                    "status": "queued" if chunk.gate.audible else "skipped",
+                    "status": "waiting_scene" if chunk.gate.audible else "skipped",
                     "s3_key": chunk_key if chunk.gate.audible else None,
                     "bytes": chunk.path.stat().st_size if chunk.gate.audible else 0,
                     "created_at": utc_now(),
@@ -156,15 +187,7 @@ class IngestHandler:
                     continue
                 audible_count += 1
                 self.aws.upload_file(chunk.path, chunk_key, "audio/wav")
-                separation_task = QueueTask(
-                    task_id=f"sam:{task.job_id}:{task.source_id}:{chunk.chunk_id}",
-                    task_type="separate_chunk",
-                    job_id=task.job_id,
-                    source_id=task.source_id,
-                    chunk_id=chunk.chunk_id,
-                )
-                separation_tasks.append(separation_task)
-        status = "chunked" if audible_count else "complete"
+        status = "analyzing" if audible_count else "complete"
         self.aws.update(
             f"JOB#{task.job_id}",
             source_key,
@@ -177,11 +200,10 @@ class IngestHandler:
                     (chunk.end_seconds for chunk in chunks), default=0.0
                 ),
                 "source_sha256": source_sha256,
+                "input_channels": source_channels,
                 "updated_at": utc_now(),
             },
         )
-        for separation_task in separation_tasks:
-            self.aws.send_task(self.settings.sam_queue_url, separation_task)
         if audible_count:
             scene_task = QueueTask(
                 task_id=f"scene:{task.job_id}:{task.source_id}",
@@ -239,8 +261,16 @@ class SeparationHandler:
             root = Path(temporary)
             input_path = root / "chunk.wav"
             self.aws.download_file(chunk["s3_key"], input_path)
-            result = self._separate_with_policy(input_path, root)
-            statuses = self._statuses(result.metadata)
+            targets = tuple(
+                task.targets
+                if task.targets is not None
+                else chunk.get("presence_gate", {}).get(
+                    "targets", ["music", "voice"]
+                )
+            )
+            result = self._separate_with_policy(input_path, root, targets=targets)
+            result.metadata["presence_gate"] = chunk.get("presence_gate", {})
+            statuses = self._statuses(result.metadata, set(result.stems))
             stage_by_kind = {
                 kind: f"stage{index}"
                 for index, kind in enumerate(
@@ -261,7 +291,7 @@ class SeparationHandler:
                     input_path, result.stems, root / "stereo"
                 )
                 result.metadata["stereo_mapping"] = {
-                    "algorithm": "frequency_masked_pan_v1",
+                    "algorithm": "frequency_masked_pan_v2",
                     "stems": {
                         stem_type: mapped.metadata
                         for stem_type, mapped in stereo_stems.items()
@@ -371,11 +401,71 @@ class SeparationHandler:
         )
         self._refresh_job(task.job_id)
 
-    def _separate_with_policy(self, input_path: Path, root: Path):
+    def _separate_with_policy(
+        self,
+        input_path: Path,
+        root: Path,
+        *,
+        targets: tuple[str, ...] = ("music", "voice"),
+    ) -> SeparationResult:
+        if not targets:
+            metadata: dict[str, Any] = {
+                "schema_version": 4,
+                "model": "semantic_presence_passthrough",
+                "verification_status": "success",
+                "verification": {
+                    "status": "success",
+                    "stage_statuses": {},
+                    "processing_policy": (
+                        "Source-scene preflight found no music or voices; SAM "
+                        "inference was skipped and the stereo input was retained "
+                        "as the SFX stem."
+                    ),
+                },
+                "requested_order": "none",
+                "requested_targets": [],
+                "cascade_order": [],
+                "inference_timings_ms": {"service_total": 0.0},
+                "stages": {},
+                "adaptive_routing": {
+                    "policy_version": 2,
+                    "trigger": "semantic_presence_no_targets",
+                    "attempts": [],
+                    "selected_order": "sfx_only",
+                    "selection_rule": "No separation target was present.",
+                },
+            }
+            return SeparationResult(
+                directory=root,
+                metadata=metadata,
+                stems={"sfx": input_path},
+                response_headers={},
+            )
+        if len(targets) == 1:
+            target = targets[0]
+            order = "music_first" if target == "music" else "voice_first"
+            selected = self.client.separate(
+                input_path,
+                root / f"{target}-only",
+                order=order,
+                targets=targets,
+            )
+            selected.metadata["adaptive_routing"] = {
+                "policy_version": 2,
+                "default_order": order,
+                "trigger": "semantic_presence_single_target",
+                "attempts": [self._attempt_summary(selected.metadata)],
+                "selected_order": f"{target}_only",
+                "selection_rule": (
+                    f"Source-scene preflight requested only the {target} stage."
+                ),
+            }
+            return selected
         primary = self.client.separate(
             input_path,
             root / "music-first",
             order="music_first",
+            targets=targets,
         )
         attempts = [self._attempt_summary(primary.metadata)]
         selected = primary
@@ -385,6 +475,7 @@ class SeparationHandler:
                 input_path,
                 root / "voice-first",
                 order="voice_first",
+                targets=targets,
             )
             attempts.append(self._attempt_summary(fallback.metadata))
             trigger = "primary_failure_retry"
@@ -393,7 +484,7 @@ class SeparationHandler:
             ):
                 selected = fallback
         selected.metadata["adaptive_routing"] = {
-            "policy_version": 1,
+            "policy_version": 2,
             "default_order": "music_first",
             "trigger": trigger,
             "attempts": attempts,
@@ -446,7 +537,9 @@ class SeparationHandler:
         }
 
     @staticmethod
-    def _statuses(metadata: dict[str, Any]) -> dict[str, VerificationStatus]:
+    def _statuses(
+        metadata: dict[str, Any], stem_types: set[str]
+    ) -> dict[str, VerificationStatus]:
         verification = metadata.get("verification", {})
         stages = verification.get("stage_statuses", {})
         cascade_order = metadata.get("cascade_order", ["music", "voice"])
@@ -454,11 +547,15 @@ class SeparationHandler:
             kind: stages.get(f"stage{index}", "uncertain")
             for index, kind in enumerate(cascade_order, start=1)
         }
-        return {
-            "music": VerificationStatus(by_kind.get("music", "uncertain")),
-            "voice": VerificationStatus(by_kind.get("voice", "uncertain")),
-            "sfx": VerificationStatus(metadata.get("verification_status", "uncertain")),
+        statuses = {
+            kind: VerificationStatus(by_kind.get(kind, "uncertain"))
+            for kind in stem_types & {"music", "voice"}
         }
+        if "sfx" in stem_types:
+            statuses["sfx"] = VerificationStatus(
+                metadata.get("verification_status", "uncertain")
+            )
+        return statuses
 
     def _enqueue_flamingo(self, task: QueueTask, stem_type: str) -> None:
         task_type = {
@@ -623,12 +720,14 @@ class Reconciler:
         self.aws.send_task(self.settings.ingest_queue_url, task)
 
     def _enqueue_sam(self, job_id: str, chunk: dict[str, Any]) -> None:
+        presence_targets = chunk.get("presence_gate", {}).get("targets")
         task = QueueTask(
             task_id=uuid.uuid4().hex,
             task_type="separate_chunk",
             job_id=job_id,
             source_id=chunk["source_id"],
             chunk_id=chunk["chunk_id"],
+            targets=presence_targets,
         )
         self.aws.update(
             f"JOB#{job_id}",
@@ -641,9 +740,10 @@ class Reconciler:
 class FlamingoHandler:
     PROMPTS = {
         "describe_scene": (
-            "Analyze the complete audio. Return concise JSON with keys "
+            "Analyze the complete audio. Return strict JSON with keys "
             "has_music (boolean), has_voices (boolean), music_description "
-            "(string or null), and scene_description (one sentence)."
+            "(string or null), and scene_description (one sentence). Do not "
+            "use Markdown or Python literals."
         ),
         "describe_music": (
             "Describe only the music in this audio in one concise sentence, "
@@ -725,6 +825,8 @@ class FlamingoHandler:
                 "updated_at": utc_now(),
             },
         )
+        if task.task_type == "describe_scene":
+            self._schedule_separation(task, result)
         self.aws.update(
             f"JOB#{task.job_id}",
             task_sk,
@@ -748,6 +850,61 @@ class FlamingoHandler:
         if not item or not item.get("s3_key"):
             raise KeyError(f"Audio input record is missing: {target_sk}")
         return item["s3_key"], target_sk
+
+    def _schedule_separation(
+        self, task: QueueTask, result: dict[str, Any]
+    ) -> None:
+        presence = _scene_presence(str(result.get("text") or ""))
+        targets = [
+            kind
+            for kind, present in (
+                ("music", presence["has_music"]),
+                ("voice", presence["has_voices"]),
+            )
+            if present
+        ]
+        presence_gate = {
+            **presence,
+            "targets": targets,
+            "model": result.get("model"),
+            "policy": "source_scene_preflight_v1",
+        }
+        self.aws.update(
+            f"JOB#{task.job_id}",
+            f"SOURCE#{task.source_id}",
+            {
+                "status": "chunked",
+                "semantic_presence": presence_gate,
+                "updated_at": utc_now(),
+            },
+        )
+        for chunk in self.aws.query_partition(f"JOB#{task.job_id}"):
+            if (
+                chunk.get("entity") != "chunk"
+                or chunk.get("source_id") != task.source_id
+                or chunk.get("status") not in {"waiting_scene", "failed"}
+            ):
+                continue
+            separation_task = QueueTask(
+                task_id=(
+                    f"sam:{task.job_id}:{task.source_id}:{chunk['chunk_id']}"
+                ),
+                task_type="separate_chunk",
+                job_id=task.job_id,
+                source_id=task.source_id,
+                chunk_id=str(chunk["chunk_id"]),
+                targets=targets,
+            )
+            self.aws.update(
+                f"JOB#{task.job_id}",
+                str(chunk["SK"]),
+                {
+                    "status": "queued",
+                    "presence_gate": presence_gate,
+                    "updated_at": utc_now(),
+                },
+            )
+            self.aws.send_task(self.settings.sam_queue_url, separation_task)
 
     def _refresh_job(self, job_id: str) -> None:
         items = self.aws.query_partition(f"JOB#{job_id}")

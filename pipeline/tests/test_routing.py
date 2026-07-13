@@ -4,7 +4,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from sam_audio_pipeline.handlers import IngestHandler, SeparationHandler
+from sam_audio_pipeline.handlers import (
+    FlamingoHandler,
+    IngestHandler,
+    SeparationHandler,
+    _scene_presence,
+)
+from sam_audio_pipeline.schema import QueueTask
 
 
 def metadata(
@@ -38,7 +44,14 @@ class FakeClient:
         self.results = results
         self.orders: list[str] = []
 
-    def separate(self, _: Path, __: Path, *, order: str):
+    def separate(
+        self,
+        _: Path,
+        __: Path,
+        *,
+        order: str,
+        targets: tuple[str, ...] = ("music", "voice"),
+    ):
         self.orders.append(order)
         return SimpleNamespace(metadata=self.results[order])
 
@@ -91,6 +104,27 @@ def test_successful_primary_route_does_not_retry(tmp_path: Path) -> None:
     assert selected.metadata["adaptive_routing"]["selected_order"] == "music_first"
 
 
+def test_no_presence_targets_bypasses_sam_and_keeps_input_as_sfx(
+    tmp_path: Path,
+) -> None:
+    handler = object.__new__(SeparationHandler)
+    input_path = tmp_path / "input.wav"
+    input_path.write_bytes(b"stereo-placeholder")
+
+    selected = handler._separate_with_policy(
+        input_path, tmp_path / "result", targets=()
+    )
+
+    assert selected.stems == {"sfx": input_path}
+    assert selected.metadata["requested_targets"] == []
+    assert selected.metadata["inference_timings_ms"]["service_total"] == 0.0
+    assert (
+        selected.metadata["adaptive_routing"]["trigger"]
+        == "semantic_presence_no_targets"
+    )
+    assert selected.metadata["adaptive_routing"]["selected_order"] == "sfx_only"
+
+
 class RefreshAWS:
     def __init__(self, items: list[dict[str, Any]]):
         self.items = items
@@ -137,6 +171,76 @@ def test_job_stays_running_when_any_source_has_audible_chunks() -> None:
     handler._refresh_job("job-1")
 
     assert aws.updates[-1]["status"] == "running"
+
+
+def test_scene_presence_parses_flamingo_python_dict_and_fails_open() -> None:
+    parsed = _scene_presence(
+        "{'has_music': False, 'has_voices': False, 'scene_description': 'writing'}"
+    )
+    assert parsed["parsed"] is True
+    assert parsed["has_music"] is False
+    assert parsed["has_voices"] is False
+    assert _scene_presence("not structured") == {
+        "has_music": True,
+        "has_voices": True,
+        "parsed": False,
+        "raw_text": "not structured",
+    }
+
+
+class PresenceAWS:
+    def __init__(self) -> None:
+        self.items = [
+            {
+                "SK": "SOURCE#source-1",
+                "entity": "source",
+                "source_id": "source-1",
+                "status": "analyzing",
+            },
+            {
+                "SK": "CHUNK#source-1#000000",
+                "entity": "chunk",
+                "source_id": "source-1",
+                "chunk_id": "000000",
+                "status": "waiting_scene",
+            },
+        ]
+        self.queued: list[QueueTask] = []
+
+    def update(self, _: str, sk: str, values: dict[str, Any]) -> None:
+        next(item for item in self.items if item["SK"] == sk).update(values)
+
+    def query_partition(self, _: str) -> list[dict[str, Any]]:
+        return self.items
+
+    def send_task(self, _: str, task: QueueTask) -> None:
+        self.queued.append(task)
+
+
+def test_scene_preflight_queues_sfx_passthrough_when_targets_are_absent() -> None:
+    aws = PresenceAWS()
+    handler = object.__new__(FlamingoHandler)
+    handler.aws = aws
+    handler.settings = SimpleNamespace(sam_queue_url="sam")
+
+    handler._schedule_separation(
+        QueueTask(
+            task_id="scene-1",
+            task_type="describe_scene",
+            job_id="job-1",
+            source_id="source-1",
+        ),
+        {
+            "model": "flamingo",
+            "text": "{'has_music': False, 'has_voices': False}",
+        },
+    )
+
+    assert aws.queued[0].targets == []
+    chunk = aws.items[1]
+    assert chunk["status"] == "queued"
+    assert chunk["presence_gate"]["targets"] == []
+    assert aws.items[0]["semantic_presence"]["parsed"] is True
 
 
 def test_final_sam_chunk_closes_job_when_annotations_already_finished() -> None:

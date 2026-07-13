@@ -18,37 +18,47 @@ rule are persisted under `adaptive_routing`.
 
 1. The control API appends an upload job to a persistent dataset and returns S3 upload URLs. API requests finish
    after durable acceptance; they do not stay open while inference is queued.
-2. An ingestion worker normalizes each source with FFmpeg and creates 30-second
-   chunks with 5-second overlap. The final short chunk is retained.
+2. An ingestion worker probes the source before chunking. Exactly two-channel
+   stereo is required; mono and multichannel sources are durably marked
+   `non_stereo_input` and skipped without model work. Accepted sources are
+   normalized with FFmpeg into 30-second chunks with 5-second overlap. The
+   final short chunk is retained.
 3. A sound gate measures peak and RMS level. Empty or extremely quiet chunks are
    marked `skipped` without consuming GPU time.
-4. Each audible chunk is sent to the single SAM Audio queue. One GPU worker
-   receives one message at a time and calls the local `sam-audio-small-tv` API.
-5. SAM Audio separates `music soundtrack` from the original chunk, then
-   `human voices` from the music residual. Candidate expansion and Judge/CLAP
+4. Audio Flamingo analyzes the complete source before SAM work is scheduled and
+   returns `has_music` and `has_voices`. A malformed response fails open to both
+   targets; a valid negative prevents that separation stage from running.
+5. Each audible chunk is sent to the single SAM Audio queue with zero, one, or
+   two requested targets. Zero targets retains the normalized stereo chunk as a
+   bit-identical SFX pass-through without calling SAM. One target runs one SAM
+   stage. Two targets use the normal cascade.
+6. SAM Audio normally separates `music soundtrack` from the original chunk,
+   then `human voices` from the music residual. Candidate expansion and Judge/CLAP
    evidence determine `success`, `uncertain`, or `failure` independently for
    each stage. A failed complete cascade triggers the bounded reverse-order
    attempt described above; it never recursively separates the SFX residual.
-6. Music, voice, and final residual (SFX) WAVs are retained as the original mono
+   These judges measure candidate quality, not whether the requested sound was
+   present; source-scene preflight owns presence decisions.
+7. Music, voice, and final residual (SFX) WAVs are retained as the original mono
    model outputs. A CPU post-process also creates a stereo companion for every
    audible stem by matching it against the original stereo chunk in 32
-   log-frequency bands. Per-band left/right correlation and loudness are
-   smoothed with a bidirectional EMA (`alpha=0.03`) in time and a three-bin
-   frequency kernel before equal-power panning. Only a final peak limiter is
-   allowed to alter the reconstructed level.
-7. Raw and stereo-mapped WAVs, the 120-point pan/loudness trajectory, inference
+   log-frequency bands. Per-band left/right correlation controls panning, while
+   loudness transfer is broadband so it cannot re-EQ the stem. Both are smoothed
+   with a bidirectional EMA (`alpha=0.03`) before equal-power panning. An SFX-only
+   pass-through bypasses mapping and keeps the original stereo PCM exactly.
+8. Raw and stereo-mapped WAVs, the 120-point pan/loudness trajectory, inference
    metadata, timings, and review assertions are stored in S3 and indexed in
    DynamoDB. A stereo mapping failure never discards or delays the raw result.
-8. Description and transcription tasks share one Audio Flamingo queue so that a
+9. Description and transcription tasks share one Audio Flamingo queue so that a
    single loaded model processes one item at a time. It creates one source-scene
    analysis per audible source, one description per music stem, and one
    speaker-labelled transcript per voice stem. Tasks exist in DynamoDB before
    SQS delivery and are reconciled after worker/message loss.
-9. A browser dashboard shows job/queue progress and exact remaining review
+10. A browser dashboard shows job/queue progress and exact remaining review
    counts. Its reviewer mode pulls the next `uncertain` or `failure` assertion,
    starts audio automatically, displays the prompt/assertion, and accepts
    one-key decisions.
-10. The dataset explorer reports source count, duration, input/chunk/stem storage,
+11. The dataset explorer reports source count, duration, input/chunk/stem storage,
    processing counts, stem mix, and review backlog. Each source displays the
    original recording first, then only the music/voice/SFX stems that passed the
    output sound gate, grouped by chunk, followed by its processing route and

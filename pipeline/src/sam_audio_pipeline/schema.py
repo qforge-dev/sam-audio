@@ -82,6 +82,7 @@ class QueueTask(BaseModel):
     job_id: str
     source_id: str
     chunk_id: str | None = None
+    targets: list[Literal["music", "voice"]] | None = None
     attempt: int = 0
     created_at: str = Field(default_factory=utc_now)
 

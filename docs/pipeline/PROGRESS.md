@@ -32,6 +32,8 @@ was an example batch size, not a workflow limit.
   original-plus-stems source explorer.
 - [x] Add frequency-aware stereo/loudness reconstruction while preserving every
   raw mono stem, plus a dashboard playback toggle and smoothed trajectory plots.
+- [x] Require stereo input, gate SAM targets with source-scene presence, support
+  single-stage inference, and use identity pass-through for pure SFX sources.
 - [x] Add persistent datasets, successive upload jobs, and reconciliation of
   uploaded/stale work from DynamoDB back into SQS.
 - [x] Provision AWS, deploy services, and run a multi-file end-to-end test.
@@ -60,17 +62,20 @@ was an example batch size, not a workflow limit.
   191,551,793 bytes.
 - Dataset `991945c1f082446a9ff66d482838f964`, job
   `3f0233f2442f4044a0f2967c68cb5a89`, completed all 100 sources and chunks with
-  zero failed chunks. It stored 284 audible stems (94 music, 91 voice, 99 SFX)
+  zero failed chunks. It initially stored 284 audible stems (94 music, 91 voice,
+  99 SFX)
   and omitted 16 below-gate outputs (6 music, 9 voice, 1 SFX). The selected
   route was music-first for 63 sounds and voice-first for 37.
-- The completed random dataset contains 624.4 MiB of indexed originals,
-  normalized chunks, and raw stems plus 543,877,704 bytes of mapped stereo
-  companions. All 284 audible stems were backfilled without replacing their
-  raw keys. Automatic verification placed 161 stems in
-  success, 54 in uncertain, and 69 in failure, leaving 123 review items.
+- After the presence repair, the completed random dataset contains 282 stems
+  and 540,037,650 bytes of mapped stereo companions. All 282 companions were
+  force-migrated to stereo v2 (or the identity path) without replacing their
+  raw keys. Automatic verification places 159 stems in success, 54 in
+  uncertain, and 69 in failure, leaving 123 review items.
 - Browser verification confirms the review screen shows exact remaining,
   failure, and uncertain counts; the dataset screen shows 100 sounds and its
-  storage breakdown; and gated stems are absent from the stacked track view.
+  storage breakdown; gated stems are absent from the stacked track view; the
+  repaired writing source shows `sfx only` plus `identity · no EQ`; and the mono
+  canary shows the explicit stereo-input skip reason.
 - Live reference job `ae31001eec754ee6850e3727134de84e` processed the supplied
   30-second `chunk_ours/og.wav` through the normal production handler and
   created raw plus stereo music, voice, and SFX objects. The rendered dashboard
@@ -81,6 +86,17 @@ was an example batch size, not a workflow limit.
   (right), matching the attached chunk-zero analysis. All three 30-second stems
   map in about 0.58 seconds locally; the fresh remote job mapped its three stems
   in about 1.02 seconds.
+- Source `099_writing_mHf7COLGcD0_170.wav` exposed both failure modes: its scene
+  annotation correctly said no music and no voices, but the old cascade still
+  created three `success` stems, and stereo v1 reduced music high-frequency
+  energy from 8.7% to 0.8%. Stereo v2 retains 7.8% on the same raw stem. The live
+  source was repaired from its stored scene evidence and now has one SFX-only
+  stem; raw, mapped, and original normalized PCM are sample-identical. The
+  dataset now indexes 282 stems (93 music, 90 voice, 99 SFX).
+- Live mono-filter job `5ec26b1bb28b420a9245e21d475d26be` completed with
+  `non_stereo_input`, one input channel, zero chunks, zero stems, and zero model
+  tasks. A live `targets=voice` API canary produced only voice and residual
+  artifacts in one 12.8-second SAM stage.
 - Multi-file job `bd85486f9d314c258956cac9b81a730f` completed: one 30-second
   audible source produced exactly one chunk and three stems; one silent source
   was sound-gated without GPU work; all three Audio Flamingo tasks completed.
@@ -90,7 +106,7 @@ was an example batch size, not a workflow limit.
 - Recovery job `1d07979ee96a45a98cf220b102fd7006` was uploaded without the
   completion callback. Reconciliation found the S3 object, enqueued ingestion,
   and completed it as sound-gated. All three queues were empty afterward.
-- Local and remote validation: 28 pipeline tests pass; the existing 12 SAM
+- Local and remote validation: 36 pipeline tests pass; the existing 12 SAM
   batching tests also pass.
 - Docker build execution remains unverified because neither the local Mac nor
   the current H100 host has a Docker daemon. Both Dockerfiles remain model-free.

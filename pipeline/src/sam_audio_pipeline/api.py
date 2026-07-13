@@ -173,6 +173,10 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
         "summary": {
             "jobs": len(jobs),
             "sources": len(all_sources),
+            "non_stereo_sources": sum(
+                source.get("skip_reason") == "non_stereo_input"
+                for source in all_sources
+            ),
             "duration_seconds": sum(
                 float(source.get("duration_seconds") or 0.0) for source in all_sources
             ),

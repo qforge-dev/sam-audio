@@ -72,6 +72,18 @@ curl -f http://localhost:8000/v1/separate \
   -o separation.zip
 ```
 
+The optional `targets` form field accepts `music`, `voice`, or
+`music,voice` (default). A single target runs only one generation stage and the
+ZIP contains that target plus its SFX residual. The durable pipeline sets this
+field from its Audio Flamingo source-scene presence preflight:
+
+```bash
+curl -f http://localhost:8000/v1/separate \
+  -F audio=@mixture.wav \
+  -F targets=voice \
+  -o voice-and-residual.zip
+```
+
 Generation, prompt, batching, and TF32 policy are configured with the
 `SAM_AUDIO_*` environment variables demonstrated in
 [`deploy/start-sam-audio-api.sh`](deploy/start-sam-audio-api.sh). A supplied

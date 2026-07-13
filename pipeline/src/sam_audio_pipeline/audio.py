@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import subprocess
 import wave
@@ -61,6 +62,28 @@ def probe_duration(path: Path) -> float:
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError(f"Invalid audio duration for {path}: {duration}")
     return duration
+
+
+def probe_channels(path: Path) -> int:
+    result = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=channels",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    streams = json.loads(result.stdout).get("streams", [])
+    channels = int(streams[0].get("channels") or 0) if streams else 0
+    if channels <= 0:
+        raise ValueError(f"Audio channel count is unavailable for {path}")
+    return channels
 
 
 def gate_wav(

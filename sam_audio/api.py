@@ -164,9 +164,7 @@ class InferenceService:
             )
         return audio
 
-    def _cascade_configs(
-        self, order: str
-    ) -> tuple[dict[str, object], dict[str, object]]:
+    def _config_for_kind(self, kind: str) -> dict[str, object]:
         by_kind = {
             "music": {
                 "prompt": self.stage1_prompt,
@@ -187,13 +185,107 @@ class InferenceService:
                 "failure_threshold": self.stage2_failure_threshold,
             },
         }
+        if kind not in by_kind:
+            raise ValueError("target must be 'music' or 'voice'")
+        return by_kind[kind]
+
+    def _cascade_configs(
+        self, order: str
+    ) -> tuple[dict[str, object], dict[str, object]]:
         kinds = {
             "music_first": ("music", "voice"),
             "voice_first": ("voice", "music"),
         }.get(order)
         if kinds is None:
             raise ValueError("order must be 'music_first' or 'voice_first'")
-        return by_kind[kinds[0]], by_kind[kinds[1]]
+        return self._config_for_kind(kinds[0]), self._config_for_kind(kinds[1])
+
+    def separate_single(
+        self, audio_path: str, target: str
+    ) -> tuple[dict[str, torch.Tensor], int, dict[str, object]]:
+        if self.batcher is None or self.processor is None:
+            raise RuntimeError("Model is not loaded")
+        service_started = time.perf_counter()
+        input_decode_started = time.perf_counter()
+        audio: str | torch.Tensor = (
+            self._predecode(audio_path) if self.predecode_inputs else audio_path
+        )
+        input_decode_ms = (time.perf_counter() - input_decode_started) * 1000
+        config = self._config_for_kind(target)
+        stage_started = time.perf_counter()
+        result = self.batcher.separate(
+            audio=audio,
+            description=str(config["prompt"]),
+            fixed_midpoint_steps=int(config["steps"]),
+            initial_candidates=int(config["initial_candidates"]),
+            max_candidates=int(config["max_candidates"]),
+            margin=float(config["margin"]),
+            quality_success_threshold=float(config["success_threshold"]),
+            quality_failure_threshold=float(config["failure_threshold"]),
+            timeout=self.request_timeout,
+        )
+        stage_ms = (time.perf_counter() - stage_started) * 1000
+        stage_metadata = result.metadata or {}
+        status = stage_metadata.get("verification", {}).get("status", "uncertain")
+        target_file = f"stage1_{target}.wav"
+        residual_file = "stage1_residual.wav"
+        metadata: dict[str, object] = {
+            "schema_version": 4,
+            "verification_status": status,
+            "verification": {
+                "status": status,
+                "stage_statuses": {"stage1": status},
+                "processing_policy": (
+                    f"Source-scene preflight requested only the {target} stage."
+                ),
+            },
+            "model": self.model_id,
+            "dtype_policy": self.dtype_policy,
+            "predict_spans": self.predict_spans,
+            "requested_order": f"{target}_only",
+            "requested_targets": [target],
+            "cascade_order": [target],
+            "artifacts": {
+                "stage1_target": target_file,
+                "stage1_residual": residual_file,
+                "canonical_stems": {
+                    target: target_file,
+                    "sfx": residual_file,
+                },
+            },
+            "score_semantics": {
+                "judge": (
+                    "Continuous quality estimates where higher is better; these "
+                    "are not calibrated probabilities or presence estimates."
+                ),
+                "candidate_margin": (
+                    "Difference between the best and runner-up ensemble ranking "
+                    "scores; this measures candidate preference, not correctness."
+                ),
+            },
+            "inference_timings_ms": {
+                "input_decode": input_decode_ms,
+                "cascade": stage_ms,
+                "service_total": (time.perf_counter() - service_started) * 1000,
+                "stage1": stage_metadata.get("timings_ms", {}),
+            },
+            "stages": {
+                "stage1": {
+                    "prompt": config["prompt"],
+                    "input": "original_audio",
+                    "fixed_midpoint_steps": config["steps"],
+                    **stage_metadata,
+                }
+            },
+        }
+        return (
+            {
+                target_file: result.target[0],
+                residual_file: result.residual[0],
+            },
+            self.processor.audio_sampling_rate,
+            metadata,
+        )
 
     def separate_cascade(
         self, audio_path: str, order: str = "music_first"
@@ -254,7 +346,7 @@ class InferenceService:
         else:
             final_status = "success"
         metadata: dict[str, object] = {
-            "schema_version": 3,
+            "schema_version": 4,
             "verification_status": final_status,
             "verification": {
                 "status": final_status,
@@ -268,6 +360,7 @@ class InferenceService:
             "dtype_policy": self.dtype_policy,
             "predict_spans": self.predict_spans,
             "requested_order": order,
+            "requested_targets": [stage1_kind, stage2_kind],
             "cascade_order": [stage1_kind, stage2_kind],
             "artifacts": {
                 "stage1_target": stage1_target_file,
@@ -383,6 +476,7 @@ def health() -> dict[str, object]:
             "async_outputs": service.async_outputs,
         },
         "supported_orders": ["music_first", "voice_first"],
+        "supported_targets": ["music", "voice"],
     }
 
 
@@ -487,6 +581,7 @@ async def separate(
     audio: Annotated[UploadFile, File()],
     description: Annotated[str, Form(max_length=500)] = "",
     order: Annotated[str, Form()] = "music_first",
+    targets: Annotated[str, Form()] = "music,voice",
 ) -> StreamingResponse:
     request_started = time.perf_counter()
     if order not in {"music_first", "voice_first"}:
@@ -494,17 +589,34 @@ async def separate(
             status_code=422,
             detail="order must be 'music_first' or 'voice_first'",
         )
+    selected_targets = tuple(
+        dict.fromkeys(value.strip().casefold() for value in targets.split(",") if value.strip())
+    )
+    if not selected_targets or any(
+        target not in {"music", "voice"} for target in selected_targets
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="targets must contain music, voice, or both",
+        )
     suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
     try:
         with tempfile.TemporaryDirectory(prefix="sam-audio-") as directory:
             input_path = Path(directory) / f"input{suffix}"
             await _save_upload(audio, input_path)
             upload_finished = time.perf_counter()
-            artifacts, sample_rate, metadata = await asyncio.to_thread(
-                service.separate_cascade,
-                str(input_path),
-                order,
-            )
+            if len(selected_targets) == 1:
+                artifacts, sample_rate, metadata = await asyncio.to_thread(
+                    service.separate_single,
+                    str(input_path),
+                    selected_targets[0],
+                )
+            else:
+                artifacts, sample_rate, metadata = await asyncio.to_thread(
+                    service.separate_cascade,
+                    str(input_path),
+                    order,
+                )
             inference_finished = time.perf_counter()
     finally:
         await audio.close()
@@ -517,6 +629,7 @@ async def separate(
         "submitted_description": description,
         "submitted_description_used": False,
         "requested_order": order,
+        "requested_targets": list(selected_targets),
     }
     metadata["timings_ms"] = {
         "upload_handler": upload_ms,

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 
 from sam_audio_pipeline.config import Settings
 from sam_audio_pipeline.handlers import SeparationHandler
@@ -119,6 +120,65 @@ def test_stereo_mapping_keeps_frequency_specific_position(tmp_path: Path) -> Non
     assert spectrum[high_bin, 1] > spectrum[high_bin, 0] * 1.1
 
 
+def test_stereo_mapping_preserves_stem_tonal_balance(tmp_path: Path) -> None:
+    sample_rate = 8_000
+    time = np.arange(sample_rate * 2) / sample_rate
+    low = 0.12 * np.sin(2 * np.pi * 220 * time)
+    high = 0.12 * np.sin(2 * np.pi * 2_000 * time)
+    stem = low + high
+    original = np.column_stack((low + 0.15 * high, low + 0.15 * high))
+    original_path = tmp_path / "original.wav"
+    stem_path = tmp_path / "music.wav"
+    write_wav(original_path, sample_rate, original)
+    write_wav(stem_path, sample_rate, stem)
+
+    result = map_stems_to_stereo(
+        original_path,
+        {"music": stem_path},
+        tmp_path / "mapped",
+        band_count=16,
+        smoothing_alpha=0.08,
+        n_fft=512,
+        hop=128,
+    )["music"]
+
+    _, stereo = read_wav(result.path)
+    raw_spectrum = np.abs(np.fft.rfft(stem))
+    mapped_spectrum = np.abs(np.fft.rfft(np.mean(stereo, axis=1)))
+    frequencies = np.fft.rfftfreq(len(stem), 1 / sample_rate)
+    low_bin = int(np.argmin(np.abs(frequencies - 220)))
+    high_bin = int(np.argmin(np.abs(frequencies - 2_000)))
+    raw_ratio = raw_spectrum[high_bin] / raw_spectrum[low_bin]
+    mapped_ratio = mapped_spectrum[high_bin] / mapped_spectrum[low_bin]
+    assert mapped_ratio == pytest.approx(raw_ratio, rel=0.2)
+    assert result.metadata["tonal_transfer"] == "broadband_gain_only"
+    assert result.metadata["algorithm"] == "frequency_masked_pan_v2"
+
+
+def test_stereo_passthrough_is_bit_identical_when_input_is_the_only_stem(
+    tmp_path: Path,
+) -> None:
+    sample_rate = 8_000
+    time = np.arange(sample_rate) / sample_rate
+    tone = 0.2 * np.sin(2 * np.pi * 440 * time)
+    original = np.column_stack((tone, tone * 0.6))
+    original_path = tmp_path / "original.wav"
+    write_wav(original_path, sample_rate, original)
+
+    result = map_stems_to_stereo(
+        original_path,
+        {"sfx": original_path},
+        tmp_path / "mapped",
+        n_fft=512,
+        hop=128,
+    )["sfx"]
+
+    assert result.path.read_bytes() == original_path.read_bytes()
+    assert result.metadata["algorithm"] == "stereo_identity_passthrough_v1"
+    assert result.metadata["tonal_transfer"] == "identity"
+    assert result.metadata["raw_channels"] == 2
+
+
 class BackfillAWS:
     def __init__(self, original: Path, stem: Path):
         self.files = {"chunk.wav": original, "voice.wav": stem}
@@ -186,6 +246,26 @@ def test_backfill_persists_companion_without_replacing_raw_stem(tmp_path: Path) 
     assert record["stereo_bytes"] > 0
     assert record["stereo_mapping"]["mapped_channels"] == 2
     assert aws.items[0]["stereo_mapped_stems"] == ["voice"]
+
+
+def test_backfill_keeps_presence_passthrough_bit_identical(tmp_path: Path) -> None:
+    sample_rate = 8_000
+    time = np.arange(sample_rate) / sample_rate
+    tone = 0.2 * np.sin(2 * np.pi * 440 * time)
+    original = np.column_stack((tone, tone * 0.4))
+    original_path = tmp_path / "original.wav"
+    write_wav(original_path, sample_rate, original)
+    aws = BackfillAWS(original_path, original_path)
+    record = aws.items[1]
+    record["stem_type"] = "sfx"
+    record["model"] = "semantic_presence_passthrough"
+
+    result = backfill_job(object(), aws, "job-1")
+
+    assert result == {"chunks": 1, "stems": 1, "skipped": 0}
+    assert record["stereo_sha256"] == digest(original_path)
+    assert record["stereo_bytes"] == original_path.stat().st_size
+    assert record["stereo_mapping"]["algorithm"] == "stereo_identity_passthrough_v1"
 
 
 class SeparationAWS:
@@ -314,3 +394,35 @@ def test_separation_handler_persists_raw_and_mapped_companions(tmp_path: Path) -
     assert all(record.stereo_s3_key for record in aws.records)
     assert all(record.stereo_bytes > 0 for record in aws.records)
     assert all(record.stereo_mapping["mapped_channels"] == 2 for record in aws.records)
+
+
+def test_separation_handler_bypasses_sam_for_sfx_only_presence(
+    tmp_path: Path,
+) -> None:
+    sample_rate = 8_000
+    time = np.arange(sample_rate) / sample_rate
+    tone = 0.2 * np.sin(2 * np.pi * 440 * time)
+    original = tmp_path / "original.wav"
+    write_wav(original, sample_rate, np.column_stack((tone, tone * 0.5)))
+    aws = SeparationAWS(original)
+    handler = SeparationHandler(pipeline_settings(), aws)
+
+    handler.handle(
+        QueueTask(
+            task_id="sam-sfx-only",
+            task_type="separate_chunk",
+            job_id="job-1",
+            source_id="source-1",
+            chunk_id="000000",
+            targets=[],
+        )
+    )
+
+    assert len(aws.records) == 1
+    record = aws.records[0]
+    assert record.stem_type == "sfx"
+    assert record.model == "semantic_presence_passthrough"
+    assert record.sha256 == record.stereo_sha256
+    assert record.bytes == record.stereo_bytes
+    assert record.stereo_mapping["algorithm"] == "stereo_identity_passthrough_v1"
+    assert aws.chunk["stored_stems"] == ["sfx"]

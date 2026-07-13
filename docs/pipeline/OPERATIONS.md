@@ -58,6 +58,15 @@ than keep an inference request open.
 
 ## Stereo mapping
 
+The pipeline accepts exactly two-channel stereo sources. Mono and multichannel
+uploads remain visible in the dataset but finish with `skip_reason` set to
+`non_stereo_input`; they create no chunks, stems, or model tasks.
+
+For accepted sources, Audio Flamingo scene analysis runs before SAM. Its
+`has_music` and `has_voices` booleans select zero, one, or both SAM targets. A
+malformed scene response deliberately falls back to both targets. Judge/CLAP
+scores remain separation-quality evidence and are not used as presence scores.
+
 New audible stems automatically keep both versions:
 
 - `{stem}.wav` is the untouched mono model output used by review and existing
@@ -69,6 +78,10 @@ New audible stems automatically keep both versions:
 In **Split data**, select a source and use **Raw / Stereo mapped** above the
 players. The original player never changes. The maps below the players show the
 smoothed trajectory; left is below the center line and right is above it.
+Version 2 applies frequency-specific panning but only broadband gain, preventing
+the mapper from making stems bass-heavy. A source with neither music nor voices
+is stored as a single SFX stem; Raw and Stereo mapped are PCM-identical and the
+map is labelled `identity · no EQ`.
 
 Backfill a completed job after deploying the mapper. The command is idempotent
 and skips stems that already have a mapped object unless `--force` is supplied:

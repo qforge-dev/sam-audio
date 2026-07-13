@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import tempfile
 import time
 import wave
@@ -155,7 +156,7 @@ def _bidirectional_ema(
     return smoothed.astype(np.float32)
 
 
-def _broadband_pan(
+def _broadband_mapping(
     original: np.ndarray,
     stem: np.ndarray,
     *,
@@ -163,10 +164,11 @@ def _broadband_pan(
     sample_rate: int,
     hop: int,
     alpha: float,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     window = max(hop, round(sample_rate * 0.1))
     half = window // 2
     raw = np.zeros(frame_count, dtype=np.float32)
+    raw_gain_db = np.zeros(frame_count, dtype=np.float32)
     weights = np.zeros(frame_count, dtype=np.float32)
     for frame in range(frame_count):
         center = frame * hop
@@ -181,11 +183,23 @@ def _broadband_pan(
         raw[frame] = (gain_right - gain_left) / max(
             gain_right + gain_left, EPSILON
         )
+        raw_gain_db[frame] = np.clip(
+            10.0 * np.log10(max(gain_left**2 + gain_right**2, EPSILON)),
+            -6.0,
+            6.0,
+        )
         weights[frame] = target_power
-    smoothed = _bidirectional_ema(
+    smoothed_pan = _bidirectional_ema(
         raw[None, :], weights[None, :], alpha=alpha, neutral=0.0
     )[0]
-    return np.sign(smoothed) * np.sqrt(np.abs(smoothed))
+    smoothed_gain_db = _bidirectional_ema(
+        raw_gain_db[None, :], weights[None, :], alpha=alpha, neutral=0.0
+    )[0]
+    return (
+        np.sign(smoothed_pan) * np.sqrt(np.abs(smoothed_pan)),
+        smoothed_gain_db,
+        weights,
+    )
 
 
 def _curve(
@@ -223,6 +237,71 @@ def _curve(
     ]
 
 
+def _identity_stereo_mapping(
+    original_path: Path,
+    output_path: Path,
+    original: np.ndarray,
+    sample_rate: int,
+    *,
+    smoothing_alpha: float,
+    n_fft: int,
+    hop: int,
+) -> StereoMappedStem:
+    mono = np.mean(original[:, :2], axis=1, dtype=np.float32)
+    frame_count = _stft(mono, n_fft, hop).shape[1]
+    pan, _, weights = _broadband_mapping(
+        original[:, :2],
+        mono,
+        frame_count=frame_count,
+        sample_rate=sample_rate,
+        hop=hop,
+        alpha=smoothing_alpha,
+    )
+    curve = _curve(
+        pan[None, :],
+        np.zeros((1, frame_count), dtype=np.float32),
+        weights[None, :],
+        hop=hop,
+        sample_rate=sample_rate,
+    )
+    pan_values = [point["pan"] for point in curve] or [0.0]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(original_path, output_path)
+    metadata = {
+        "algorithm": "stereo_identity_passthrough_v1",
+        "sample_rate": sample_rate,
+        "source_channels": 2,
+        "source_was_mono": False,
+        "raw_channels": 2,
+        "mapped_channels": 2,
+        "frequency_bands": 0,
+        "n_fft": n_fft,
+        "hop_samples": hop,
+        "smoothing": {
+            "type": "bidirectional_ema",
+            "alpha": smoothing_alpha,
+            "frequency_kernel": [],
+        },
+        "tonal_transfer": "identity",
+        "pan_summary": {
+            "start": pan_values[0],
+            "end": pan_values[-1],
+            "mean": round(float(np.mean(pan_values)), 4),
+            "minimum": min(pan_values),
+            "maximum": max(pan_values),
+        },
+        "gain_summary_db": {"mean": 0.0, "minimum": 0.0, "maximum": 0.0},
+        "limiter_gain": 1.0,
+        "pan_curve": curve,
+    }
+    return StereoMappedStem(
+        path=output_path,
+        sha256=sha256_file(output_path),
+        bytes=output_path.stat().st_size,
+        metadata=metadata,
+    )
+
+
 def map_stems_to_stereo(
     original_path: Path,
     stem_paths: dict[str, Path],
@@ -248,6 +327,7 @@ def map_stems_to_stereo(
         return {}
     mono_stems: dict[str, np.ndarray] = {}
     raw_channels: dict[str, int] = {}
+    identity_stems: set[str] = set()
     for stem_type, path in stem_paths.items():
         stem_rate, samples = _read_pcm16(path)
         if stem_rate != sample_rate:
@@ -256,12 +336,41 @@ def map_stems_to_stereo(
             )
         raw_channels[stem_type] = int(samples.shape[1])
         mono_stems[stem_type] = _aligned_mono(samples, sample_count)
+        if (
+            source_channels == 2
+            and raw_channels[stem_type] == 2
+            and path.resolve() == original_path.resolve()
+        ):
+            identity_stems.add(stem_type)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    mapped: dict[str, StereoMappedStem] = {}
+    for stem_type in identity_stems:
+        mapped[stem_type] = _identity_stereo_mapping(
+            original_path,
+            output_dir / f"{stem_type}.stereo.wav",
+            original,
+            sample_rate,
+            smoothing_alpha=smoothing_alpha,
+            n_fft=n_fft,
+            hop=hop,
+        )
+    processable_stems = {
+        stem_type: samples
+        for stem_type, samples in mono_stems.items()
+        if stem_type not in identity_stems
+    }
+    if not processable_stems:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        for result in mapped.values():
+            result.metadata["processing_ms"] = round(elapsed_ms, 3)
+        return mapped
 
     left_spectrum = _stft(original[:, 0], n_fft, hop)
     right_spectrum = _stft(original[:, 1], n_fft, hop)
     stem_spectra = {
         stem_type: _stft(samples, n_fft, hop)
-        for stem_type, samples in mono_stems.items()
+        for stem_type, samples in processable_stems.items()
     }
     powers = {
         stem_type: np.abs(spectrum).astype(np.float32) ** 2
@@ -271,14 +380,10 @@ def map_stems_to_stereo(
     left_power = np.abs(left_spectrum).astype(np.float32) ** 2
     right_power = np.abs(right_spectrum).astype(np.float32) ** 2
     bands = _band_slices(sample_rate, n_fft, band_count)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    mapped: dict[str, StereoMappedStem] = {}
-
     for stem_type, stem_spectrum in stem_spectra.items():
         mask = powers[stem_type] / total_power
         frame_count = stem_spectrum.shape[1]
         raw_pan = np.zeros((band_count, frame_count), dtype=np.float32)
-        raw_gain_db = np.zeros_like(raw_pan)
         weights = np.zeros_like(raw_pan)
         for band_index, frequencies in enumerate(bands):
             stem_band = stem_spectrum[frequencies]
@@ -295,12 +400,6 @@ def map_stems_to_stereo(
             gain_right = np.abs(cross_right) / np.maximum(stem, EPSILON)
             raw_pan[band_index] = (gain_right - gain_left) / np.maximum(
                 gain_right + gain_left, EPSILON
-            )
-            reference_gain_power = gain_left * gain_left + gain_right * gain_right
-            raw_gain_db[band_index] = np.clip(
-                10.0 * np.log10(np.maximum(reference_gain_power, EPSILON)),
-                -12.0,
-                12.0,
             )
             coherence_left = np.abs(cross_left) ** 2 / np.maximum(
                 left * stem, EPSILON
@@ -321,7 +420,7 @@ def map_stems_to_stereo(
             raw_pan, weights, alpha=smoothing_alpha, neutral=0.0
         )
         band_pan = np.sign(band_pan) * np.sqrt(np.abs(band_pan))
-        broadband_pan = _broadband_pan(
+        broadband_pan, broadband_gain_db, _ = _broadband_mapping(
             original,
             mono_stems[stem_type],
             frame_count=frame_count,
@@ -343,8 +442,8 @@ def map_stems_to_stereo(
             -0.95,
             0.95,
         )
-        gain_db = _bidirectional_ema(
-            raw_gain_db, weights, alpha=smoothing_alpha, neutral=0.0
+        gain_db = np.broadcast_to(
+            broadband_gain_db[None, :], (band_count, frame_count)
         )
         gain = 10.0 ** (gain_db / 20.0)
         angle = (pan + 1.0) * (math.pi / 4.0)
@@ -373,7 +472,7 @@ def map_stems_to_stereo(
         pan_values = [point["pan"] for point in curve] or [0.0]
         gain_values = [point["gain_db"] for point in curve] or [0.0]
         metadata = {
-            "algorithm": "frequency_masked_pan_v1",
+            "algorithm": "frequency_masked_pan_v2",
             "sample_rate": sample_rate,
             "source_channels": source_channels,
             "source_was_mono": original_was_mono,
@@ -387,6 +486,7 @@ def map_stems_to_stereo(
                 "alpha": smoothing_alpha,
                 "frequency_kernel": [0.25, 0.5, 0.25],
             },
+            "tonal_transfer": "broadband_gain_only",
             "pan_summary": {
                 "start": pan_values[0],
                 "end": pan_values[-1],
@@ -457,6 +557,9 @@ def backfill_job(
             aws.download_file(str(chunk["s3_key"]), original)
             local_stems: dict[str, Path] = {}
             for stem in stems:
+                if stem.get("model") == "semantic_presence_passthrough":
+                    local_stems[str(stem["stem_type"])] = original
+                    continue
                 path = root / "raw" / f"{stem['stem_type']}.wav"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 aws.download_file(str(stem["s3_key"]), path)
@@ -466,7 +569,7 @@ def backfill_job(
                 f"jobs/{job_id}/metadata/{source_id}/{chunk_id}.stereo.json"
             )
             aws.upload_json(
-                {"algorithm": "frequency_masked_pan_v1", "stems": {
+                {"algorithm": "frequency_masked_pan_v2", "stems": {
                     stem_type: item.metadata for stem_type, item in mapped.items()
                 }},
                 mapping_key,
