@@ -28,6 +28,81 @@ Install dependencies:
 pip install .
 ```
 
+## API server
+
+Install the API dependencies and point the service at a downloaded checkpoint:
+
+```bash
+pip install '.[api]'
+SAM_AUDIO_MODEL=/models/sam-audio-small-tv sam-audio-api
+```
+
+The Docker image contains the application and its dependencies, but no model weights.
+Mount a checkpoint directory at runtime:
+
+```bash
+docker build -t sam-audio-api .
+docker run --gpus all --rm -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  sam-audio-api
+```
+
+The API runs the configured two-stage cascade (`human voices`, then
+`music soundtrack`) through one continuous batcher. Submit an audio file; the response
+ZIP contains `stage1_voices.wav`, `stage1_residual.wav`, `stage2_music.wav`,
+`stage2_residual.wav`, and `metadata.json`:
+
+```bash
+curl -f http://localhost:8000/v1/separate \
+  -F audio=@mixture.wav \
+  -o separation.zip
+```
+
+Generation, prompt, batching, and TF32 policy are configured with the
+`SAM_AUDIO_*` environment variables demonstrated in
+[`deploy/start-sam-audio-api.sh`](deploy/start-sam-audio-api.sh). A supplied
+`description` form field is accepted for compatibility but ignored in cascade mode.
+
+`metadata.json` records the per-stage Judge `overall`, `recall`, `precision`, and
+`faithfulness` values, CLAP scores, ensemble candidate scores, selected candidate,
+runner-up margin, adaptive expansion, and inference settings. Judge values are
+continuous quality estimates where higher is better, not calibrated probabilities.
+The candidate margin measures preference over the runner-up, not correctness.
+
+The production defaults generate candidates in rounds of four (4, then 8, then
+12). Another round is generated when the ensemble margin is below `0.05` or the
+stage has not reached its success threshold. Voice ranking weights Judge overall
+and precision equally; music ranking uses 25% overall and 75% precision to more
+strongly penalize SFX spillover.
+
+The top-level result is `verification_status`: `success`, `uncertain`, or
+`failure`. Voice thresholds default to 4.5/4.3 (success/failure), and music
+thresholds to 4.4/4.1. Scores between those boundaries are `uncertain`; an
+otherwise successful score with unresolved candidate margin after 12 candidates
+is also `uncertain`. A failed or uncertain first stage never cancels the second
+stage. Each stage keeps its numeric Judge evidence under `verification`, but there
+is no top-level 1–5 score.
+
+```bash
+unzip separation.zip -d separation
+jq . separation/metadata.json
+```
+
+Each response includes a standard `Server-Timing` header plus
+`X-SAM-Audio-Upload-Ms`, `X-SAM-Audio-Inference-Ms`,
+`X-SAM-Audio-Package-Ms`, and `X-SAM-Audio-Server-Ms` headers. Use curl's
+`time_starttransfer` and `time_total` values to measure client download time.
+The same headers also expose per-stage raw queue wait, preprocessing, GPU queue
+wait, preparation, generation, audio decoding, CLAP, Judge, ensemble combining,
+total scoring, selection, postprocessing, and stage-total durations. For example,
+`X-SAM-Audio-Stage2-Generation-Ms`, `X-SAM-Audio-Stage2-CLAP-Ms`, and
+`X-SAM-Audio-Stage2-Judge-Ms`. The structured values and per-round generation
+durations are also stored under `inference_timings_ms` in `metadata.json`.
+
+For a persistent Linux deployment, customize and install the example
+[`deploy/sam-audio-api.service`](deploy/sam-audio-api.service) systemd unit. It
+binds to localhost by default; use an SSH tunnel to access port 8000 securely.
+
 ## Usage
 
 ⚠️ Before using SAM Audio, please request access to the checkpoints on the SAM Audio

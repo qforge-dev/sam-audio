@@ -24,6 +24,7 @@ def create_ranker(config):
         return EnsembleRanker(
             rankers=[create_ranker(cfg) for cfg in ranker_cfgs],
             weights=weights,
+            names=list(config.rankers),
         )
     else:
         assert config is None

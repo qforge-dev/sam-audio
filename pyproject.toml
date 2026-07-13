@@ -25,6 +25,7 @@ dependencies = [
     "nvidia-cuda-runtime",
     "perception-models @ git+https://github.com/facebookresearch/perception_models.git@unpin-deps",
     "pydub",
+    "setuptools<81",
     "torch",
     "torchaudio",
     "torchcodec",
@@ -32,6 +33,16 @@ dependencies = [
     "torchvision",
     "transformers>=4.54.0",
 ]
+
+[project.optional-dependencies]
+api = [
+    "fastapi",
+    "python-multipart",
+    "uvicorn[standard]",
+]
+
+[project.scripts]
+sam-audio-api = "sam_audio.api:main"
 
 [dependency-groups]
 dev = [

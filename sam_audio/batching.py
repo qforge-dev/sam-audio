@@ -26,6 +26,14 @@ def _now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
+def _synchronize(device: Optional[torch.device] = None) -> None:
+    if not torch.cuda.is_available():
+        return
+    if device is not None and device.type != "cuda":
+        return
+    torch.cuda.synchronize(device=device)
+
+
 @dataclass
 class ContinuousBatcherConfig:
     max_batch_size: int = 4
@@ -38,7 +46,10 @@ class ContinuousBatcherConfig:
     predict_spans: bool = False
     initial_candidates: int = 1
     max_candidates: int = 1
+    candidate_increment: int = 4
     margin: float = 0.05
+    min_quality_score: Optional[float] = None
+    failure_quality_score: Optional[float] = None
     dtype: Optional[torch.dtype] = None
     pin_memory: bool = True
     non_blocking_transfer: bool = True
@@ -56,6 +67,14 @@ class ContinuousBatcherConfig:
             raise ValueError("`initial_candidates` must be >= 1")
         if self.max_candidates < self.initial_candidates:
             raise ValueError("`max_candidates` must be >= `initial_candidates`")
+        if self.candidate_increment < 1:
+            raise ValueError("`candidate_increment` must be >= 1")
+        if (
+            self.min_quality_score is not None
+            and self.failure_quality_score is not None
+            and self.failure_quality_score > self.min_quality_score
+        ):
+            raise ValueError("Failure quality score cannot exceed success score")
 
         cpu_count = os.cpu_count() or 1
         available_workers = max(1, cpu_count - 4)
@@ -110,6 +129,8 @@ class _RawRequest:
     initial_candidates: Optional[int]
     max_candidates: Optional[int]
     margin: Optional[float]
+    quality_success_threshold: Optional[float]
+    quality_failure_threshold: Optional[float]
     submitted_ms: float
 
 
@@ -119,6 +140,8 @@ class _ReadyRequest:
     batch: Batch
     feature_length: int
     ready_ms: float
+    raw_queue_wait_ms: float
+    preprocess_ms: float
 
 
 @dataclass
@@ -128,6 +151,7 @@ class _ActiveRequest:
     generated: torch.Tensor
     step_index: int
     candidates: int
+    initial_candidates: int
     max_candidates: int
     margin: float
     fixed_midpoint_steps: int
@@ -136,6 +160,13 @@ class _ActiveRequest:
     initial_target_wavs: Optional[list[torch.Tensor]] = None
     initial_residual_wavs: Optional[list[torch.Tensor]] = None
     initial_scores: Optional[torch.Tensor] = None
+    initial_score_details: dict[str, dict[str, Any]] = field(default_factory=dict)
+    expansion_history: list[dict[str, Any]] = field(default_factory=list)
+    timings_ms: dict[str, float] = field(default_factory=dict)
+    generation_round_ms: float = 0.0
+    generation_rounds_ms: list[float] = field(default_factory=list)
+    generation_events: list[tuple[Any, Any]] = field(default_factory=list)
+
 
 class ContinuousSAMAudioBatcher:
     """Thread-safe continuous batcher for one loaded SAMAudio model instance.
@@ -202,6 +233,8 @@ class ContinuousSAMAudioBatcher:
         initial_candidates: Optional[int] = None,
         max_candidates: Optional[int] = None,
         margin: Optional[float] = None,
+        quality_success_threshold: Optional[float] = None,
+        quality_failure_threshold: Optional[float] = None,
         block: bool = True,
         timeout: Optional[float] = None,
     ) -> concurrent.futures.Future:
@@ -221,6 +254,8 @@ class ContinuousSAMAudioBatcher:
             initial_candidates=initial_candidates,
             max_candidates=max_candidates,
             margin=margin,
+            quality_success_threshold=quality_success_threshold,
+            quality_failure_threshold=quality_failure_threshold,
             submitted_ms=_now_ms(),
         )
         self._raw_queue.put(request, block=block, timeout=timeout)
@@ -240,6 +275,8 @@ class ContinuousSAMAudioBatcher:
         initial_candidates: Optional[int] = None,
         max_candidates: Optional[int] = None,
         margin: Optional[float] = None,
+        quality_success_threshold: Optional[float] = None,
+        quality_failure_threshold: Optional[float] = None,
         timeout: Optional[float] = None,
     ) -> SeparationResult:
         return self.submit(
@@ -252,6 +289,8 @@ class ContinuousSAMAudioBatcher:
             initial_candidates=initial_candidates,
             max_candidates=max_candidates,
             margin=margin,
+            quality_success_threshold=quality_success_threshold,
+            quality_failure_threshold=quality_failure_threshold,
         ).result(timeout=timeout)
 
     def submit_cascade(
@@ -268,9 +307,13 @@ class ContinuousSAMAudioBatcher:
         stage1_initial_candidates: Optional[int] = None,
         stage1_max_candidates: Optional[int] = None,
         stage1_margin: Optional[float] = None,
+        stage1_quality_success_threshold: Optional[float] = None,
+        stage1_quality_failure_threshold: Optional[float] = None,
         stage2_initial_candidates: Optional[int] = None,
         stage2_max_candidates: Optional[int] = None,
         stage2_margin: Optional[float] = None,
+        stage2_quality_success_threshold: Optional[float] = None,
+        stage2_quality_failure_threshold: Optional[float] = None,
     ) -> concurrent.futures.Future:
         outer: concurrent.futures.Future = concurrent.futures.Future()
         stage1_future = self.submit(
@@ -283,6 +326,8 @@ class ContinuousSAMAudioBatcher:
             initial_candidates=stage1_initial_candidates,
             max_candidates=stage1_max_candidates,
             margin=stage1_margin,
+            quality_success_threshold=stage1_quality_success_threshold,
+            quality_failure_threshold=stage1_quality_failure_threshold,
         )
 
         def submit_stage2(done_future: concurrent.futures.Future):
@@ -303,6 +348,8 @@ class ContinuousSAMAudioBatcher:
                     initial_candidates=stage2_initial_candidates,
                     max_candidates=stage2_max_candidates,
                     margin=stage2_margin,
+                    quality_success_threshold=stage2_quality_success_threshold,
+                    quality_failure_threshold=stage2_quality_failure_threshold,
                 )
 
                 def finish(stage2_done: concurrent.futures.Future):
@@ -336,9 +383,13 @@ class ContinuousSAMAudioBatcher:
         stage1_initial_candidates: Optional[int] = None,
         stage1_max_candidates: Optional[int] = None,
         stage1_margin: Optional[float] = None,
+        stage1_quality_success_threshold: Optional[float] = None,
+        stage1_quality_failure_threshold: Optional[float] = None,
         stage2_initial_candidates: Optional[int] = None,
         stage2_max_candidates: Optional[int] = None,
         stage2_margin: Optional[float] = None,
+        stage2_quality_success_threshold: Optional[float] = None,
+        stage2_quality_failure_threshold: Optional[float] = None,
         timeout: Optional[float] = None,
     ) -> CascadeResult:
         return self.submit_cascade(
@@ -354,9 +405,13 @@ class ContinuousSAMAudioBatcher:
             stage1_initial_candidates=stage1_initial_candidates,
             stage1_max_candidates=stage1_max_candidates,
             stage1_margin=stage1_margin,
+            stage1_quality_success_threshold=stage1_quality_success_threshold,
+            stage1_quality_failure_threshold=stage1_quality_failure_threshold,
             stage2_initial_candidates=stage2_initial_candidates,
             stage2_max_candidates=stage2_max_candidates,
             stage2_margin=stage2_margin,
+            stage2_quality_success_threshold=stage2_quality_success_threshold,
+            stage2_quality_failure_threshold=stage2_quality_failure_threshold,
         ).result(timeout=timeout)
 
     def close(self, wait: bool = True):
@@ -401,7 +456,7 @@ class ContinuousSAMAudioBatcher:
     def _infer_device(self) -> torch.device:
         try:
             return next(self.model.parameters()).device
-        except (AttributeError, StopIteration):
+        except AttributeError, StopIteration:
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _preprocess_loop(self):
@@ -427,12 +482,15 @@ class ContinuousSAMAudioBatcher:
                 )
                 self._pin_batch(batch)
                 feature_length = int(batch.sizes.max().item())
+                ready_ms = _now_ms()
                 self._gpu_ready_queue.put(
                     _ReadyRequest(
                         raw=request,
                         batch=batch,
                         feature_length=feature_length,
-                        ready_ms=_now_ms(),
+                        ready_ms=ready_ms,
+                        raw_queue_wait_ms=start - request.submitted_ms,
+                        preprocess_ms=ready_ms - start,
                     )
                 )
                 with self._metrics_lock:
@@ -539,6 +597,9 @@ class ContinuousSAMAudioBatcher:
             return
         try:
             start = _now_ms()
+            gpu_queue_wait_ms = start - item.ready_ms
+            _synchronize(self.device)
+            prepare_started = _now_ms()
             batch = item.batch.to(
                 self.device, non_blocking=self.config.non_blocking_transfer
             )
@@ -563,13 +624,22 @@ class ContinuousSAMAudioBatcher:
                 if item.raw.fixed_midpoint_steps is not None
                 else self.config.fixed_midpoint_steps
             )
-            margin = item.raw.margin if item.raw.margin is not None else self.config.margin
+            margin = (
+                item.raw.margin if item.raw.margin is not None else self.config.margin
+            )
+            success_threshold, failure_threshold = self._quality_thresholds(item.raw)
             if fixed_midpoint_steps < 1:
                 raise ValueError("`fixed_midpoint_steps` must be >= 1")
             if initial_candidates < 1:
                 raise ValueError("`initial_candidates` must be >= 1")
             if max_candidates < initial_candidates:
                 raise ValueError("`max_candidates` must be >= `initial_candidates`")
+            if (
+                success_threshold is not None
+                and failure_threshold is not None
+                and failure_threshold > success_threshold
+            ):
+                raise ValueError("Failure threshold cannot exceed success threshold")
             with torch.inference_mode():
                 prepared = self.model.prepare_audio(
                     batch,
@@ -577,6 +647,8 @@ class ContinuousSAMAudioBatcher:
                     predict_spans=self.config.predict_spans,
                 )
             generated = torch.randn_like(prepared.forward_args["audio_features"])
+            _synchronize(self.device)
+            prepare_ms = _now_ms() - prepare_started
             self._active.append(
                 _ActiveRequest(
                     raw=item.raw,
@@ -584,11 +656,27 @@ class ContinuousSAMAudioBatcher:
                     generated=generated,
                     step_index=0,
                     candidates=initial_candidates,
+                    initial_candidates=initial_candidates,
                     max_candidates=max_candidates,
                     margin=margin,
                     fixed_midpoint_steps=fixed_midpoint_steps,
                     stage="initial",
                     admitted_ms=_now_ms(),
+                    timings_ms={
+                        "raw_queue_wait": item.raw_queue_wait_ms,
+                        "preprocess": item.preprocess_ms,
+                        "gpu_queue_wait": gpu_queue_wait_ms,
+                        "prepare": prepare_ms,
+                        "generation": 0.0,
+                        "decode": 0.0,
+                        "clap": 0.0,
+                        "judge": 0.0,
+                        "ensemble_combine": 0.0,
+                        "ranking_total": 0.0,
+                        "scoring": 0.0,
+                        "selection": 0.0,
+                        "postprocess": 0.0,
+                    },
                 )
             )
             with self._metrics_lock:
@@ -639,6 +727,11 @@ class ContinuousSAMAudioBatcher:
 
     def _run_generation_step(self, group: list[_ActiveRequest]):
         start = _now_ms()
+        start_event = end_event = None
+        if self.device.type == "cuda":
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
         merged = self._merge_prepared([item.prepared for item in group])
         generated = torch.cat([item.generated for item in group], dim=0)
         with torch.inference_mode():
@@ -649,16 +742,24 @@ class ContinuousSAMAudioBatcher:
                 steps=group[0].fixed_midpoint_steps,
                 options=self.config.midpoint_options,
             )
+        if end_event is not None:
+            end_event.record()
+        step_ms = _now_ms() - start
         offset = 0
         for active in group:
             rows = active.generated.size(0)
             active.generated = stepped[offset : offset + rows]
             active.step_index += 1
+            if start_event is not None and end_event is not None:
+                active.generation_events.append((start_event, end_event))
+            else:
+                active.generation_round_ms += step_ms
+                active.timings_ms["generation"] += step_ms
             offset += rows
         with self._metrics_lock:
             self._metrics.gpu_batches += 1
             self._metrics.generation_steps += len(group)
-            self._metrics.step_ms += _now_ms() - start
+            self._metrics.step_ms += step_ms
             self._refresh_queue_metrics_locked()
 
     def _merge_prepared(self, prepared_items: list[Any]):
@@ -698,52 +799,47 @@ class ContinuousSAMAudioBatcher:
 
     def _finish_generation(self, active: _ActiveRequest):
         try:
+            _synchronize(self.device)
+            if active.generation_events:
+                generation_ms = sum(
+                    start.elapsed_time(end) for start, end in active.generation_events
+                )
+                active.generation_round_ms += generation_ms
+                active.timings_ms["generation"] += generation_ms
+                active.generation_events.clear()
             start = _now_ms()
             with torch.inference_mode():
                 target_wavs, residual_wavs = self.model.decode_prepared_candidate_wavs(
                     active.prepared, active.generated
                 )
+            _synchronize(self.device)
+            decode_ms = _now_ms() - start
+            active.timings_ms["decode"] += decode_ms
             with self._metrics_lock:
-                self._metrics.decode_ms += _now_ms() - start
+                self._metrics.decode_ms += decode_ms
 
+            _synchronize(self.device)
             score_start = _now_ms()
             with torch.inference_mode():
-                scores = self.model._score_candidate_wavs(
-                    active.prepared.batch, target_wavs, active.candidates
-                )
+                if hasattr(self.model, "_score_candidate_wavs_with_details"):
+                    scores, score_details, ranker_timings = (
+                        self.model._score_candidate_wavs_with_details(
+                            active.prepared.batch, target_wavs, active.candidates
+                        )
+                    )
+                else:
+                    scores = self.model._score_candidate_wavs(
+                        active.prepared.batch, target_wavs, active.candidates
+                    )
+                    score_details = {}
+                    ranker_timings = {}
+            _synchronize(self.device)
+            score_ms = _now_ms() - score_start
+            active.timings_ms["scoring"] += score_ms
+            for name in ("clap", "judge", "ensemble_combine", "ranking_total"):
+                active.timings_ms[name] += float(ranker_timings.get(name, 0.0))
             with self._metrics_lock:
-                self._metrics.score_ms += _now_ms() - score_start
-
-            if active.stage == "initial" and self._needs_extra_candidates(active, scores):
-                extra_candidates = (
-                    active.max_candidates - active.candidates
-                )
-                with torch.inference_mode():
-                    extra_prepared = self.model.prepare_audio(
-                        active.prepared.batch,
-                        candidates=extra_candidates,
-                        predict_spans=False,
-                    )
-                self._active.append(
-                    _ActiveRequest(
-                        raw=active.raw,
-                        prepared=extra_prepared,
-                        generated=torch.randn_like(
-                            extra_prepared.forward_args["audio_features"]
-                        ),
-                        step_index=0,
-                        candidates=extra_candidates,
-                        max_candidates=active.max_candidates,
-                        margin=active.margin,
-                        fixed_midpoint_steps=active.fixed_midpoint_steps,
-                        stage="extra",
-                        admitted_ms=_now_ms(),
-                        initial_target_wavs=target_wavs,
-                        initial_residual_wavs=residual_wavs,
-                        initial_scores=scores,
-                    )
-                )
-                return
+                self._metrics.score_ms += score_ms
 
             if active.stage == "extra" and active.initial_scores is not None:
                 if scores is not None:
@@ -764,11 +860,72 @@ class ContinuousSAMAudioBatcher:
                         )
                     ]
                     scores = torch.cat([active.initial_scores, scores], dim=1)
+                    score_details = self._merge_score_details(
+                        active.initial_score_details, score_details
+                    )
                 else:
                     scores = active.initial_scores
+                    score_details = active.initial_score_details
                     target_wavs = active.initial_target_wavs or target_wavs
                     residual_wavs = active.initial_residual_wavs or residual_wavs
 
+            expansion_reasons = self._expansion_reasons(active, scores, score_details)
+            if expansion_reasons:
+                current_candidates = (
+                    int(scores.size(1)) if scores is not None else active.candidates
+                )
+                extra_candidates = min(
+                    self.config.candidate_increment,
+                    active.max_candidates - current_candidates,
+                )
+                _synchronize(self.device)
+                prepare_started = _now_ms()
+                with torch.inference_mode():
+                    extra_prepared = self.model.prepare_audio(
+                        active.prepared.batch,
+                        candidates=extra_candidates,
+                        predict_spans=False,
+                    )
+                extra_generated = torch.randn_like(
+                    extra_prepared.forward_args["audio_features"]
+                )
+                _synchronize(self.device)
+                active.timings_ms["prepare"] += _now_ms() - prepare_started
+                self._active.append(
+                    _ActiveRequest(
+                        raw=active.raw,
+                        prepared=extra_prepared,
+                        generated=extra_generated,
+                        step_index=0,
+                        candidates=extra_candidates,
+                        initial_candidates=active.initial_candidates,
+                        max_candidates=active.max_candidates,
+                        margin=active.margin,
+                        fixed_midpoint_steps=active.fixed_midpoint_steps,
+                        stage="extra",
+                        admitted_ms=_now_ms(),
+                        initial_target_wavs=target_wavs,
+                        initial_residual_wavs=residual_wavs,
+                        initial_scores=scores,
+                        initial_score_details=score_details,
+                        expansion_history=[
+                            *active.expansion_history,
+                            {
+                                "after_candidates": current_candidates,
+                                "reasons": expansion_reasons,
+                            },
+                        ],
+                        timings_ms=active.timings_ms,
+                        generation_rounds_ms=[
+                            *active.generation_rounds_ms,
+                            active.generation_round_ms,
+                        ],
+                    )
+                )
+                return
+
+            _synchronize(self.device)
+            selection_started = _now_ms()
             with torch.inference_mode():
                 result = self.model._select_candidate_wavs(
                     target_wavs,
@@ -776,25 +933,198 @@ class ContinuousSAMAudioBatcher:
                     scores,
                     active.generated.device,
                 )
+            _synchronize(self.device)
+            active.timings_ms["selection"] += _now_ms() - selection_started
             result.noise = active.generated
+            result.metadata = self._ranking_metadata(active, scores, score_details)
             self._submit_postprocess(active.raw, result)
         except Exception as exc:
             active.raw.future.set_exception(exc)
             with self._metrics_lock:
                 self._metrics.failed += 1
 
-    def _needs_extra_candidates(
-        self, active: _ActiveRequest, scores: Optional[torch.Tensor]
-    ) -> bool:
+    def _expansion_reasons(
+        self,
+        active: _ActiveRequest,
+        scores: Optional[torch.Tensor],
+        score_details: dict[str, dict[str, Any]],
+    ) -> list[str]:
         if scores is None:
-            return False
-        if active.candidates >= active.max_candidates:
-            return False
-        if active.candidates < 2:
-            return True
-        top2 = scores.topk(k=2, dim=1).values
-        confident = (top2[:, 0] - top2[:, 1]).ge(active.margin)
-        return not bool(confident.all())
+            return []
+        total_candidates = int(scores.size(1))
+        if total_candidates >= active.max_candidates:
+            return []
+        reasons = []
+        if total_candidates < 2:
+            reasons.append("fewer_than_two_candidates")
+        else:
+            top2 = scores.topk(k=2, dim=1).values
+            if not bool((top2[:, 0] - top2[:, 1]).ge(active.margin).all()):
+                reasons.append("candidate_margin_below_threshold")
+        quality_score = self._selected_quality_score(scores, score_details)
+        success_threshold, _ = self._quality_thresholds(active.raw)
+        if (
+            quality_score is not None
+            and success_threshold is not None
+            and quality_score < success_threshold
+        ):
+            reasons.append("quality_score_below_threshold")
+        return reasons
+
+    def _quality_thresholds(
+        self, request: _RawRequest
+    ) -> tuple[Optional[float], Optional[float]]:
+        success = (
+            request.quality_success_threshold
+            if request.quality_success_threshold is not None
+            else self.config.min_quality_score
+        )
+        failure = (
+            request.quality_failure_threshold
+            if request.quality_failure_threshold is not None
+            else self.config.failure_quality_score
+        )
+        return success, failure
+
+    @staticmethod
+    def _selected_quality_score(
+        scores: Optional[torch.Tensor],
+        score_details: dict[str, dict[str, Any]],
+    ) -> Optional[float]:
+        if scores is None:
+            return None
+        judge = score_details.get("judge", {})
+        selection_score = judge.get("selection_score")
+        if torch.is_tensor(selection_score):
+            selected_index = int(scores[0].argmax().item())
+            return float(selection_score[0, selected_index].item())
+        overall = judge.get("overall")
+        precision = judge.get("precision")
+        if not torch.is_tensor(overall) or not torch.is_tensor(precision):
+            return None
+        selected_index = int(scores[0].argmax().item())
+        return float(
+            ((overall[0, selected_index] + precision[0, selected_index]) / 2).item()
+        )
+
+    @staticmethod
+    def _merge_score_details(
+        initial: dict[str, dict[str, Any]],
+        extra: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for ranker_name in initial.keys() | extra.keys():
+            merged[ranker_name] = {}
+            initial_values = initial.get(ranker_name, {})
+            extra_values = extra.get(ranker_name, {})
+            for metric in initial_values.keys() | extra_values.keys():
+                first = initial_values.get(metric)
+                second = extra_values.get(metric)
+                if torch.is_tensor(first) and torch.is_tensor(second):
+                    merged[ranker_name][metric] = torch.cat([first, second], dim=1)
+                else:
+                    merged[ranker_name][metric] = first if first is not None else second
+        return merged
+
+    def _ranking_metadata(
+        self,
+        active: _ActiveRequest,
+        scores: Optional[torch.Tensor],
+        score_details: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        initial_candidates = active.initial_candidates
+        candidate_count = (
+            int(scores.size(1)) if scores is not None else active.candidates
+        )
+        selected_index = int(scores[0].argmax().item()) if scores is not None else 0
+        combined_scores = (
+            [float(value) for value in scores[0].detach().float().cpu().tolist()]
+            if scores is not None
+            else []
+        )
+        sorted_scores = sorted(combined_scores, reverse=True)
+        runner_up = sorted_scores[1] if len(sorted_scores) > 1 else None
+        selected_score = combined_scores[selected_index] if combined_scores else None
+        raw_quality_score = self._selected_quality_score(scores, score_details)
+        success_threshold, failure_threshold = self._quality_thresholds(active.raw)
+        candidate_margin = (
+            selected_score - runner_up
+            if selected_score is not None and runner_up is not None
+            else None
+        )
+        verification_reasons: list[str] = []
+        if raw_quality_score is None:
+            verification_status = "uncertain"
+            verification_reasons.append("judge_quality_unavailable")
+        elif failure_threshold is not None and raw_quality_score < failure_threshold:
+            verification_status = "failure"
+            verification_reasons.append("judge_quality_below_failure_threshold")
+        elif success_threshold is not None and raw_quality_score < success_threshold:
+            verification_status = "uncertain"
+            verification_reasons.append("judge_quality_between_thresholds")
+        elif candidate_margin is not None and candidate_margin < active.margin:
+            verification_status = "uncertain"
+            verification_reasons.append("candidate_margin_unresolved_at_maximum")
+        else:
+            verification_status = "success"
+
+        ranker_metadata: dict[str, dict[str, Any]] = {}
+        for ranker_name, values in score_details.items():
+            candidate_scores: dict[str, list[float]] = {}
+            selected: dict[str, float] = {}
+            configuration: dict[str, object] = {}
+            for metric, value in values.items():
+                if not torch.is_tensor(value):
+                    if isinstance(value, (bool, int, float, str)):
+                        configuration[metric] = value
+                    continue
+                row = [float(item) for item in value[0].detach().float().cpu().tolist()]
+                candidate_scores[metric] = row
+                if selected_index < len(row):
+                    selected[metric] = row[selected_index]
+            ranker_metadata[ranker_name] = {
+                "candidate_scores": candidate_scores,
+                "selected": selected,
+                **configuration,
+            }
+
+        return {
+            "verification": {
+                "status": verification_status,
+                "reasons": verification_reasons,
+                "judge_quality_score": raw_quality_score,
+                "judge_quality_formula": (
+                    "stage-specific weighted Judge overall and precision"
+                ),
+                "success_threshold": success_threshold,
+                "failure_threshold": failure_threshold,
+            },
+            "timings_ms": {
+                **active.timings_ms,
+                "generation_rounds": [
+                    *active.generation_rounds_ms,
+                    active.generation_round_ms,
+                ],
+            },
+            "selection": {
+                "initial_candidates": initial_candidates,
+                "max_candidates": active.max_candidates,
+                "candidate_increment": self.config.candidate_increment,
+                "candidates_generated": candidate_count,
+                "expanded_candidates": bool(active.expansion_history),
+                "expansion_rounds": len(active.expansion_history),
+                "expansion_history": active.expansion_history,
+                "selected_candidate": selected_index,
+                "selected_score": selected_score,
+                "runner_up_score": runner_up,
+                "candidate_margin": candidate_margin,
+                "adaptive_margin_threshold": active.margin,
+                "success_quality_threshold": success_threshold,
+                "failure_quality_threshold": failure_threshold,
+                "candidate_scores": combined_scores,
+            },
+            "rankers": ranker_metadata,
+        }
 
     def _submit_postprocess(self, request: _RawRequest, result: SeparationResult):
         with self._metrics_lock:
@@ -805,6 +1135,7 @@ class ContinuousSAMAudioBatcher:
     def _postprocess_result(self, request: _RawRequest, result: SeparationResult):
         start = _now_ms()
         try:
+            metadata = getattr(result, "metadata", None)
             result = type(result)(
                 target=[
                     tensor.detach().float().cpu() if torch.is_tensor(tensor) else tensor
@@ -820,8 +1151,14 @@ class ContinuousSAMAudioBatcher:
                     else result.noise
                 ),
             )
+            result.metadata = metadata
             if self.config.completion_callback is not None:
                 self.config.completion_callback(result)
+            postprocess_ms = _now_ms() - start
+            if isinstance(result.metadata, dict):
+                timings = result.metadata.setdefault("timings_ms", {})
+                timings["postprocess"] = postprocess_ms
+                timings["stage_total"] = _now_ms() - request.submitted_ms
             request.future.set_result(result)
             with self._metrics_lock:
                 self._metrics.completed += 1

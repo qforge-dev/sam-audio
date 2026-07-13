@@ -7,8 +7,8 @@ import types
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 import torch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -152,7 +152,9 @@ class FakeModel(torch.nn.Module):
     def prepare_audio(self, batch, candidates=1, predict_spans=False):
         del predict_spans
         feature_length = int(batch.sizes.max().item())
-        text_length = max(len(description.split()) for description in batch.descriptions)
+        text_length = max(
+            len(description.split()) for description in batch.descriptions
+        )
         rows = batch.audios.size(0) * candidates
         audio_features = torch.zeros(rows, feature_length, 2)
         return FakePrepared(
@@ -195,6 +197,26 @@ class FakeModel(torch.nn.Module):
         if candidates <= 1:
             return None
         return torch.arange(candidates, dtype=torch.float32).view(1, candidates)
+
+    def _score_candidate_wavs_with_details(self, batch, target_wavs, candidates):
+        scores = self._score_candidate_wavs(batch, target_wavs, candidates)
+        if scores is None:
+            return None, {}, {}
+        return (
+            scores,
+            {
+                "clap": {"score": scores / 10, "ensemble_weight": 5.0},
+                "judge": {
+                    "overall": scores,
+                    "recall": scores + 0.1,
+                    "precision": scores + 0.2,
+                    "faithfulness": scores + 0.3,
+                    "ensemble_weight": 1.0,
+                },
+                "ensemble": {"score": scores},
+            },
+            {"clap": 1.0, "judge": 2.0, "ensemble_combine": 0.1, "ranking_total": 3.1},
+        )
 
     def _select_candidate_wavs(self, target_wavs, residual_wavs, scores, device):
         del scores
@@ -367,5 +389,171 @@ def test_cascade_uses_in_memory_residual_for_stage2():
         assert result.stage1.residual[0].item() == -3.0
         assert result.stage2.target[0].item() == 1.0
         assert torch.is_tensor(fake_processor.audio_inputs[1])
+    finally:
+        batcher.close()
+
+
+def test_adaptive_reranking_preserves_candidate_and_judge_metadata():
+    model = FakeModel()
+    cfg = ContinuousBatcherConfig(
+        max_batch_size=1,
+        max_active_requests=1,
+        fixed_midpoint_steps=1,
+        initial_candidates=2,
+        max_candidates=4,
+        margin=2.0,
+        preprocess_workers=1,
+        postprocess_workers=1,
+        pin_memory=False,
+    )
+    batcher = ContinuousSAMAudioBatcher(model, FakeProcessor(), cfg)
+    try:
+        result = batcher.separate(audio=3, description="music", timeout=5)
+        selection = result.metadata["selection"]
+        assert selection["initial_candidates"] == 2
+        assert selection["candidates_generated"] == 4
+        assert selection["expanded_candidates"] is True
+        assert selection["selected_candidate"] == 1
+        assert selection["candidate_scores"] == [0.0, 1.0, 0.0, 1.0]
+        assert selection["candidate_margin"] == 0.0
+        assert result.metadata["rankers"]["judge"]["selected"] == {
+            "overall": 1.0,
+            "recall": pytest.approx(1.1),
+            "precision": pytest.approx(1.2),
+            "faithfulness": pytest.approx(1.3),
+        }
+        assert result.metadata["rankers"]["clap"]["ensemble_weight"] == 5.0
+    finally:
+        batcher.close()
+
+
+def test_quality_gate_expands_candidates_in_incremental_rounds_to_maximum():
+    model = FakeModel()
+    cfg = ContinuousBatcherConfig(
+        max_batch_size=1,
+        max_active_requests=1,
+        fixed_midpoint_steps=1,
+        initial_candidates=4,
+        max_candidates=12,
+        candidate_increment=4,
+        margin=0.0,
+        min_quality_score=4.2,
+        preprocess_workers=1,
+        postprocess_workers=1,
+        pin_memory=False,
+    )
+    batcher = ContinuousSAMAudioBatcher(model, FakeProcessor(), cfg)
+    try:
+        result = batcher.separate(audio=3, description="music", timeout=5)
+        selection = result.metadata["selection"]
+        assert selection["initial_candidates"] == 4
+        assert selection["max_candidates"] == 12
+        assert selection["candidate_increment"] == 4
+        assert selection["candidates_generated"] == 12
+        assert selection["expansion_rounds"] == 2
+        assert selection["expansion_history"] == [
+            {
+                "after_candidates": 4,
+                "reasons": ["quality_score_below_threshold"],
+            },
+            {
+                "after_candidates": 8,
+                "reasons": ["quality_score_below_threshold"],
+            },
+        ]
+        assert result.metadata["verification"] == {
+            "status": "uncertain",
+            "reasons": ["judge_quality_between_thresholds"],
+            "judge_quality_score": pytest.approx(3.1),
+            "judge_quality_formula": (
+                "stage-specific weighted Judge overall and precision"
+            ),
+            "success_threshold": 4.2,
+            "failure_threshold": None,
+        }
+        timings = result.metadata["timings_ms"]
+        assert timings["clap"] == 3.0
+        assert timings["judge"] == 6.0
+        assert timings["ranking_total"] == pytest.approx(9.3)
+        assert len(timings["generation_rounds"]) == 3
+        assert timings["generation"] >= 0
+        assert timings["decode"] >= 0
+        assert timings["selection"] >= 0
+        assert timings["postprocess"] >= 0
+        assert timings["stage_total"] >= 0
+    finally:
+        batcher.close()
+
+
+@pytest.mark.parametrize(
+    ("success_threshold", "failure_threshold", "expected"),
+    [
+        (3.0, 2.0, "success"),
+        (3.5, 3.0, "uncertain"),
+        (4.5, 3.5, "failure"),
+    ],
+)
+def test_three_bucket_verification_statuses(
+    success_threshold, failure_threshold, expected
+):
+    batcher = ContinuousSAMAudioBatcher(
+        FakeModel(),
+        FakeProcessor(),
+        ContinuousBatcherConfig(
+            max_batch_size=1,
+            max_active_requests=1,
+            fixed_midpoint_steps=1,
+            initial_candidates=4,
+            max_candidates=4,
+            margin=0.0,
+            preprocess_workers=1,
+            postprocess_workers=1,
+            pin_memory=False,
+        ),
+    )
+    try:
+        result = batcher.separate(
+            audio=3,
+            description="music",
+            quality_success_threshold=success_threshold,
+            quality_failure_threshold=failure_threshold,
+            timeout=5,
+        )
+        assert result.metadata["verification"]["status"] == expected
+    finally:
+        batcher.close()
+
+
+def test_stage1_failure_does_not_cancel_stage2():
+    processor = FakeProcessor()
+    batcher = ContinuousSAMAudioBatcher(
+        FakeModel(),
+        processor,
+        ContinuousBatcherConfig(
+            max_batch_size=1,
+            max_active_requests=1,
+            fixed_midpoint_steps=1,
+            initial_candidates=4,
+            max_candidates=4,
+            margin=0.0,
+            preprocess_workers=1,
+            postprocess_workers=1,
+            pin_memory=False,
+        ),
+    )
+    try:
+        result = batcher.separate_cascade(
+            audio=3,
+            stage1_description="human voices",
+            stage2_description="music soundtrack",
+            stage1_quality_success_threshold=4.5,
+            stage1_quality_failure_threshold=3.5,
+            stage2_quality_success_threshold=3.0,
+            stage2_quality_failure_threshold=2.0,
+            timeout=5,
+        )
+        assert result.stage1.metadata["verification"]["status"] == "failure"
+        assert result.stage2.metadata["verification"]["status"] == "success"
+        assert len(processor.audio_inputs) == 2
     finally:
         batcher.close()

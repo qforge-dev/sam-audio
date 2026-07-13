@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /home/ubuntu/sam-audio-deploy
+
+export PYTHONPATH=/home/ubuntu/sam-audio-deploy
+export SAM_AUDIO_MODEL=/home/ubuntu/models/sam-audio-small-tv
+export SAM_AUDIO_HOST=127.0.0.1
+export SAM_AUDIO_PORT=8000
+
+export HF_HOME=/home/ubuntu/.cache/huggingface
+export HF_HUB_CACHE=/home/ubuntu/models/huggingface/hub
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export USE_TF=0
+export USE_FLAX=0
+export TRANSFORMERS_NO_TF=1
+export TRANSFORMERS_NO_FLAX=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+export NVIDIA_TF32_OVERRIDE=1
+export SAM_AUDIO_DTYPE_POLICY=tf32
+export SAM_AUDIO_PROMPT_STAGE1="human voices"
+export SAM_AUDIO_PROMPT_STAGE2="music soundtrack"
+export SAM_AUDIO_PREDICT_SPANS=true
+export SAM_AUDIO_STAGE1_STEPS=16
+export SAM_AUDIO_STAGE1_INITIAL_CANDIDATES=4
+export SAM_AUDIO_STAGE1_MAX_CANDIDATES=12
+export SAM_AUDIO_STAGE1_MARGIN=0.05
+export SAM_AUDIO_STAGE2_STEPS=16
+export SAM_AUDIO_STAGE2_INITIAL_CANDIDATES=4
+export SAM_AUDIO_STAGE2_MAX_CANDIDATES=12
+export SAM_AUDIO_STAGE2_MARGIN=0.05
+export SAM_AUDIO_CANDIDATE_INCREMENT=4
+export SAM_AUDIO_STAGE1_SUCCESS_THRESHOLD=4.5
+export SAM_AUDIO_STAGE1_FAILURE_THRESHOLD=4.3
+export SAM_AUDIO_STAGE2_SUCCESS_THRESHOLD=4.4
+export SAM_AUDIO_STAGE2_FAILURE_THRESHOLD=4.1
+export SAM_AUDIO_VOICE_JUDGE_OVERALL_WEIGHT=0.5
+export SAM_AUDIO_VOICE_JUDGE_PRECISION_WEIGHT=0.5
+export SAM_AUDIO_MUSIC_JUDGE_OVERALL_WEIGHT=0.25
+export SAM_AUDIO_MUSIC_JUDGE_PRECISION_WEIGHT=0.75
+export SAM_AUDIO_MAX_BATCH_SIZE=1
+export SAM_AUDIO_MAX_ACTIVE_REQUESTS=16
+export SAM_AUDIO_PREDECODE_INPUTS=true
+export SAM_AUDIO_ASYNC_OUTPUTS=true
+
+exec /home/ubuntu/sam-audio-deploy/.venv/bin/sam-audio-api

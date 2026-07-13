@@ -125,6 +125,7 @@ class SeparationResult:
     target: torch.Tensor
     residual: torch.Tensor
     noise: torch.Tensor
+    metadata: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -573,7 +574,11 @@ class SAMAudio(BaseModel):
             raise ValueError(
                 "`reranking_candidates` must match the candidate count used by `prepare_audio`"
             )
-        if predict_spans and not prepared.predict_spans and prepared.batch.anchors is None:
+        if (
+            predict_spans
+            and not prepared.predict_spans
+            and prepared.batch.anchors is None
+        ):
             prepared = self.prepare_audio(
                 prepared.batch,
                 candidates=prepared.candidates,
@@ -694,9 +699,7 @@ class SAMAudio(BaseModel):
         )
         bsz = wavs.size(0) // prepared.candidates
         sizes = self.audio_codec.feature_idx_to_wav_idx(prepared.batch.sizes)
-        target_wavs = self.unbatch(
-            wavs[:, 0].view(bsz, prepared.candidates, -1), sizes
-        )
+        target_wavs = self.unbatch(wavs[:, 0].view(bsz, prepared.candidates, -1), sizes)
         residual_wavs = self.unbatch(
             wavs[:, 1].view(bsz, prepared.candidates, -1), sizes
         )
@@ -741,9 +744,7 @@ class SAMAudio(BaseModel):
         )
         bsz = wavs.size(0) // prepared.candidates
         sizes = self.audio_codec.feature_idx_to_wav_idx(prepared.batch.sizes)
-        target_wavs = self.unbatch(
-            wavs[:, 0].view(bsz, prepared.candidates, -1), sizes
-        )
+        target_wavs = self.unbatch(wavs[:, 0].view(bsz, prepared.candidates, -1), sizes)
         residual_wavs = self.unbatch(
             wavs[:, 1].view(bsz, prepared.candidates, -1), sizes
         )
@@ -778,6 +779,43 @@ class SAMAudio(BaseModel):
                 sample_rate=self.audio_codec.sample_rate,
             )
         return None
+
+    def _score_candidate_wavs_with_details(
+        self,
+        batch: Batch,
+        target_wavs: list[torch.Tensor],
+        candidates: int,
+    ) -> tuple[Optional[torch.Tensor], dict[str, dict[str, Any]], dict[str, float]]:
+        ranker = None
+        kwargs: dict[str, Any] = {}
+        if (
+            candidates > 1
+            and batch.masked_video is not None
+            and self.visual_ranker is not None
+        ):
+            ranker = self.visual_ranker
+            kwargs = {
+                "extracted_audio": target_wavs,
+                "videos": batch.masked_video,
+                "sample_rate": self.audio_codec.sample_rate,
+            }
+        elif candidates > 1 and self.text_ranker is not None:
+            sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
+            input_audio = [
+                audio[:, :size].float().expand(candidates, -1)
+                for audio, size in zip(batch.audios, sizes, strict=False)
+            ]
+            ranker = self.text_ranker
+            kwargs = {
+                "extracted_audio": [wav.float() for wav in target_wavs],
+                "input_audio": input_audio,
+                "descriptions": batch.descriptions,
+                "sample_rate": self.audio_codec.sample_rate,
+            }
+        if ranker is None:
+            return None, {}, {}
+        ranked = ranker.score_with_details(**kwargs)
+        return ranked.scores, ranked.details, ranked.timings_ms
 
     def _select_candidate_wavs(
         self,
@@ -819,8 +857,8 @@ class SAMAudio(BaseModel):
             candidates=initial_candidates,
             predict_spans=predict_spans,
         )
-        target_wavs, residual_wavs, first_noise = self._generate_prepared_candidate_wavs(
-            prepared, noise, ode_opt
+        target_wavs, residual_wavs, first_noise = (
+            self._generate_prepared_candidate_wavs(prepared, noise, ode_opt)
         )
         scores = self._score_candidate_wavs(
             prepared.batch, target_wavs, initial_candidates
@@ -871,9 +909,7 @@ class SAMAudio(BaseModel):
         ]
         all_residual_wavs = [
             torch.cat([residual, extra], dim=0)
-            for residual, extra in zip(
-                residual_wavs, extra_residual_wavs, strict=False
-            )
+            for residual, extra in zip(residual_wavs, extra_residual_wavs, strict=False)
         ]
         all_scores = torch.cat([scores, extra_scores], dim=1)
         result = self._select_candidate_wavs(

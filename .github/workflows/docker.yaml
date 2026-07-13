@@ -45,7 +45,7 @@ jobs:
 
       - name: Check lockfile
         run: |
-          uv pip compile pyproject.toml --group dev --upgrade \
+          uv pip compile pyproject.toml --group dev --extra api --upgrade \
             --python-version 3.14 \
             --python-platform x86_64-manylinux_2_28 \
             --torch-backend "${UV_TORCH_BACKEND}" \
@@ -58,6 +58,7 @@ jobs:
         run: |
           python -m venv /tmp/sam-audio-venv
           uv pip sync pylock.toml --group dev \
+            --extra api \
             --torch-backend "${UV_TORCH_BACKEND}" \
             --strict \
             --dry-run \

@@ -1,0 +1,18 @@
+[Unit]
+Description=SAM Audio inference API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/sam-audio-deploy
+Environment=LD_LIBRARY_PATH=/home/ubuntu/sam-audio-deploy/.venv/lib/python3.14/site-packages/nvidia/cu13/lib
+ExecStart=/home/ubuntu/sam-audio-deploy/deploy/start-sam-audio-api.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

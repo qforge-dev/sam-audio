@@ -33,8 +33,8 @@ WORKDIR /opt/sam-audio
 COPY pyproject.toml pylock.toml README.md LICENSE ./
 COPY sam_audio ./sam_audio
 
-RUN uv pip sync pylock.toml --system --torch-backend "${UV_TORCH_BACKEND}" --strict \
-    && uv pip install --system --no-deps --no-build-isolation .
+RUN uv pip sync pylock.toml --system --extra api --torch-backend "${UV_TORCH_BACKEND}" --strict \
+    && uv pip install --system --no-deps --no-build-isolation ".[api]"
 
 RUN python - <<'PY'
 import sam_audio
@@ -46,4 +46,10 @@ print("sam_audio", sam_audio.__version__ if hasattr(sam_audio, "__version__") el
 print(SAMAudio.__name__, SAMAudioProcessor.__name__, AudioDecoder.__name__, ModernBertConfig.__name__)
 PY
 
-CMD ["python", "-c", "import torch, sam_audio; print(f'sam_audio image ready: torch {torch.__version__}')"]
+ENV SAM_AUDIO_MODEL=/models/sam-audio-small-tv
+
+VOLUME ["/models"]
+
+EXPOSE 8000
+
+CMD ["sam-audio-api"]
