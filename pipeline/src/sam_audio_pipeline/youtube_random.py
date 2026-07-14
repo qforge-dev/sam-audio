@@ -334,7 +334,16 @@ def analyze_wav(path: Path) -> dict[str, Any]:
     side = (samples[:, 0] - samples[:, 1]) / 2.0
     side_energy = float(np.mean(np.square(side)))
     total_energy = float(np.mean(np.square(samples)))
-    channel_correlation = float(np.corrcoef(samples[:, 0], samples[:, 1])[0, 1])
+    left_std = float(np.std(samples[:, 0]))
+    right_std = float(np.std(samples[:, 1]))
+    if left_std <= 1e-12 or right_std <= 1e-12:
+        channel_correlation = (
+            1.0 if np.array_equal(samples[:, 0], samples[:, 1]) else 0.0
+        )
+    else:
+        channel_correlation = float(
+            np.corrcoef(samples[:, 0], samples[:, 1])[0, 1]
+        )
     return {
         "channels": channels,
         "is_stereo": True,

@@ -75,3 +75,18 @@ def test_quality_gate_rejects_channel_duplicated_mono(tmp_path: Path) -> None:
 
     assert metrics["channel_correlation"] == 1.0
     assert "dual_mono" in quality_rejections(metrics, source_format())
+
+
+def test_quality_metrics_remain_finite_for_constant_channel(tmp_path: Path) -> None:
+    path = tmp_path / "constant.wav"
+    samples = np.zeros((48_000 * 10, 2), dtype="<i2")
+    samples[:, 1] = 1000
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(2)
+        output.setsampwidth(2)
+        output.setframerate(48_000)
+        output.writeframes(samples.tobytes())
+
+    metrics = analyze_wav(path)
+
+    assert metrics["channel_correlation"] == 0.0
