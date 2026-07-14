@@ -58,6 +58,8 @@ score_batch() {
   "$WHISPER_PYTHON" -m sam_audio_pipeline.m2d_validator asr-score \
     --input-dir "$batch_dir/audio" \
     --output "$batch_dir/asr-validation.jsonl" \
+    --m2d-results "$batch_dir/m2d-validation.jsonl" \
+    --require-cinematic-mix \
     --model small \
     --download-root /home/ubuntu/.cache/huggingface/faster-whisper
 }

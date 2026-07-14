@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from sam_audio_pipeline.m2d_validator import (
+    _m2d_asr_allowlist,
     evaluate_asr,
     evaluate_probabilities,
     load_label_families,
@@ -202,6 +203,36 @@ def _strong_voice_windows() -> list[dict[str, float | int]]:
         }
         for _ in range(9)
     ]
+
+
+def test_asr_allowlist_contains_only_current_m2d_passes(tmp_path: Path) -> None:
+    results = tmp_path / "m2d.jsonl"
+    results.write_text(
+        "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "filename": "pass.wav",
+                    "accepted": True,
+                    "rejection_reasons": [],
+                    "windows": _strong_voice_windows(),
+                },
+                {
+                    "filename": "fail.wav",
+                    "accepted": False,
+                    "rejection_reasons": ["insufficient_speech"],
+                    "windows": [],
+                },
+            )
+        )
+    )
+
+    allowed, scored_count = _m2d_asr_allowlist(
+        results, require_cinematic_mix=False
+    )
+
+    assert allowed == {"pass.wav"}
+    assert scored_count == 2
 
 
 def test_materialize_preserves_source_and_links_only_accepted(tmp_path: Path):

@@ -515,6 +515,24 @@ def evaluate_asr(
     }
 
 
+def _m2d_asr_allowlist(
+    path: Path, *, require_cinematic_mix: bool
+) -> tuple[set[str], int]:
+    latest: dict[str, dict[str, Any]] = {}
+    for line in path.read_text().splitlines():
+        if line.strip():
+            item = json.loads(line)
+            latest[str(item["filename"])] = item
+    allowed = {
+        filename
+        for filename, item in latest.items()
+        if _enforce_current_voice_gate(
+            item, require_cinematic_mix=require_cinematic_mix
+        ).get("accepted")
+    }
+    return allowed, len(latest)
+
+
 def score_asr_directory(args: argparse.Namespace) -> None:
     try:
         from faster_whisper import WhisperModel
@@ -530,6 +548,20 @@ def score_asr_directory(args: argparse.Namespace) -> None:
         download_root=(str(args.download_root) if args.download_root else None),
     )
     files = sorted(args.input_dir.glob(args.glob))
+    m2d_results = getattr(args, "m2d_results", None)
+    if m2d_results:
+        allowed, scored_count = _m2d_asr_allowlist(
+            m2d_results,
+            require_cinematic_mix=bool(
+                getattr(args, "require_cinematic_mix", False)
+            ),
+        )
+        files = [path for path in files if path.name in allowed]
+        logger.info(
+            "Restricted ASR to %d M2D-passing clips from %d scored filenames",
+            len(files),
+            scored_count,
+        )
     if args.limit:
         files = files[: args.limit]
     existing: set[str] = set()
@@ -1128,6 +1160,8 @@ def _parser() -> argparse.ArgumentParser:
     asr_score.add_argument("--device", default="cuda")
     asr_score.add_argument("--compute-type", default="float16")
     asr_score.add_argument("--download-root", type=Path)
+    asr_score.add_argument("--m2d-results", type=Path)
+    asr_score.add_argument("--require-cinematic-mix", action="store_true")
     asr_score.add_argument("--beam-size", type=int, default=5)
     asr_score.add_argument("--glob", default="*.wav")
     asr_score.add_argument("--limit", type=int)
