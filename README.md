@@ -106,6 +106,11 @@ uv run sam-pipeline-youtube-random \
   --total 1000 --seed 20260714
 ```
 
+Search metadata is only a candidate generator. Use the M2D validation command
+described in `docs/pipeline/OPERATIONS.md` before treating a clip as spoken
+dialogue over an active background. The gate explicitly rejects singing,
+rapping, choir, and other vocal music.
+
 Generation, prompt, batching, and TF32 policy are configured with the
 `SAM_AUDIO_*` environment variables demonstrated in
 [`deploy/start-sam-audio-api.sh`](deploy/start-sam-audio-api.sh). A supplied

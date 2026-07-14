@@ -122,6 +122,13 @@ was an example batch size, not a workflow limit.
   true-stereo, clipping, duration, uniqueness, existence, and SHA-256 gate
   passes. The audio payload is 1,920,078,000 bytes; no AudioSet record metadata
   or AudioSet candidate source was used.
+- M2D fragment validation scored all 1,000 local general-YouTube clips with the
+  official AudioSet-fine-tuned checkpoint. Policy
+  `spoken_dialogue_instrumental_background_m2d_v2` accepts 429 clips with
+  temporally overlapping spoken dialogue and active background, while rejecting
+  343 for singing, rapping, choir, or other vocal music. The listening output
+  preserves all 429 accepted clips and includes a 272-clip balanced subset with
+  136 music-led and 136 effects/ambience-or-mixed clips.
 - Live mono-filter job `5ec26b1bb28b420a9245e21d475d26be` completed with
   `non_stereo_input`, one input channel, zero chunks, zero stems, and zero model
   tasks. A live `targets=voice` API canary produced only voice and residual

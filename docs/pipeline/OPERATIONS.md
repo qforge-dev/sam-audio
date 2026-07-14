@@ -205,6 +205,49 @@ uv run sam-pipeline-youtube-random \
   --total 1000 --verify-only
 ```
 
+### M2D dialogue/background validation
+
+The technical YouTube gate does not prove that spoken dialogue and background
+activity occur in the selected ten seconds. Validate candidates with the
+official M2D AudioSet-fine-tuned tagger before using them. The validator scores
+overlapping two-second windows and requires speech, a non-human background
+class, and at least three windows in which both are active. Singing, choir,
+chant, rapping, humming, opera, a capella, vocal music, and song evidence may
+appear in at most one window, preventing sung vocals from satisfying the speech
+requirement. It separately records music-led, effects/ambience-led, and mixed
+instrumental backgrounds.
+
+The model repository, checkpoint, AudioSet label CSV, and ontology are runtime
+inputs rather than files baked into this repository or its Docker image:
+
+```bash
+uv run sam-pipeline-m2d-validate score \
+  --input-dir /data/youtube-random-1000/audio \
+  --output /data/youtube-random-1000/m2d-validation.jsonl \
+  --m2d-repo /models/m2d \
+  --checkpoint /models/m2d/weights_ep69it3124-0.47929.pth \
+  --class-labels /models/audioset/class_labels_indices.csv \
+  --ontology /models/audioset/ontology.json \
+  --m2d-commit 3d0c4de9447c404a8d3f9f37e04f53bc902e09b3
+```
+
+Create a separate listening-test folder containing only accepted audio. The
+command hard-links files when possible and never removes the source dataset:
+
+```bash
+uv run sam-pipeline-m2d-validate materialize \
+  --input-dir ~/Downloads/youtube-random-1000-20260714/audio \
+  --results ~/Downloads/m2d-validation.jsonl \
+  --source-manifest ~/Downloads/youtube-random-1000-20260714/manifest.json \
+  --output-dir ~/Downloads/youtube-dialogue-background-m2d-ok-20260714
+```
+
+The output includes `manifest.json`, `audit.json`, the complete M2D JSONL, and
+the accepted WAVs under `audio/`. `balanced-audio/` is a deterministic listening
+subset with equal music-led and non-music-led counts. Every record keeps the
+per-window scores, ranks, top labels, temporal coverage, rejection reasons,
+exact M2D checkpoint hash, and validator policy version.
+
 ## AudioSet validation batches
 
 Acquire a reproducible random sample from the official AudioSet segment CSVs.
