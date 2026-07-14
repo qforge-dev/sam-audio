@@ -17,7 +17,9 @@ export HF_HOME=/home/ubuntu/.cache/huggingface
 cd "$PIPELINE_ROOT"
 
 wait_for_initial_batch() {
-  while systemctl is-active --quiet sam-cinematic-dm-full-v3.service; do
+  while pgrep -f \
+    "sam_audio_pipeline.youtube_random.*cinematic-dm-raw-20260715" \
+    >/dev/null; do
     sleep 30
   done
 }
@@ -35,7 +37,7 @@ acquire_batch() {
     --query-count 500 \
     --results-per-query 100 \
     --search-workers 8 \
-    --download-workers 8 \
+    --download-workers 16 \
     --candidate-multiplier 2.0 \
     --max-attempts 16000 || true
 }
