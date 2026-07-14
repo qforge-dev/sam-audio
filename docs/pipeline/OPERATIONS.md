@@ -299,7 +299,7 @@ subset with equal music-led and non-music-led counts. Every record keeps the
 per-window scores, ranks, top labels, temporal coverage, rejection reasons,
 exact M2D checkpoint hash, and validator policy version.
 
-Policy v4 requires audible voice evidence in at least five 2-second windows:
+Policy v5 requires audible voice evidence in at least five 2-second windows:
 the M2D speech-family probability must be at least `0.10` and rank within the
 top five labels in each counted window. This strong gate is separate from the
 older low-confidence speech diagnostic and rejects clips tagged as speech only
@@ -326,6 +326,11 @@ no-speech probability no higher than `0.40`. Against the completed human-review
 set it rejected 12 of 14 clips explicitly marked `lacking_voice` while retaining
 25 of a deterministic 30-clip Good/Perfect calibration sample. The M2D strong
 speech check remains required as an independent guard.
+
+The same M2D pass rejects synthetic narration when Speech Synthesizer scores at
+least `0.20` within the top five labels in two or more windows. This threshold
+comes directly from the reviewed `ai voice` failure, where the class scored
+`0.24`–`0.72` in all nine windows.
 
 Pass both validation files when creating the exact final set:
 

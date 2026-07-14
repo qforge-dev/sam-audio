@@ -236,6 +236,7 @@ CINEMATIC_EXCLUDED_TERMS = (
     "action camera",
     "whatsapp status",
     "backsound",
+    "behind the scenes",
     "bollywood",
     "hindi",
     "tamil",

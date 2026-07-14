@@ -35,6 +35,32 @@ def test_asr_gate_requires_decodable_foreground_voice() -> None:
     assert "low_transcription_confidence" in chatter_hallucination["rejection_reasons"]
 
 
+def test_m2d_gate_rejects_repeated_confident_synthetic_speech() -> None:
+    labels = [
+        {"mid": "speech", "display_name": "Speech"},
+        {"mid": "music", "display_name": "Music"},
+        {"mid": "sfx", "display_name": "Vehicle"},
+        {"mid": "/m/0brhx", "display_name": "Speech synthesizer"},
+    ]
+    families = {
+        "speech": {0},
+        "foreground_speech": {0},
+        "synthetic_speech": {3},
+        "music": {1},
+        "nonmusic_background": {2},
+        "background": {1, 2},
+        "human": {0, 3},
+        "vocal_music": set(),
+    }
+    probabilities = np.asarray([[0.35, 0.20, 0.15, 0.30]] * 9)
+
+    result = evaluate_probabilities(probabilities, labels, families)
+
+    assert result["accepted"] is False
+    assert result["synthetic_speech_active_windows"] == 9
+    assert "synthetic_speech_present" in result["rejection_reasons"]
+
+
 def test_evaluate_probabilities_requires_temporal_overlap():
     labels = [
         {"mid": "speech", "display_name": "Speech"},

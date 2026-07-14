@@ -68,6 +68,12 @@ higher than `0.40`. Applied retrospectively, it rejects 12 of 14
 calibration sample. It is combined with cinematic-source metadata and the
 existing strong-speech gate; it is not treated as a standalone guarantee.
 
+The reviewed clip annotated `ai voice` exposed a separate, high-confidence
+signal: M2D Speech Synthesizer scored 0.24–0.72 in all nine windows. The current
+policy therefore rejects clips with Speech Synthesizer probability of at least
+0.20 at rank five or better in two or more windows. Acquisition metadata also
+rejects explicit AI/text-to-speech and behind-the-scenes sources.
+
 ## Model limitation discovered
 
 The old weak M2D speech gate was too permissive. More importantly, aggregate

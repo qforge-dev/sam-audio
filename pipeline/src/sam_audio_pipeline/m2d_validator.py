@@ -29,6 +29,7 @@ FOREGROUND_SPEECH_MIDS = {
     "/m/01h8n0",  # Conversation
     "/m/02qldy",  # Narration / monologue
 }
+SYNTHETIC_SPEECH_MID = "/m/0brhx"
 MUSIC_ROOT = "/m/04rlf"
 HUMAN_ROOT = "/m/0dgw9r"
 BACKGROUND_ROOTS = (
@@ -57,6 +58,9 @@ MIN_STRONG_SPEECH_WINDOWS = 5
 MIN_FOREGROUND_SPEECH_PROBABILITY = 0.005
 MAX_FOREGROUND_SPEECH_RANK = 15
 MIN_FOREGROUND_SPEECH_WINDOWS = 4
+MIN_SYNTHETIC_SPEECH_PROBABILITY = 0.20
+MAX_SYNTHETIC_SPEECH_RANK = 5
+MAX_SYNTHETIC_SPEECH_WINDOWS = 1
 MIN_ASR_VAD_SECONDS = 1.5
 MIN_ASR_WORDS = 2
 MIN_ASR_AVG_LOGPROB = -0.75
@@ -71,8 +75,8 @@ MIN_BACKGROUND_WINDOWS = 4
 MIN_OVERLAP_WINDOWS = 3
 MAX_VOCAL_MUSIC_WINDOWS = 1
 TOP_LABELS = 8
-POLICY_VERSION = "spoken_dialogue_instrumental_background_m2d_v4"
-CINEMATIC_POLICY_VERSION = "cinematic_dialogue_music_sfx_m2d_v2"
+POLICY_VERSION = "spoken_dialogue_instrumental_background_m2d_v5"
+CINEMATIC_POLICY_VERSION = "cinematic_dialogue_music_sfx_m2d_v3"
 ASR_POLICY_VERSION = "foreground_voice_faster_whisper_v1"
 
 
@@ -119,6 +123,9 @@ def load_label_families(
     foreground_speech = {
         index for index, mid in enumerate(mids) if mid in FOREGROUND_SPEECH_MIDS
     }
+    synthetic_speech = {
+        index for index, mid in enumerate(mids) if mid == SYNTHETIC_SPEECH_MID
+    }
     music = indices((MUSIC_ROOT,))
     human = indices((HUMAN_ROOT,))
     nonmusic_background = indices(BACKGROUND_ROOTS)
@@ -126,6 +133,7 @@ def load_label_families(
     return labels, {
         "speech": speech,
         "foreground_speech": foreground_speech,
+        "synthetic_speech": synthetic_speech,
         "music": music,
         "nonmusic_background": nonmusic_background,
         "background": music | nonmusic_background,
@@ -167,11 +175,15 @@ def evaluate_probabilities(
         evidence = {
             name: _family_evidence(
                 row,
-                families.get(name, families["speech"]),
+                families.get(
+                    name,
+                    families["speech"] if name == "foreground_speech" else set(),
+                ),
             )
             for name in (
                 "speech",
                 "foreground_speech",
+                "synthetic_speech",
                 "music",
                 "nonmusic_background",
                 "background",
@@ -190,6 +202,11 @@ def evaluate_probabilities(
             evidence["foreground_speech"][0]
             >= MIN_FOREGROUND_SPEECH_PROBABILITY
             and evidence["foreground_speech"][1] <= MAX_FOREGROUND_SPEECH_RANK
+        )
+        synthetic_speech_active = (
+            evidence["synthetic_speech"][0]
+            >= MIN_SYNTHETIC_SPEECH_PROBABILITY
+            and evidence["synthetic_speech"][1] <= MAX_SYNTHETIC_SPEECH_RANK
         )
         cinematic_music_active = (
             evidence["music"][0] >= MIN_CINEMATIC_MUSIC_PROBABILITY
@@ -231,6 +248,11 @@ def evaluate_probabilities(
                 ),
                 "foreground_speech_rank": evidence["foreground_speech"][1],
                 "foreground_speech_active": foreground_speech_active,
+                "synthetic_speech_score": round(
+                    evidence["synthetic_speech"][0], 8
+                ),
+                "synthetic_speech_rank": evidence["synthetic_speech"][1],
+                "synthetic_speech_active": synthetic_speech_active,
                 "cinematic_music_active": cinematic_music_active,
                 "cinematic_sfx_active": cinematic_sfx_active,
                 "background_active": background_active,
@@ -251,6 +273,9 @@ def evaluate_probabilities(
     strong_speech_windows = sum(item["strong_speech_active"] for item in windows)
     foreground_speech_windows = sum(
         item["foreground_speech_active"] for item in windows
+    )
+    synthetic_speech_windows = sum(
+        item["synthetic_speech_active"] for item in windows
     )
     cinematic_music_windows = sum(
         item["cinematic_music_active"] for item in windows
@@ -279,6 +304,8 @@ def evaluate_probabilities(
         rejections.append("insufficient_speech")
     if strong_speech_windows < MIN_STRONG_SPEECH_WINDOWS:
         rejections.append("insufficient_strong_speech")
+    if synthetic_speech_windows > MAX_SYNTHETIC_SPEECH_WINDOWS:
+        rejections.append("synthetic_speech_present")
     if require_cinematic_mix:
         if cinematic_music_windows < MIN_CINEMATIC_MUSIC_WINDOWS:
             rejections.append("insufficient_cinematic_music")
@@ -302,6 +329,7 @@ def evaluate_probabilities(
         "speech_active_windows": speech_windows,
         "strong_speech_active_windows": strong_speech_windows,
         "foreground_speech_active_windows": foreground_speech_windows,
+        "synthetic_speech_active_windows": synthetic_speech_windows,
         "cinematic_music_active_windows": cinematic_music_windows,
         "cinematic_sfx_active_windows": cinematic_sfx_windows,
         "background_active_windows": background_windows,
@@ -311,6 +339,9 @@ def evaluate_probabilities(
         "strong_speech_coverage": round(strong_speech_windows / window_count, 6),
         "foreground_speech_coverage": round(
             foreground_speech_windows / window_count, 6
+        ),
+        "synthetic_speech_coverage": round(
+            synthetic_speech_windows / window_count, 6
         ),
         "cinematic_music_coverage": round(
             cinematic_music_windows / window_count, 6
@@ -399,6 +430,11 @@ def score_directory(args: argparse.Namespace) -> None:
         ),
         "maximum_foreground_speech_rank": MAX_FOREGROUND_SPEECH_RANK,
         "minimum_foreground_speech_windows": MIN_FOREGROUND_SPEECH_WINDOWS,
+        "minimum_synthetic_speech_probability": (
+            MIN_SYNTHETIC_SPEECH_PROBABILITY
+        ),
+        "maximum_synthetic_speech_rank": MAX_SYNTHETIC_SPEECH_RANK,
+        "maximum_synthetic_speech_windows": MAX_SYNTHETIC_SPEECH_WINDOWS,
         "minimum_cinematic_music_probability": MIN_CINEMATIC_MUSIC_PROBABILITY,
         "maximum_cinematic_music_rank": MAX_CINEMATIC_MUSIC_RANK,
         "minimum_cinematic_music_windows": MIN_CINEMATIC_MUSIC_WINDOWS,
@@ -596,6 +632,20 @@ def _enforce_current_voice_gate(
             foreground_score >= MIN_FOREGROUND_SPEECH_PROBABILITY
             and foreground_rank <= MAX_FOREGROUND_SPEECH_RANK
         )
+        synthetic_score = float(window.get("synthetic_speech_score", 0.0))
+        synthetic_rank = int(window.get("synthetic_speech_rank", 10_000))
+        if "synthetic_speech_score" not in window:
+            for index, item in enumerate(window.get("top_labels", []), 1):
+                if item.get("mid") == SYNTHETIC_SPEECH_MID:
+                    synthetic_score = float(item.get("probability", 0.0))
+                    synthetic_rank = index
+                    break
+        window["synthetic_speech_score"] = synthetic_score
+        window["synthetic_speech_rank"] = synthetic_rank
+        window["synthetic_speech_active"] = (
+            synthetic_score >= MIN_SYNTHETIC_SPEECH_PROBABILITY
+            and synthetic_rank <= MAX_SYNTHETIC_SPEECH_RANK
+        )
         window["cinematic_music_active"] = (
             float(window.get("music_score", 0.0))
             >= MIN_CINEMATIC_MUSIC_PROBABILITY
@@ -615,6 +665,9 @@ def _enforce_current_voice_gate(
     foreground_speech_windows = sum(
         bool(window["foreground_speech_active"]) for window in windows
     )
+    synthetic_speech_windows = sum(
+        bool(window["synthetic_speech_active"]) for window in windows
+    )
     cinematic_music_windows = sum(
         bool(window["cinematic_music_active"]) for window in windows
     )
@@ -628,6 +681,11 @@ def _enforce_current_voice_gate(
     reasons = list(dict.fromkeys(result.get("rejection_reasons", [])))
     if not strong_voice_present and "insufficient_strong_speech" not in reasons:
         reasons.append("insufficient_strong_speech")
+    if (
+        synthetic_speech_windows > MAX_SYNTHETIC_SPEECH_WINDOWS
+        and "synthetic_speech_present" not in reasons
+    ):
+        reasons.append("synthetic_speech_present")
     if require_cinematic_mix:
         if (
             cinematic_music_windows < MIN_CINEMATIC_MUSIC_WINDOWS
@@ -646,6 +704,7 @@ def _enforce_current_voice_gate(
             "accepted": (
                 bool(result.get("accepted"))
                 and strong_voice_present
+                and synthetic_speech_windows <= MAX_SYNTHETIC_SPEECH_WINDOWS
                 and (not require_cinematic_mix or cinematic_mix_present)
             ),
             "policy": policy,
@@ -657,6 +716,10 @@ def _enforce_current_voice_gate(
             "foreground_speech_active_windows": foreground_speech_windows,
             "foreground_speech_coverage": round(
                 foreground_speech_windows / max(1, len(windows)), 6
+            ),
+            "synthetic_speech_active_windows": synthetic_speech_windows,
+            "synthetic_speech_coverage": round(
+                synthetic_speech_windows / max(1, len(windows)), 6
             ),
             "cinematic_music_active_windows": cinematic_music_windows,
             "cinematic_sfx_active_windows": cinematic_sfx_windows,
