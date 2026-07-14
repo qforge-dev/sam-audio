@@ -18,7 +18,13 @@ import time
 import urllib.parse
 import urllib.request
 import wave
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1285,61 +1291,75 @@ def acquire_dataset(
         pending,
         grouped=(source == "dailymotion" and clips_per_video > 1),
     )
+    limited_groups: list[list[dict[str, Any]]] = []
+    remaining_attempt_capacity = max_attempts
+    for group in work_groups:
+        if remaining_attempt_capacity <= 0:
+            break
+        selected = group[:remaining_attempt_capacity]
+        if selected:
+            limited_groups.append(selected)
+            remaining_attempt_capacity -= len(selected)
     attempts_made = 0
     with attempts_path.open("a", encoding="utf-8") as attempt_log:
         with ThreadPoolExecutor(max_workers=download_workers) as executor:
-            for offset in range(0, len(work_groups), download_workers):
-                if accepted_count >= total or attempts_made >= max_attempts:
-                    break
-                capacity = max_attempts - attempts_made
-                batch: list[list[dict[str, Any]]] = []
-                for group in work_groups[offset : offset + download_workers]:
-                    if capacity <= 0:
-                        break
-                    selected = group[:capacity]
-                    batch.append(selected)
-                    capacity -= len(selected)
-                grouped_results = list(
-                    executor.map(
-                        lambda group: acquire_candidate_group(
-                            group, output_dir, youtube_client=youtube_client
-                        ),
-                        batch,
-                    )
-                )
-                results = [
-                    result
-                    for group_results in grouped_results
-                    for result in group_results
-                ]
-                for result in results:
-                    attempts_made += 1
-                    if (
-                        result.get("retrieval_status") == "success"
-                        and accepted_count >= total
-                    ):
-                        (output_dir / str(result["local_path"])).unlink(missing_ok=True)
-                        result["retrieval_status"] = "surplus"
-                    if result.get("retrieval_status") == "success":
-                        accepted_count += 1
-                    attempts.append(result)
-                    attempt_log.write(json.dumps(result) + "\n")
-                    attempt_log.flush()
-                write_manifest(
+            group_iterator = iter(limited_groups)
+            in_flight: dict[Future[list[dict[str, Any]]], None] = {}
+
+            def submit_next() -> bool:
+                try:
+                    group = next(group_iterator)
+                except StopIteration:
+                    return False
+                future = executor.submit(
+                    acquire_candidate_group,
+                    group,
                     output_dir,
-                    attempts,
-                    target=total,
-                    seed=seed,
-                    profile=profile,
-                    clips_per_video=clips_per_video,
-                    source=source,
+                    youtube_client=youtube_client,
                 )
-                logger.info(
-                    "Accepted %d/%d after %d new attempts",
-                    accepted_count,
-                    total,
-                    attempts_made,
-                )
+                in_flight[future] = None
+                return True
+
+            for _ in range(download_workers):
+                if not submit_next():
+                    break
+
+            while in_flight:
+                completed, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    del in_flight[future]
+                    for result in future.result():
+                        attempts_made += 1
+                        if (
+                            result.get("retrieval_status") == "success"
+                            and accepted_count >= total
+                        ):
+                            (output_dir / str(result["local_path"])).unlink(
+                                missing_ok=True
+                            )
+                            result["retrieval_status"] = "surplus"
+                        if result.get("retrieval_status") == "success":
+                            accepted_count += 1
+                        attempts.append(result)
+                        attempt_log.write(json.dumps(result) + "\n")
+                    attempt_log.flush()
+                    write_manifest(
+                        output_dir,
+                        attempts,
+                        target=total,
+                        seed=seed,
+                        profile=profile,
+                        clips_per_video=clips_per_video,
+                        source=source,
+                    )
+                    logger.info(
+                        "Accepted %d/%d after %d new attempts",
+                        accepted_count,
+                        total,
+                        attempts_made,
+                    )
+                    if accepted_count < total:
+                        submit_next()
     manifest = write_manifest(
         output_dir,
         attempts,
