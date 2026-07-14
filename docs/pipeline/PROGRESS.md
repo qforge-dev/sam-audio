@@ -32,6 +32,8 @@ was an example batch size, not a workflow limit.
   original-plus-stems source explorer.
 - [x] Add frequency-aware stereo/loudness reconstruction while preserving every
   raw mono stem, plus a dashboard playback toggle and smoothed trajectory plots.
+- [x] Join stored stereo stems, persist phase/level-sensitive waveform fidelity
+  metrics, and graph the dataset-wide reconstruction score distribution.
 - [x] Require stereo input, gate SAM targets with source-scene presence, support
   single-stage inference, and use identity pass-through for pure SFX sources.
 - [x] Add persistent datasets, successive upload jobs, and reconciliation of
@@ -93,6 +95,13 @@ was an example batch size, not a workflow limit.
   source was repaired from its stored scene evidence and now has one SFX-only
   stem; raw, mapped, and original normalized PCM are sample-identical. The
   dataset now indexes 282 stems (93 music, 90 voice, 99 SFX).
+- Joined-stereo reconstruction is backfilled for all 100 stereo sources in seed
+  `20260713` and all 98 stereo sources in seed `20260714`. Their mean waveform
+  similarity is 82.79% (7.11–100) and 88.02% (24.92–100), respectively. The
+  repaired writing/SFX-only record scores exactly 100 with correlation 1.0 and
+  0 dB level error. Four additional reconstructable legacy sources (five
+  chunks) were also migrated, for 202 full-source joins from 203 chunk joins;
+  mono and sound-gated sources correctly have no joined artifact.
 - Live mono-filter job `5ec26b1bb28b420a9245e21d475d26be` completed with
   `non_stereo_input`, one input channel, zero chunks, zero stems, and zero model
   tasks. A live `targets=voice` API canary produced only voice and residual
@@ -106,7 +115,7 @@ was an example batch size, not a workflow limit.
 - Recovery job `1d07979ee96a45a98cf220b102fd7006` was uploaded without the
   completion callback. Reconciliation found the S3 object, enqueued ingestion,
   and completed it as sound-gated. All three queues were empty afterward.
-- Local and remote validation: 36 pipeline tests pass; the existing 12 SAM
+- Local and remote validation: 39 pipeline tests pass; the existing 12 SAM
   batching tests also pass.
 - Docker build execution remains unverified because neither the local Mac nor
   the current H100 host has a Docker daemon. Both Dockerfiles remain model-free.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import mimetypes
 import re
+import statistics
 import uuid
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
@@ -65,6 +66,33 @@ def _review_counts(aws: PipelineAWS) -> dict[str, int]:
     }
 
 
+def _percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _similarity_summary(scores: list[float]) -> dict[str, Any]:
+    return {
+        "count": len(scores),
+        "mean": round(statistics.fmean(scores), 4) if scores else None,
+        "median": round(statistics.median(scores), 4) if scores else None,
+        "minimum": round(min(scores), 4) if scores else None,
+        "maximum": round(max(scores), 4) if scores else None,
+        "p10": round(value, 4)
+        if (value := _percentile(scores, 0.1)) is not None
+        else None,
+        "p90": round(value, 4)
+        if (value := _percentile(scores, 0.9)) is not None
+        else None,
+    }
+
+
 def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
     dataset = aws.get(f"DATASET#{dataset_id}", "META")
     if not dataset:
@@ -121,6 +149,21 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
                 ),
                 None,
             )
+            chunk_reconstruction_scores = [
+                float(score)
+                for chunk in source_chunks
+                if (
+                    score := chunk.get("reconstruction", {})
+                    .get("metrics", {})
+                    .get("similarity_score")
+                )
+                is not None
+            ]
+            source_similarity = (
+                source.get("reconstruction", {})
+                .get("metrics", {})
+                .get("similarity_score")
+            )
             all_sources.append(
                 {
                     **source,
@@ -146,6 +189,22 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
                         )
                     ),
                     "selected_order": route,
+                    "reconstruction_count": (
+                        1 if source_similarity is not None else 0
+                    ),
+                    "reconstructed_chunk_count": len(
+                        chunk_reconstruction_scores
+                    ),
+                    "similarity_score": (
+                        round(float(source_similarity), 4)
+                        if source_similarity is not None
+                        else None
+                    ),
+                    "similarity_minimum": (
+                        round(min(chunk_reconstruction_scores), 4)
+                        if chunk_reconstruction_scores
+                        else None
+                    ),
                 }
             )
         job_summaries.append(
@@ -165,6 +224,41 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
     chunk_bytes = sum(int(chunk.get("bytes") or 0) for chunk in all_chunks)
     stem_bytes = sum(int(stem.get("bytes") or 0) for stem in all_stems)
     stereo_bytes = sum(int(stem.get("stereo_bytes") or 0) for stem in all_stems)
+    chunk_reconstruction_bytes = sum(
+        int(chunk.get("reconstruction", {}).get("bytes") or 0)
+        for chunk in all_chunks
+    )
+    source_reconstruction_bytes = sum(
+        int(source.get("reconstruction", {}).get("bytes") or 0)
+        for source in all_sources
+    )
+    reconstruction_bytes = (
+        chunk_reconstruction_bytes + source_reconstruction_bytes
+    )
+    reconstructions = []
+    for source in all_sources:
+        reconstruction = source.get("reconstruction", {})
+        metrics = reconstruction.get("metrics", {})
+        score = metrics.get("similarity_score")
+        if score is None:
+            continue
+        reconstructions.append(
+            {
+                "job_id": source.get("job_id"),
+                "source_id": source.get("source_id"),
+                "filename": source.get("filename"),
+                "chunk_count": source.get("chunk_count"),
+                "duration_seconds": source.get("duration_seconds"),
+                "similarity_score": float(score),
+                "waveform_correlation": metrics.get("waveform_correlation"),
+                "level_delta_db": metrics.get("level_delta_db"),
+                "snr_db": metrics.get("snr_db"),
+                "selected_order": source.get("selected_order"),
+            }
+        )
+    similarity_scores = [
+        float(item["similarity_score"]) for item in reconstructions
+    ]
     review_remaining = sum(
         stem.get("effective_status") in {"failure", "uncertain"} for stem in all_stems
     )
@@ -184,7 +278,16 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
             "chunk_bytes": chunk_bytes,
             "stem_bytes": stem_bytes,
             "stereo_bytes": stereo_bytes,
-            "total_bytes": input_bytes + chunk_bytes + stem_bytes + stereo_bytes,
+            "reconstruction_bytes": reconstruction_bytes,
+            "chunk_reconstruction_bytes": chunk_reconstruction_bytes,
+            "source_reconstruction_bytes": source_reconstruction_bytes,
+            "total_bytes": (
+                input_bytes
+                + chunk_bytes
+                + stem_bytes
+                + stereo_bytes
+                + reconstruction_bytes
+            ),
             "chunks": len(all_chunks),
             "audible_chunks": sum(
                 chunk.get("status") != "skipped" for chunk in all_chunks
@@ -194,6 +297,11 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
             ),
             "stems": len(all_stems),
             "stereo_stems": sum(bool(stem.get("stereo_s3_key")) for stem in all_stems),
+            "reconstructed_chunks": sum(
+                bool(chunk.get("reconstruction")) for chunk in all_chunks
+            ),
+            "reconstructed_sources": len(reconstructions),
+            "similarity": _similarity_summary(similarity_scores),
             "stems_by_type": dict(
                 Counter(str(stem.get("stem_type")) for stem in all_stems)
             ),
@@ -215,6 +323,10 @@ def _dataset_snapshot(aws: PipelineAWS, dataset_id: str) -> dict[str, Any]:
             all_sources,
             key=lambda source: str(source.get("created_at", "")),
             reverse=True,
+        ),
+        "reconstructions": sorted(
+            reconstructions,
+            key=lambda item: float(item["similarity_score"]),
         ),
     }
 
@@ -432,11 +544,17 @@ def create_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         job = next(item for item in items if item["SK"] == "META")
+        source_reconstruction = source.get("reconstruction", {})
         source = {
             **source,
             "audio_url": (
                 store.presign_download(source["s3_key"])
                 if source.get("s3_key") and source.get("status") != "failed"
+                else None
+            ),
+            "joined_audio_url": (
+                store.presign_download(source_reconstruction["s3_key"])
+                if source_reconstruction.get("s3_key")
                 else None
             ),
         }
@@ -499,6 +617,7 @@ def create_app(
         expanded_chunks = []
         for chunk in chunks:
             chunk_id = str(chunk["chunk_id"])
+            reconstruction = chunk.get("reconstruction", {})
             expanded_chunks.append(
                 {
                     **chunk,
@@ -514,6 +633,11 @@ def create_app(
                         ),
                     ),
                     "omitted_stems": sorted(omitted_by_chunk[chunk_id]),
+                    "joined_audio_url": (
+                        store.presign_download(reconstruction["s3_key"])
+                        if reconstruction.get("s3_key")
+                        else None
+                    ),
                 }
             )
         annotations = [

@@ -84,6 +84,13 @@ curl -f http://localhost:8000/v1/separate \
   -o voice-and-residual.zip
 ```
 
+The durable pipeline also sums the stored stereo-mapped stems after separation,
+reassembles the chunk joins into one joined stereo WAV per original record, and
+records a 0–100 sample-aligned reconstruction similarity score plus correlation,
+level, error, SNR, and per-channel metrics. These artifacts, chunk diagnostics,
+and the dataset-wide source-score distribution are available in the **Split
+data** dashboard; the direct model ZIP API remains unchanged.
+
 Generation, prompt, batching, and TF32 policy are configured with the
 `SAM_AUDIO_*` environment variables demonstrated in
 [`deploy/start-sam-audio-api.sh`](deploy/start-sam-audio-api.sh). A supplied

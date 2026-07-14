@@ -46,6 +46,17 @@
       .view[hidden] { display: none; }
       .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
       .metrics { grid-template-columns: repeat(6, 1fr); margin: 14px 0; }
+      .similarity-panel { margin: 0 0 14px; }
+      .similarity-head { display: flex; justify-content: space-between; gap: 16px; align-items: end; margin-bottom: 8px; }
+      .similarity-head strong { display: block; font-size: 22px; margin-top: 3px; }
+      .similarity-head span { color: var(--muted); text-align: right; }
+      .similarity-chart { width: 100%; height: auto; display: block; }
+      .similarity-chart .bar { fill: color-mix(in srgb, var(--accent) 72%, transparent); }
+      .similarity-chart .axis, .similarity-chart .grid-line { stroke: #59606b; stroke-width: 1; }
+      .similarity-chart .grid-line { opacity: .28; }
+      .similarity-chart .mean-line { stroke: var(--warn); stroke-width: 2; }
+      .similarity-chart text { fill: var(--muted); font-size: 10px; }
+      .similarity-chart .count { fill: var(--text); }
       .card { background: color-mix(in srgb, var(--panel) 95%, transparent); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
       .queue-name, .eyebrow { color: var(--muted); text-transform: uppercase; letter-spacing: .1em; font-size: 11px; }
       .queue-count, .metric-value { font-size: 29px; font-weight: 760; margin-top: 7px; line-height: 1.15; }
@@ -103,6 +114,8 @@
       .track-row.music .track-label { border-left: 4px solid var(--music); }
       .track-row.voice .track-label { border-left: 4px solid var(--voice); }
       .track-row.sfx .track-label { border-left: 4px solid var(--sfx); }
+      .track-row.joined .track-label { border-left: 4px solid var(--accent); }
+      .track-row.chunk-original { background: #181d22; }
       .chunk { margin-top: 15px; }
       .chunk-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 4px 7px; color: var(--muted); font-size: 12px; }
       .stereo-maps { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-top: 8px; }
@@ -112,6 +125,9 @@
       .stereo-map .center-line { stroke: #59606b; stroke-width: 1; stroke-dasharray: 4 4; }
       .stereo-map .pan-line { fill: none; stroke-width: 2.5; vector-effect: non-scaling-stroke; }
       .stereo-map-foot { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+      .reconstruction-summary { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-top: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 11px; background: #13161a; }
+      .reconstruction-summary strong { color: var(--accent); font-size: 17px; }
+      .reconstruction-summary span { color: var(--muted); font-size: 11px; text-align: right; }
       .gate-skip { border: 1px dashed var(--line); border-radius: 12px; padding: 20px; color: var(--muted); text-align: center; }
       .pipeline-overview { margin-top: 16px; }
       .steps { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
@@ -161,6 +177,7 @@
             <button id="refresh-dataset">Refresh</button>
           </div>
           <div id="dataset-metrics" class="grid metrics"></div>
+          <div id="similarity-chart"></div>
           <div class="explorer">
             <div id="source-list" class="card source-list"></div>
             <div id="source-detail" class="card"><div class="empty">Select a sound to inspect its split.</div></div>
@@ -202,6 +219,32 @@
         const minutes = Math.floor((value % 3600) / 60);
         const remainder = value % 60;
         return hours ? `${hours}h ${minutes}m` : `${minutes}m ${remainder}s`;
+      }
+
+      function formatScore(value) {
+        return value == null ? "–" : `${Number(value).toFixed(1)}%`;
+      }
+
+      function similarityChart(records, summary) {
+        if (!records.length) return '<div class="card similarity-panel"><div class="eyebrow">Reconstruction similarity</div><div class="muted">Joined stereo reconstruction has not been generated for this dataset yet.</div></div>';
+        const bins = Array(10).fill(0);
+        records.forEach(record => bins[Math.min(9, Math.max(0, Math.floor(Number(record.similarity_score) / 10)))]++);
+        const width = 760, height = 176, left = 34, right = 16, top = 24, bottom = 32;
+        const plotWidth = width - left - right, plotHeight = height - top - bottom;
+        const maximum = Math.max(...bins, 1), slot = plotWidth / bins.length;
+        const bars = bins.map((count, index) => {
+          const barHeight = count / maximum * plotHeight;
+          const x = left + index * slot + 4;
+          const y = top + plotHeight - barHeight;
+          return `<rect class="bar" x="${x}" y="${y}" width="${Math.max(slot - 8, 1)}" height="${barHeight}"><title>${index * 10}–${index === 9 ? 100 : index * 10 + 10}: ${count} source(s)</title></rect>${count ? `<text class="count" x="${x + (slot - 8) / 2}" y="${Math.max(y - 5, 11)}" text-anchor="middle">${count}</text>` : ""}`;
+        }).join("");
+        const ticks = [0, 20, 40, 60, 80, 100].map(value => {
+          const x = left + value / 100 * plotWidth;
+          return `<line class="grid-line" x1="${x}" y1="${top}" x2="${x}" y2="${top + plotHeight}"></line><text x="${x}" y="${height - 10}" text-anchor="middle">${value}%</text>`;
+        }).join("");
+        const meanX = left + Number(summary.mean || 0) / 100 * plotWidth;
+        const description = `${records.length} joined stereo records; mean ${formatScore(summary.mean)}, median ${formatScore(summary.median)}, range ${formatScore(summary.minimum)} to ${formatScore(summary.maximum)}.`;
+        return `<div class="card similarity-panel"><div class="similarity-head"><div><div class="eyebrow">Reconstruction similarity</div><strong>${formatScore(summary.mean)} mean</strong></div><span>${records.length} joined source(s) · median ${formatScore(summary.median)}<br>sample-aligned · phase + level sensitive</span></div><svg class="similarity-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(description)}"><title>${escapeHtml(description)}</title>${ticks}<line class="axis" x1="${left}" y1="${top + plotHeight}" x2="${width - right}" y2="${top + plotHeight}"></line>${bars}<line class="mean-line" x1="${meanX}" y1="${top - 4}" x2="${meanX}" y2="${top + plotHeight}"></line><text x="${Math.min(meanX + 4, width - 70)}" y="${top - 8}">mean ${formatScore(summary.mean)}</text></svg></div>`;
       }
 
       function show(view) {
@@ -311,18 +354,20 @@
         $("#dataset-metrics").innerHTML = [
           metric("Sounds", summary.sources, `${summary.jobs} upload job(s) · ${summary.non_stereo_sources || 0} non-stereo skipped`),
           metric("Duration", formatDuration(summary.duration_seconds), "original audio"),
-          metric("Storage", formatBytes(summary.total_bytes), `${formatBytes(summary.input_bytes)} originals · ${formatBytes(summary.chunk_bytes)} chunks · ${formatBytes(summary.stem_bytes)} raw stems · ${formatBytes(summary.stereo_bytes)} stereo`),
+          metric("Storage", formatBytes(summary.total_bytes), `${formatBytes(summary.input_bytes)} originals · ${formatBytes(summary.chunk_bytes)} chunks · ${formatBytes(summary.stem_bytes)} raw stems · ${formatBytes(summary.stereo_bytes)} mapped · ${formatBytes(summary.reconstruction_bytes)} joined`),
           metric("Chunks", summary.chunks, `${summary.skipped_chunks} sound-gated`),
           metric("Stems", summary.stems, `${Object.entries(summary.stems_by_type).map(([key, value]) => `${value} ${key}`).join(" · ")} · ${summary.stereo_stems} stereo mapped`),
           metric("Needs review", summary.review_remaining, "failure + uncertain")
         ].join("");
+        $("#similarity-chart").innerHTML = similarityChart(currentDataset.reconstructions || [], summary.similarity || {});
         $("#source-list").innerHTML = currentDataset.sources.map(source => {
           const needsReview = (source.stem_statuses.failure || 0) + (source.stem_statuses.uncertain || 0);
           const route = source.selected_order ? ` · ${source.selected_order.replace("_", " ")}` : "";
           const skipped = source.skip_reason === "non_stereo_input" ? " · skipped: input is not stereo" : "";
+          const similarity = source.similarity_score == null ? "" : ` · ${formatScore(source.similarity_score)} joined`;
           return `<button class="source-item ${source.source_id === currentSourceId ? "active" : ""}" data-source="${escapeHtml(source.source_id)}" onclick="loadSource('${escapeHtml(source.job_id)}', '${escapeHtml(source.source_id)}')">
             <strong>${escapeHtml(source.filename)}</strong>
-            <small>${escapeHtml(source.pipeline_status)} · ${formatDuration(source.duration_seconds)} · ${source.stem_count} stem(s)${escapeHtml(route)}${escapeHtml(skipped)}${needsReview ? ` · ${needsReview} need review` : ""}</small>
+            <small>${escapeHtml(source.pipeline_status)} · ${formatDuration(source.duration_seconds)} · ${source.stem_count} stem(s)${escapeHtml(route)}${escapeHtml(skipped)}${escapeHtml(similarity)}${needsReview ? ` · ${needsReview} need review` : ""}</small>
           </button>`;
         }).join("") || '<div class="empty">No uploaded sounds yet.</div>';
         const target = preferredSource || currentSourceId;
@@ -392,6 +437,8 @@
           ? `AudioSet · ${labels.join(", ") || "labelled sound"} · source ${provenance.start_seconds}s–${provenance.end_seconds}s`
           : `${formatDuration(source.duration_seconds)} · ${formatBytes(source.bytes)}`;
         const original = trackRow("original", "Original", "OG sound", source.audio_url);
+        const sourceReconstruction = source.reconstruction?.metrics || {};
+        const sourceJoined = trackRow("joined", "Joined", `full stereo reconstruction · ${formatScore(sourceReconstruction.similarity_score)} similar`, source.joined_audio_url);
         const sourceSkip = source.skip_reason === "non_stereo_input"
           ? '<div class="chunk"><div class="chunk-head"><span>Input filter</span><span class="status">skipped</span></div><div class="gate-skip">This source was not processed because the pipeline accepts exactly two-channel stereo input.</div></div>'
           : "";
@@ -401,14 +448,20 @@
             return `<div class="chunk"><div class="chunk-head"><span>Chunk ${escapeHtml(chunk.chunk_id)} · ${chunk.start_seconds}s–${chunk.end_seconds}s</span><span class="status">sound-gated</span></div><div class="gate-skip">No audible signal passed the gate, so no stems were generated.</div></div>`;
           }
           const route = chunk.stems[0]?.settings?.adaptive_routing?.selected_order;
-          const rows = chunk.stems.map(stem => {
+          const originalChunk = trackRow("chunk-original", "Chunk OG", "normalized stereo", chunk.audio_url);
+          const stemRows = chunk.stems.map(stem => {
             const labelsByType = {music: ["Music", "music stem"], voice: ["Voice", "dialogue stem"], sfx: ["Residual", "SFX / ambience"]};
             const [label, subtitle] = labelsByType[stem.stem_type] || [stem.stem_type, "stem"];
             return trackRow(stem.stem_type, label, `${subtitle} · ${stem.effective_status}`, stem.audio_url, stem.stereo_audio_url);
           }).join("");
+          const reconstruction = chunk.reconstruction || {};
+          const reconstructionMetrics = reconstruction.metrics || {};
+          const joined = trackRow("joined", "Chunk joined", `mapped stems · ${formatScore(reconstructionMetrics.similarity_score)} similar`, chunk.joined_audio_url);
+          const rows = originalChunk + stemRows + joined;
+          const reconstructionSummary = chunk.joined_audio_url ? `<div class="reconstruction-summary"><strong>${formatScore(reconstructionMetrics.similarity_score)} waveform similarity</strong><span>correlation ${Number(reconstructionMetrics.waveform_correlation || 0).toFixed(3)} · level ${Number(reconstructionMetrics.level_delta_db || 0).toFixed(2)} dB · SNR ${Number(reconstructionMetrics.snr_db || 0).toFixed(2)} dB</span></div>` : "";
           const stereoMaps = chunk.stems.map(stereoMapCard).join("");
           const gate = chunk.gate ? ` · peak ${Number(chunk.gate.peak_dbfs).toFixed(1)} dBFS` : "";
-          return `<div class="chunk"><div class="chunk-head"><span>Chunk ${escapeHtml(chunk.chunk_id)} · ${chunk.start_seconds}s–${chunk.end_seconds}s${escapeHtml(gate)}</span><span>${route ? escapeHtml(route.replace("_", " ")) : escapeHtml(chunk.status)}</span></div><div class="track-stack">${rows || '<div class="gate-skip">All generated stems were below the output sound gate.</div>'}</div>${stereoMaps ? `<div class="stereo-maps">${stereoMaps}</div>` : ""}</div>`;
+          return `<div class="chunk"><div class="chunk-head"><span>Chunk ${escapeHtml(chunk.chunk_id)} · ${chunk.start_seconds}s–${chunk.end_seconds}s${escapeHtml(gate)}</span><span>${route ? escapeHtml(route.replace("_", " ")) : escapeHtml(chunk.status)}</span></div><div class="track-stack">${rows || '<div class="gate-skip">All generated stems were below the output sound gate.</div>'}</div>${reconstructionSummary}${stereoMaps ? `<div class="stereo-maps">${stereoMaps}</div>` : ""}</div>`;
         }).join("");
         const steps = [
           ["source", source.pipeline_status],
@@ -419,7 +472,7 @@
         const annotations = data.annotations.map(annotation => `<div class="annotation"><b>${escapeHtml(annotation.task_type.replaceAll("_", " "))}</b><div>${escapeHtml(annotation.text)}</div></div>`).join("");
         $("#source-detail").innerHTML = `
           <div class="source-header"><div><div class="eyebrow">Sound detail</div><h2>${escapeHtml(source.filename)}</h2><div class="source-meta">${escapeHtml(provenanceText)}</div></div><div class="source-actions">${hasStereo ? `<div class="mode-toggle" aria-label="Stem playback mode"><button class="${stereoMappingEnabled ? "" : "active"}" onclick="setStereoMapping(false)">Raw</button><button class="${stereoMappingEnabled ? "active" : ""}" onclick="setStereoMapping(true)">Stereo mapped</button></div>` : ""}<span class="status ${escapeHtml(source.pipeline_status)}">${escapeHtml(source.pipeline_status)}</span></div></div>
-          <div class="track-stack">${original || '<div class="gate-skip">Original upload is not available.</div>'}</div>
+          <div class="track-stack">${original || '<div class="gate-skip">Original upload is not available.</div>'}${sourceJoined}</div>
           ${sourceSkip}
           ${chunks}
           <div class="card pipeline-overview"><div class="eyebrow">How it moved through the pipeline</div><div class="steps">${steps}</div><div class="annotations">${annotations || '<div class="muted">No model annotations yet.</div>'}</div></div>`;

@@ -17,6 +17,13 @@ from .aws import PipelineAWS
 from .config import Settings
 from .flamingo_client import AudioFlamingoClient
 from .model_client import SAMAudioClient, SeparationResult
+from .reconstruction import (
+    join_reconstructed_chunks,
+    join_stereo_stems,
+    normalize_source_audio,
+    reconstruction_record,
+    stereo_pcm16_sample_rate,
+)
 from .schema import QueueTask, StemRecord, VerificationStatus, utc_now
 from .stereo import StereoMappedStem, map_stems_to_stereo
 
@@ -251,6 +258,7 @@ class SeparationHandler:
         if not chunk:
             raise KeyError(f"Chunk does not exist: {task.chunk_id}")
         if chunk.get("status") == "complete":
+            self._refresh_source_reconstruction(task.job_id, task.source_id)
             return
         self.aws.update(
             f"JOB#{task.job_id}",
@@ -302,6 +310,7 @@ class SeparationHandler:
                     "Stereo mapping failed; raw stems remain durable for backfill"
                 )
             stored_stems: list[str] = []
+            stored_stereo_paths: dict[str, Path] = {}
             for stem_type, stem_path in result.stems.items():
                 gate = gates[stem_type]
                 stem_key = (
@@ -337,6 +346,7 @@ class SeparationHandler:
                         f"{task.chunk_id}/{stem_type}.stereo.wav"
                     )
                     self.aws.upload_file(stereo.path, stereo_key, "audio/wav")
+                    stored_stereo_paths[stem_type] = stereo.path
                 stage_name = stage_by_kind.get(stem_type)
                 stage = (
                     result.metadata.get("stages", {}).get(stage_name, {})
@@ -382,24 +392,136 @@ class SeparationHandler:
                 self.aws.put_stem(record)
                 stored_stems.append(stem_type)
                 self._enqueue_flamingo(task, stem_type)
+            reconstruction = None
+            if stored_stereo_paths:
+                try:
+                    joined = join_stereo_stems(
+                        input_path,
+                        stored_stereo_paths,
+                        root / "reconstruction" / "joined.stereo.wav",
+                    )
+                    joined_key = (
+                        f"jobs/{task.job_id}/reconstructions/{task.source_id}/"
+                        f"{task.chunk_id}.joined.stereo.wav"
+                    )
+                    self.aws.upload_file(joined.path, joined_key, "audio/wav")
+                    reconstruction = reconstruction_record(joined, joined_key)
+                    result.metadata["reconstruction"] = reconstruction
+                except Exception:
+                    logger.exception(
+                        "Joined stereo reconstruction failed; mapped stems "
+                        "remain durable"
+                    )
             metadata_key = (
                 f"jobs/{task.job_id}/metadata/{task.source_id}/{task.chunk_id}.json"
             )
             self.aws.upload_json(result.metadata, metadata_key)
-        self.aws.update(
-            f"JOB#{task.job_id}",
-            chunk_sk,
-            {
-                "status": "complete",
-                "stored_stems": stored_stems,
-                "verification_status": result.metadata.get(
-                    "verification_status", "uncertain"
-                ),
-                "metadata_s3_key": metadata_key,
-                "updated_at": utc_now(),
-            },
-        )
+        chunk_values = {
+            "status": "complete",
+            "stored_stems": stored_stems,
+            "verification_status": result.metadata.get(
+                "verification_status", "uncertain"
+            ),
+            "metadata_s3_key": metadata_key,
+            "updated_at": utc_now(),
+        }
+        if reconstruction:
+            chunk_values["reconstruction"] = reconstruction
+        self.aws.update(f"JOB#{task.job_id}", chunk_sk, chunk_values)
+        self._refresh_source_reconstruction(task.job_id, task.source_id)
         self._refresh_job(task.job_id)
+
+    def _refresh_source_reconstruction(
+        self, job_id: str, source_id: str
+    ) -> None:
+        items = self.aws.query_partition(f"JOB#{job_id}")
+        source = next(
+            (
+                item
+                for item in items
+                if item.get("entity") == "source"
+                and item.get("source_id") == source_id
+            ),
+            None,
+        )
+        chunks = sorted(
+            [
+                item
+                for item in items
+                if item.get("entity") == "chunk"
+                and item.get("source_id") == source_id
+            ],
+            key=lambda item: float(item.get("start_seconds") or 0.0),
+        )
+        if (
+            not source
+            or not chunks
+            or any(
+                chunk.get("status") not in {"complete", "skipped"}
+                for chunk in chunks
+            )
+        ):
+            return
+        existing = source.get("reconstruction", {})
+        if existing.get("s3_key") and self.aws.object_exists(
+            str(existing["s3_key"])
+        ):
+            return
+        reconstructed = [
+            chunk
+            for chunk in chunks
+            if chunk.get("status") == "complete"
+            and chunk.get("reconstruction", {}).get("s3_key")
+        ]
+        complete_chunks = [
+            chunk for chunk in chunks if chunk.get("status") == "complete"
+        ]
+        if not reconstructed or len(reconstructed) != len(complete_chunks):
+            return
+        with tempfile.TemporaryDirectory(
+            prefix="sam-source-reconstruction-"
+        ) as temporary:
+            root = Path(temporary)
+            source_path = root / f"source{Path(source['filename']).suffix or '.audio'}"
+            normalized = root / "source.normalized.wav"
+            self.aws.download_file(str(source["s3_key"]), source_path)
+            local_chunks: list[tuple[str, float, Path]] = []
+            for chunk in reconstructed:
+                path = root / "chunks" / f"{chunk['chunk_id']}.wav"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self.aws.download_file(
+                    str(chunk["reconstruction"]["s3_key"]), path
+                )
+                local_chunks.append(
+                    (
+                        str(chunk["chunk_id"]),
+                        float(chunk.get("start_seconds") or 0.0),
+                        path,
+                    )
+                )
+            normalize_source_audio(
+                source_path,
+                normalized,
+                sample_rate=stereo_pcm16_sample_rate(local_chunks[0][2]),
+            )
+            joined = join_reconstructed_chunks(
+                normalized,
+                local_chunks,
+                root / "source.joined.stereo.wav",
+            )
+            joined_key = (
+                f"jobs/{job_id}/reconstructions/{source_id}/"
+                "source.joined.stereo.wav"
+            )
+            self.aws.upload_file(joined.path, joined_key, "audio/wav")
+            self.aws.update(
+                f"JOB#{job_id}",
+                str(source["SK"]),
+                {
+                    "reconstruction": reconstruction_record(joined, joined_key),
+                    "updated_at": utc_now(),
+                },
+            )
 
     def _separate_with_policy(
         self,

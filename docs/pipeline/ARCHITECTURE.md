@@ -46,25 +46,38 @@ rule are persisted under `adaptive_routing`.
    loudness transfer is broadband so it cannot re-EQ the stem. Both are smoothed
    with a bidirectional EMA (`alpha=0.03`) before equal-power panning. An SFX-only
    pass-through bypasses mapping and keeps the original stereo PCM exactly.
-8. Raw and stereo-mapped WAVs, the 120-point pan/loudness trajectory, inference
-   metadata, timings, and review assertions are stored in S3 and indexed in
-   DynamoDB. A stereo mapping failure never discards or delays the raw result.
-9. Description and transcription tasks share one Audio Flamingo queue so that a
+8. After the output sound gate, the stored stereo-mapped stems are summed into
+   one joined WAV per chunk. Once every chunk is terminal, those chunk joins are
+   placed back on their source timeline (overlaps are averaged) to produce one
+   `source.joined.stereo.wav` for the original record. The stored source PCM is
+   compared sample-for-sample with the normalized stereo original. A 0–100
+   symmetric waveform-agreement score penalizes phase, timing, polarity, and
+   level error; correlation, left/right scores, level delta, normalized RMSE,
+   SNR, coverage, and limiter gain remain alongside it for diagnosis. Chunk
+   scores remain available for locating a problem. An identity SFX pass-through
+   reconstructs exactly at 100.
+9. Raw and stereo-mapped WAVs, the joined reconstruction, similarity metrics,
+   the 120-point pan/loudness trajectory, inference metadata, timings, and
+   review assertions are stored in S3 and indexed in DynamoDB. A stereo mapping
+   failure never discards or delays the raw result.
+10. Description and transcription tasks share one Audio Flamingo queue so that a
    single loaded model processes one item at a time. It creates one source-scene
    analysis per audible source, one description per music stem, and one
    speaker-labelled transcript per voice stem. Tasks exist in DynamoDB before
    SQS delivery and are reconciled after worker/message loss.
-10. A browser dashboard shows job/queue progress and exact remaining review
+11. A browser dashboard shows job/queue progress and exact remaining review
    counts. Its reviewer mode pulls the next `uncertain` or `failure` assertion,
    starts audio automatically, displays the prompt/assertion, and accepts
    one-key decisions.
-11. The dataset explorer reports source count, duration, input/chunk/stem storage,
+12. The dataset explorer reports source count, duration, input/chunk/stem storage,
    processing counts, stem mix, and review backlog. Each source displays the
    original recording first, then only the music/voice/SFX stems that passed the
    output sound gate, grouped by chunk, followed by its processing route and
-   model annotations. Raw mono playback is the default; a `Stereo mapped`
-   toggle swaps only the stem players and leaves the original recording
-   untouched. Each stem also shows its smoothed left/right trajectory.
+   model annotations. Stereo-mapped playback is the default; a `Raw` toggle
+   swaps only the stem players and leaves the original recording untouched.
+   Each stem also shows its smoothed left/right trajectory. The explorer plays
+   the full joined result beside its original, retains each chunk join and its
+   diagnostics, and graphs the dataset-wide source-score distribution.
 
 ## AWS resources
 
@@ -103,6 +116,8 @@ jobs/{job_id}/sources/{source_id}/{filename}
 jobs/{job_id}/chunks/{source_id}/{chunk_index}.wav
 jobs/{job_id}/stems/{source_id}/{chunk_index}/{music|voice|sfx}.wav
 jobs/{job_id}/stems/{source_id}/{chunk_index}/{music|voice|sfx}.stereo.wav
+jobs/{job_id}/reconstructions/{source_id}/{chunk_index}.joined.stereo.wav
+jobs/{job_id}/reconstructions/{source_id}/source.joined.stereo.wav
 jobs/{job_id}/metadata/{source_id}/{chunk_index}.json
 jobs/{job_id}/metadata/{source_id}/{chunk_index}.stereo.json
 ```
@@ -110,7 +125,9 @@ jobs/{job_id}/metadata/{source_id}/{chunk_index}.stereo.json
 Source and stem records include SHA-256 hashes. A stem record includes the
 source chunk hash, prompt, model/settings fingerprint, automated status,
 reviewer status, raw and stereo S3 keys/hashes/sizes, stereo mapping summary,
-timings, and raw Judge/CLAP evidence. The raw `s3_key` is never replaced by its
+chunk reconstruction key/hash/size and waveform similarity metrics, timings,
+and raw Judge/CLAP evidence. The source record stores the corresponding full
+record reconstruction and metrics. The raw `s3_key` is never replaced by its
 mapped companion.
 
 ## Review contract

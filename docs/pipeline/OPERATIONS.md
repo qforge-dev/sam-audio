@@ -97,6 +97,39 @@ ssh ubuntu@ec2-44-211-31-38.compute-1.amazonaws.com \
 Use `--max-chunks N` for a canary. Mapping is CPU-only and does not require a
 SAM or Audio Flamingo restart.
 
+## Joined reconstruction and similarity
+
+After stereo mapping and the output sound gate, the pipeline sums only the
+stored stereo variants into `{chunk}.joined.stereo.wav`. After all chunks for a
+record are terminal, it places those joins back on the source timeline and
+overlap-averages them into `source.joined.stereo.wav`. The primary dataset score
+compares that stored source PCM directly with the normalized stereo original,
+without gain fitting or time alignment:
+
+`100 × max(0, 2 × dot(original, joined) / (energy(original) + energy(joined)))`
+
+This makes 100 an exact reconstruction; missing-output silence against an
+audible original, opposite polarity, or another non-positive match scores 0.
+The source record also retains waveform correlation,
+left/right scores, level delta, normalized RMSE, SNR, coverage, and final limiter
+gain. Chunk records retain the same diagnostics plus the included stem types so
+a low source score can be localized. In **Split data**, the dataset histogram
+shows the source-score distribution, the source detail plays Original beside
+Joined, and each chunk exposes its normalized original and diagnostic join.
+
+Backfill completed jobs from existing stereo companions without rerunning SAM or
+Audio Flamingo:
+
+```bash
+ssh ubuntu@ec2-44-211-31-38.compute-1.amazonaws.com \
+  "sudo bash -c 'set -a; source /etc/sam-audio-pipeline.env; set +a; \
+   cd /home/ubuntu/sam-audio-deploy/pipeline; \
+   .venv/bin/sam-pipeline-reconstruction-backfill --job-id JOB_ID'"
+```
+
+The command is idempotent; use `--force` to regenerate an existing joined
+artifact or `--max-chunks N` for a canary.
+
 ## AudioSet validation batches
 
 Acquire a reproducible random sample from the official AudioSet segment CSVs.

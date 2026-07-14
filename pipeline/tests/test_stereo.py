@@ -271,6 +271,16 @@ def test_backfill_keeps_presence_passthrough_bit_identical(tmp_path: Path) -> No
 class SeparationAWS:
     def __init__(self, original: Path):
         self.original = original
+        self.source = {
+            "PK": "JOB#job-1",
+            "SK": "SOURCE#source-1",
+            "entity": "source",
+            "job_id": "job-1",
+            "source_id": "source-1",
+            "filename": "original.wav",
+            "status": "chunked",
+            "s3_key": "source.wav",
+        }
         self.chunk = {
             "PK": "JOB#job-1",
             "SK": "CHUNK#source-1#000000",
@@ -290,6 +300,8 @@ class SeparationAWS:
     def update(self, _: str, sk: str, values: dict[str, Any]) -> None:
         if sk == self.chunk["SK"]:
             self.chunk.update(values)
+        if sk == self.source["SK"]:
+            self.source.update(values)
 
     def download_file(self, _: str, destination: Path) -> None:
         shutil.copyfile(self.original, destination)
@@ -312,7 +324,7 @@ class SeparationAWS:
 
     def query_partition(self, _: str) -> list[dict[str, Any]]:
         return [
-            {"entity": "source", "status": "chunked", "audible_chunk_count": 1},
+            self.source,
             self.chunk,
             *[
                 {"entity": "stem", "stem_type": record.stem_type}
@@ -389,11 +401,17 @@ def test_separation_handler_persists_raw_and_mapped_companions(tmp_path: Path) -
     )
 
     assert len(aws.records) == 3
-    assert len(aws.uploads) == 6
-    assert sum(key.endswith(".stereo.wav") for key in aws.uploads) == 3
+    assert len(aws.uploads) == 8
+    assert sum(
+        key.endswith(".stereo.wav") and not key.endswith(".joined.stereo.wav")
+        for key in aws.uploads
+    ) == 3
+    assert sum(key.endswith(".joined.stereo.wav") for key in aws.uploads) == 2
     assert all(record.stereo_s3_key for record in aws.records)
     assert all(record.stereo_bytes > 0 for record in aws.records)
     assert all(record.stereo_mapping["mapped_channels"] == 2 for record in aws.records)
+    assert aws.chunk["reconstruction"]["metrics"]["similarity_score"] > 0
+    assert aws.source["reconstruction"]["metrics"]["similarity_score"] > 0
 
 
 def test_separation_handler_bypasses_sam_for_sfx_only_presence(
@@ -425,4 +443,6 @@ def test_separation_handler_bypasses_sam_for_sfx_only_presence(
     assert record.sha256 == record.stereo_sha256
     assert record.bytes == record.stereo_bytes
     assert record.stereo_mapping["algorithm"] == "stereo_identity_passthrough_v1"
+    assert aws.chunk["reconstruction"]["metrics"]["similarity_score"] == 100.0
+    assert aws.source["reconstruction"]["metrics"]["similarity_score"] == 100.0
     assert aws.chunk["stored_stems"] == ["sfx"]

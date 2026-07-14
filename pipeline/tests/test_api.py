@@ -203,6 +203,16 @@ def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
                 "status": "complete",
                 "bytes": 1000,
                 "duration_seconds": 10.0,
+                "reconstruction": {
+                    "s3_key": "source.joined.stereo.wav",
+                    "bytes": 100,
+                    "metrics": {
+                        "similarity_score": 87.0,
+                        "waveform_correlation": 0.93,
+                        "level_delta_db": -1.0,
+                        "snr_db": 8.5,
+                    },
+                },
             },
         )
         aws.put(
@@ -218,6 +228,16 @@ def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
                 "s3_key": "chunk.wav",
                 "bytes": 50,
                 "gate": {"audible": True},
+                "reconstruction": {
+                    "s3_key": "joined.stereo.wav",
+                    "bytes": 75,
+                    "metrics": {
+                        "similarity_score": 88.5,
+                        "waveform_correlation": 0.94,
+                        "level_delta_db": -0.8,
+                        "snr_db": 9.2,
+                    },
+                },
             }
         )
         for index, stem_type in enumerate(("music", "sfx"), start=1):
@@ -270,12 +290,26 @@ def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
         "chunk_bytes": 50,
         "stem_bytes": 300,
         "stereo_bytes": 220,
-        "total_bytes": 1570,
+        "reconstruction_bytes": 175,
+        "chunk_reconstruction_bytes": 75,
+        "source_reconstruction_bytes": 100,
+        "total_bytes": 1745,
         "chunks": 1,
         "audible_chunks": 1,
         "skipped_chunks": 0,
         "stems": 2,
         "stereo_stems": 1,
+        "reconstructed_chunks": 1,
+        "reconstructed_sources": 1,
+        "similarity": {
+            "count": 1,
+            "mean": 87.0,
+            "median": 87.0,
+            "minimum": 87.0,
+            "maximum": 87.0,
+            "p10": 87.0,
+            "p90": 87.0,
+        },
         "stems_by_type": {"music": 1, "sfx": 1},
         "stems_by_status": {"success": 2},
         "selected_routes": {},
@@ -292,3 +326,9 @@ def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
     )
     assert detail["chunks"][0]["stems"][1]["stereo_audio_url"] is None
     assert detail["chunks"][0]["omitted_stems"] == ["voice"]
+    assert detail["chunks"][0]["joined_audio_url"].endswith("joined.stereo.wav")
+    assert detail["source"]["joined_audio_url"].endswith(
+        "source.joined.stereo.wav"
+    )
+    assert overview["reconstructions"][0]["similarity_score"] == 87.0
+    assert overview["sources"][0]["similarity_score"] == 87.0
