@@ -51,8 +51,8 @@ HIGH_QUALITY_AUDIO_SELECTOR = (
     "bestaudio[acodec!=none]/best[acodec!=none]"
 )
 DAILYMOTION_EFFICIENT_SELECTOR = (
-    "best[height>=360][height<=480][acodec!=none]/"
-    "best[height>=360][acodec!=none]/best[acodec!=none]"
+    "best[height>=720][height<=720][acodec!=none]/"
+    "best[height>=720][acodec!=none]/best[acodec!=none]"
 )
 
 SCENES = (
