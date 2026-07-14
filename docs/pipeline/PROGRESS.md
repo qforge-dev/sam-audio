@@ -34,6 +34,8 @@ was an example batch size, not a workflow limit.
   raw mono stem, plus a dashboard playback toggle and smoothed trajectory plots.
 - [x] Join stored stereo stems, persist phase/level-sensitive waveform fidelity
   metrics, and graph the dataset-wide reconstruction score distribution.
+- [x] Persist and display each original's mono/stereo layout and encoding quality
+  facts, with an idempotent historical backfill.
 - [x] Require stereo input, gate SAM targets with source-scene presence, support
   single-stage inference, and use identity pass-through for pure SFX sources.
 - [x] Add persistent datasets, successive upload jobs, and reconciliation of
@@ -102,6 +104,11 @@ was an example batch size, not a workflow limit.
   0 dB level error. Four additional reconstructable legacy sources (five
   chunks) were also migrated, for 202 full-source joins from 203 chunk joins;
   mono and sound-gated sources correctly have no joined artifact.
+- Original audio profiles were backfilled for all 207 durable source objects
+  across nine jobs. The only two records without profiles are upload records
+  from an already-failed job whose source objects never reached S3. The current
+  AudioSet set reports 98 stereo and two mono originals with exact codec,
+  sample-rate, bit-depth, and bitrate facts.
 - Live mono-filter job `5ec26b1bb28b420a9245e21d475d26be` completed with
   `non_stereo_input`, one input channel, zero chunks, zero stems, and zero model
   tasks. A live `targets=voice` API canary produced only voice and residual

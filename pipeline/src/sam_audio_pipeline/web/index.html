@@ -96,10 +96,13 @@
       .source-item.active { background: #26302d; color: var(--accent); }
       .source-item strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .source-item small { color: var(--muted); }
+      .source-item .source-audio-profile { display: block; margin-top: 4px; color: #aeb7c3; }
       .source-header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 16px; }
       .source-header > div { min-width: 0; }
       .source-header h2 { overflow-wrap: anywhere; }
       .source-meta { color: var(--muted); }
+      .audio-profile { display: inline-flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; color: #c7ced8; font-size: 12px; }
+      .audio-profile span { padding: 4px 7px; border: 1px solid var(--line); border-radius: 999px; background: #171b20; }
       .source-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
       .mode-toggle { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: #111318; }
       .mode-toggle button { border: 0; padding: 6px 10px; background: transparent; }
@@ -223,6 +226,38 @@
 
       function formatScore(value) {
         return value == null ? "–" : `${Number(value).toFixed(1)}%`;
+      }
+
+      function audioProfileParts(profile) {
+        if (!profile?.channels) return [];
+        const qualityLabels = {
+          hi_res_lossless: "Hi-res lossless encoding",
+          lossless: "Lossless encoding",
+          high_bitrate_lossy: "High-bitrate lossy",
+          standard_bitrate_lossy: "Standard lossy",
+          low_bitrate_lossy: "Low-bitrate lossy",
+          compressed_unknown_bitrate: "Compressed"
+        };
+        const sampleRate = Number(profile.sample_rate_hz || 0);
+        const rate = sampleRate ? `${Number((sampleRate / 1000).toFixed(sampleRate % 1000 ? 1 : 0))} kHz` : null;
+        const bitrate = profile.bitrate_bps ? `${Math.round(Number(profile.bitrate_bps) / 1000).toLocaleString()} kbps` : null;
+        const encoding = [profile.container?.split(",")[0]?.toUpperCase(), profile.codec?.toUpperCase()].filter(Boolean).join(" / ");
+        return [
+          profile.channel_label || `${profile.channels} channels`,
+          qualityLabels[profile.quality_tier] || null,
+          encoding || null,
+          rate,
+          profile.bit_depth ? `${profile.bit_depth}-bit` : null,
+          bitrate
+        ].filter(Boolean);
+      }
+
+      function audioProfileText(profile) {
+        return audioProfileParts(profile).join(" · ");
+      }
+
+      function audioProfileBadges(profile) {
+        return audioProfileParts(profile).map(part => `<span>${escapeHtml(part)}</span>`).join("");
       }
 
       function similarityChart(records, summary) {
@@ -365,9 +400,11 @@
           const route = source.selected_order ? ` · ${source.selected_order.replace("_", " ")}` : "";
           const skipped = source.skip_reason === "non_stereo_input" ? " · skipped: input is not stereo" : "";
           const similarity = source.similarity_score == null ? "" : ` · ${formatScore(source.similarity_score)} joined`;
+          const audioProfile = audioProfileText(source.audio_profile);
           return `<button class="source-item ${source.source_id === currentSourceId ? "active" : ""}" data-source="${escapeHtml(source.source_id)}" onclick="loadSource('${escapeHtml(source.job_id)}', '${escapeHtml(source.source_id)}')">
             <strong>${escapeHtml(source.filename)}</strong>
             <small>${escapeHtml(source.pipeline_status)} · ${formatDuration(source.duration_seconds)} · ${source.stem_count} stem(s)${escapeHtml(route)}${escapeHtml(skipped)}${escapeHtml(similarity)}${needsReview ? ` · ${needsReview} need review` : ""}</small>
+            ${audioProfile ? `<small class="source-audio-profile">${escapeHtml(audioProfile)}</small>` : ""}
           </button>`;
         }).join("") || '<div class="empty">No uploaded sounds yet.</div>';
         const target = preferredSource || currentSourceId;
@@ -436,6 +473,7 @@
         const provenanceText = provenance.video_id
           ? `AudioSet · ${labels.join(", ") || "labelled sound"} · source ${provenance.start_seconds}s–${provenance.end_seconds}s`
           : `${formatDuration(source.duration_seconds)} · ${formatBytes(source.bytes)}`;
+        const sourceAudioProfile = audioProfileBadges(source.audio_profile);
         const original = trackRow("original", "Original", "OG sound", source.audio_url);
         const sourceReconstruction = source.reconstruction?.metrics || {};
         const sourceJoined = trackRow("joined", "Joined", `full stereo reconstruction · ${formatScore(sourceReconstruction.similarity_score)} similar`, source.joined_audio_url);
@@ -471,7 +509,7 @@
         ].map(([label, status]) => `<span class="step ${escapeHtml(status)}">${escapeHtml(label)} · ${escapeHtml(status)}</span>`).join("");
         const annotations = data.annotations.map(annotation => `<div class="annotation"><b>${escapeHtml(annotation.task_type.replaceAll("_", " "))}</b><div>${escapeHtml(annotation.text)}</div></div>`).join("");
         $("#source-detail").innerHTML = `
-          <div class="source-header"><div><div class="eyebrow">Sound detail</div><h2>${escapeHtml(source.filename)}</h2><div class="source-meta">${escapeHtml(provenanceText)}</div></div><div class="source-actions">${hasStereo ? `<div class="mode-toggle" aria-label="Stem playback mode"><button class="${stereoMappingEnabled ? "" : "active"}" onclick="setStereoMapping(false)">Raw</button><button class="${stereoMappingEnabled ? "active" : ""}" onclick="setStereoMapping(true)">Stereo mapped</button></div>` : ""}<span class="status ${escapeHtml(source.pipeline_status)}">${escapeHtml(source.pipeline_status)}</span></div></div>
+          <div class="source-header"><div><div class="eyebrow">Sound detail</div><h2>${escapeHtml(source.filename)}</h2><div class="source-meta">${escapeHtml(provenanceText)}</div>${sourceAudioProfile ? `<div class="audio-profile" aria-label="Original audio quality">${sourceAudioProfile}</div>` : ""}</div><div class="source-actions">${hasStereo ? `<div class="mode-toggle" aria-label="Stem playback mode"><button class="${stereoMappingEnabled ? "" : "active"}" onclick="setStereoMapping(false)">Raw</button><button class="${stereoMappingEnabled ? "active" : ""}" onclick="setStereoMapping(true)">Stereo mapped</button></div>` : ""}<span class="status ${escapeHtml(source.pipeline_status)}">${escapeHtml(source.pipeline_status)}</span></div></div>
           <div class="track-stack">${original || '<div class="gate-skip">Original upload is not available.</div>'}${sourceJoined}</div>
           ${sourceSkip}
           ${chunks}

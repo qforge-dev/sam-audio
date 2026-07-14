@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .audio import chunk_audio, gate_wav, probe_channels, probe_duration, sha256_file
+from .audio import chunk_audio, gate_wav, probe_audio_profile, sha256_file
 from .aws import PipelineAWS
 from .config import Settings
 from .flamingo_client import AudioFlamingoClient
@@ -124,8 +124,10 @@ class IngestHandler:
             suffix = Path(source["filename"]).suffix or ".audio"
             local_source = root / f"source{suffix}"
             self.aws.download_file(source["s3_key"], local_source)
-            source_bytes = local_source.stat().st_size
-            source_channels = probe_channels(local_source)
+            audio_profile = probe_audio_profile(local_source)
+            source_bytes = int(audio_profile["bytes"])
+            source_channels = int(audio_profile["channels"])
+            source_duration = float(audio_profile.get("duration_seconds") or 0.0)
             source_sha256 = sha256_file(local_source)
             if source_channels != 2:
                 self.aws.update(
@@ -135,10 +137,11 @@ class IngestHandler:
                         "status": "complete",
                         "skip_reason": "non_stereo_input",
                         "input_channels": source_channels,
+                        "audio_profile": audio_profile,
                         "chunk_count": 0,
                         "audible_chunk_count": 0,
                         "bytes": source_bytes,
-                        "duration_seconds": probe_duration(local_source),
+                        "duration_seconds": source_duration,
                         "source_sha256": source_sha256,
                         "updated_at": utc_now(),
                     },
@@ -208,6 +211,7 @@ class IngestHandler:
                 ),
                 "source_sha256": source_sha256,
                 "input_channels": source_channels,
+                "audio_profile": audio_profile,
                 "updated_at": utc_now(),
             },
         )

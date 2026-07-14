@@ -20,6 +20,7 @@ sam-pipeline-audioset = "sam_audio_pipeline.audioset:main"
 sam-pipeline-submit = "sam_audio_pipeline.submit:main"
 sam-pipeline-stereo-backfill = "sam_audio_pipeline.stereo:main"
 sam-pipeline-reconstruction-backfill = "sam_audio_pipeline.reconstruction:main"
+sam-pipeline-audio-profile-backfill = "sam_audio_pipeline.audio_profile:main"
 sam-audio-flamingo-api = "sam_audio_pipeline.flamingo_api:main"
 
 [dependency-groups]

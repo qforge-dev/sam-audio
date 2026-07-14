@@ -109,6 +109,25 @@ def test_ingest_persists_source_size_before_temp_directory_cleanup(
     assert record["duration_seconds"] == 1.0
     assert record["status"] == "analyzing"
     assert record["input_channels"] == 2
+    assert record["audio_profile"] == {
+        "schema_version": 1,
+        "channels": 2,
+        "channel_layout": "unknown",
+        "channel_label": "Stereo",
+        "is_stereo": True,
+        "sample_rate_hz": 8000,
+        "bit_depth": 16,
+        "sample_format": "s16",
+        "bitrate_bps": 256000,
+        "codec": "pcm_s16le",
+        "codec_name": "PCM signed 16-bit little-endian",
+        "container": "wav",
+        "container_name": "WAV / WAVE (Waveform Audio)",
+        "lossless": True,
+        "quality_tier": "lossless",
+        "duration_seconds": 1.0,
+        "bytes": source.stat().st_size,
+    }
     assert aws.items["CHUNK#source-1#000000"]["status"] == "waiting_scene"
     assert aws.events == ["describe_scene"]
 
@@ -146,6 +165,8 @@ def test_ingest_skips_non_stereo_input_before_chunking(tmp_path: Path) -> None:
     assert record["status"] == "complete"
     assert record["skip_reason"] == "non_stereo_input"
     assert record["input_channels"] == 1
+    assert record["audio_profile"]["channel_label"] == "Mono"
+    assert record["audio_profile"]["quality_tier"] == "lossless"
     assert record["chunk_count"] == 0
     assert not any(key.startswith("CHUNK#") for key in aws.items)
     assert aws.events == []

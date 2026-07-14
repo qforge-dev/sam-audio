@@ -10,6 +10,7 @@ import wave
 from array import array
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .schema import GateMetrics
 
@@ -84,6 +85,119 @@ def probe_channels(path: Path) -> int:
     if channels <= 0:
         raise ValueError(f"Audio channel count is unavailable for {path}")
     return channels
+
+
+LOSSLESS_CODECS = {
+    "alac",
+    "ape",
+    "flac",
+    "mlp",
+    "truehd",
+    "tta",
+    "wavpack",
+}
+
+
+def _integer(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _floating(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _sample_format_bits(sample_format: str) -> int | None:
+    digits = "".join(character for character in sample_format if character.isdigit())
+    return _integer(digits)
+
+
+def probe_audio_profile(path: Path) -> dict[str, Any]:
+    """Return original-file channel and encoding facts from its first audio stream."""
+    result = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            (
+                "stream=codec_name,codec_long_name,sample_fmt,sample_rate,channels,"
+                "channel_layout,bits_per_sample,bits_per_raw_sample,bit_rate:"
+                "format=format_name,format_long_name,bit_rate,duration,size"
+            ),
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    payload = json.loads(result.stdout)
+    streams = payload.get("streams") or []
+    if not streams:
+        raise ValueError(f"No audio stream is available for {path}")
+    stream = streams[0]
+    container = payload.get("format") or {}
+    channels = _integer(stream.get("channels"))
+    sample_rate = _integer(stream.get("sample_rate"))
+    if channels is None or sample_rate is None:
+        raise ValueError(
+            f"Audio channel/sample-rate metadata is unavailable for {path}"
+        )
+    codec = str(stream.get("codec_name") or "unknown")
+    sample_format = str(stream.get("sample_fmt") or "")
+    bit_depth = (
+        _integer(stream.get("bits_per_raw_sample"))
+        or _integer(stream.get("bits_per_sample"))
+        or (_sample_format_bits(sample_format) if codec.startswith("pcm_") else None)
+    )
+    bitrate = _integer(stream.get("bit_rate")) or _integer(container.get("bit_rate"))
+    lossless = codec.startswith("pcm_") or codec in LOSSLESS_CODECS
+    if lossless and bit_depth and bit_depth >= 24 and sample_rate >= 88_200:
+        quality_tier = "hi_res_lossless"
+    elif lossless:
+        quality_tier = "lossless"
+    elif bitrate and bitrate >= 256_000:
+        quality_tier = "high_bitrate_lossy"
+    elif bitrate and bitrate >= 128_000:
+        quality_tier = "standard_bitrate_lossy"
+    elif bitrate:
+        quality_tier = "low_bitrate_lossy"
+    else:
+        quality_tier = "compressed_unknown_bitrate"
+    channel_label = (
+        "Mono"
+        if channels == 1
+        else "Stereo"
+        if channels == 2
+        else f"{channels} channels"
+    )
+    return {
+        "schema_version": 1,
+        "channels": channels,
+        "channel_layout": str(stream.get("channel_layout") or "unknown"),
+        "channel_label": channel_label,
+        "is_stereo": channels == 2,
+        "sample_rate_hz": sample_rate,
+        "bit_depth": bit_depth,
+        "sample_format": sample_format or None,
+        "bitrate_bps": bitrate,
+        "codec": codec,
+        "codec_name": str(stream.get("codec_long_name") or codec),
+        "container": str(container.get("format_name") or "unknown"),
+        "container_name": str(container.get("format_long_name") or "unknown"),
+        "lossless": lossless,
+        "quality_tier": quality_tier,
+        "duration_seconds": _floating(container.get("duration")),
+        "bytes": _integer(container.get("size")) or path.stat().st_size,
+    }
 
 
 def gate_wav(

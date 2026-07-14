@@ -75,8 +75,10 @@ rule are persisted under `adaptive_routing`.
    output sound gate, grouped by chunk, followed by its processing route and
    model annotations. Stereo-mapped playback is the default; a `Raw` toggle
    swaps only the stem players and leaves the original recording untouched.
-   Each stem also shows its smoothed left/right trajectory. The explorer plays
-   the full joined result beside its original, retains each chunk join and its
+   Each stem also shows its smoothed left/right trajectory. Every original
+   displays its channel layout, codec/container, sample rate, bit depth when
+   available, bitrate, and lossless/lossy quality tier. The explorer plays the
+   full joined result beside its original, retains each chunk join and its
    diagnostics, and graphs the dataset-wide source-score distribution.
 
 ## AWS resources

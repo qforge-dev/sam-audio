@@ -130,6 +130,26 @@ ssh ubuntu@ec2-44-211-31-38.compute-1.amazonaws.com \
 The command is idempotent; use `--force` to regenerate an existing joined
 artifact or `--max-chunks N` for a canary.
 
+## Original audio profiles
+
+Ingestion probes the first audio stream before the stereo-only gate and stores
+the original channel count/layout, codec and container, sample rate, bit depth
+when the codec exposes it, bitrate, and lossless/lossy quality tier. **Split
+data** shows these facts in both the source list and source header, including for
+mono inputs that were skipped before model work.
+
+Backfill existing sources directly from their durable originals:
+
+```bash
+ssh ubuntu@ec2-44-211-31-38.compute-1.amazonaws.com \
+  "sudo bash -c 'set -a; source /etc/sam-audio-pipeline.env; set +a; \
+   cd /home/ubuntu/sam-audio-deploy/pipeline; \
+   .venv/bin/sam-pipeline-audio-profile-backfill --all'"
+```
+
+The command is idempotent; pass one or more `--job-id JOB_ID` arguments instead
+of `--all`, or use `--force` to refresh already-profiled sources.
+
 ## AudioSet validation batches
 
 Acquire a reproducible random sample from the official AudioSet segment CSVs.

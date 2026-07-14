@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from sam_audio_pipeline.audio import chunk_audio, gate_wav
+from sam_audio_pipeline.audio import chunk_audio, gate_wav, probe_audio_profile
 
 
 def write_tone(
@@ -34,6 +34,24 @@ def test_gate_rejects_silence_and_keeps_audible_tone(tmp_path: Path) -> None:
     audible = gate_wav(tone)
     assert audible.audible is True
     assert audible.peak_dbfs == pytest.approx(-12.04, abs=0.1)
+
+
+def test_probe_audio_profile_reports_channel_layout_and_quality(tmp_path: Path) -> None:
+    tone = tmp_path / "tone.wav"
+    write_tone(tone, 1.0, 0.25)
+
+    profile = probe_audio_profile(tone)
+
+    assert profile["channel_label"] == "Mono"
+    assert profile["is_stereo"] is False
+    assert profile["channels"] == 1
+    assert profile["sample_rate_hz"] == 8_000
+    assert profile["bit_depth"] == 16
+    assert profile["bitrate_bps"] == 128_000
+    assert profile["codec"] == "pcm_s16le"
+    assert profile["container"] == "wav"
+    assert profile["lossless"] is True
+    assert profile["quality_tier"] == "lossless"
 
 
 def test_chunking_uses_30_seconds_with_5_second_overlap(tmp_path: Path) -> None:

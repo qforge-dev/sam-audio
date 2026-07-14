@@ -203,6 +203,18 @@ def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
                 "status": "complete",
                 "bytes": 1000,
                 "duration_seconds": 10.0,
+                "audio_profile": {
+                    "channels": 2,
+                    "channel_label": "Stereo",
+                    "is_stereo": True,
+                    "sample_rate_hz": 48000,
+                    "bit_depth": 24,
+                    "bitrate_bps": 2304000,
+                    "codec": "pcm_s24le",
+                    "container": "wav",
+                    "lossless": True,
+                    "quality_tier": "lossless",
+                },
                 "reconstruction": {
                     "s3_key": "source.joined.stereo.wav",
                     "bytes": 100,
@@ -317,6 +329,8 @@ def test_dataset_overview_and_source_explorer_report_real_artifacts() -> None:
         "review_remaining": 0,
     }
     assert detail["source"]["source_metadata"]["video_id"] == "abc123"
+    assert detail["source"]["audio_profile"]["channel_label"] == "Stereo"
+    assert overview["sources"][0]["audio_profile"]["bit_depth"] == 24
     assert [stem["stem_type"] for stem in detail["chunks"][0]["stems"]] == [
         "music",
         "sfx",
