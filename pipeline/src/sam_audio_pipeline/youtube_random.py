@@ -339,7 +339,7 @@ def _query_for_source(query: str, source: str) -> str:
 
 
 def _candidate_allowed(item: dict[str, Any], *, profile: str = "general") -> bool:
-    duration = float(item.get("duration") or 0.0)
+    duration = float(item.get("duration") or item.get("duration_seconds") or 0.0)
     title = f" {str(item.get('title') or '').lower()} "
     uploader = f" {str(item.get('uploader') or item.get('channel') or '').lower()} "
     description = f" {str(item.get('description') or '').lower()} "
@@ -350,7 +350,7 @@ def _candidate_allowed(item: dict[str, Any], *, profile: str = "general") -> boo
         CINEMATIC_EXCLUDED_TERMS if profile == "cinematic" else EXCLUDED_TITLE_TERMS
     )
     return (
-        bool(item.get("id"))
+        bool(item.get("id") or item.get("video_id"))
         and 30.0 <= duration <= 3600.0
         and item.get("live_status") not in {"is_live", "is_upcoming"}
         and not any(

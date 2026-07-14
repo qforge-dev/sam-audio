@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import wave
 from argparse import Namespace
@@ -11,6 +12,7 @@ from sam_audio_pipeline.m2d_validator import (
     evaluate_probabilities,
     load_label_families,
     materialize_accepted,
+    merge_materialized,
 )
 
 
@@ -328,3 +330,84 @@ def test_materialize_intersects_m2d_and_asr_acceptance(tmp_path: Path) -> None:
     assert manifest["foreground_voice_rejection_reason_counts"] == {
         "low_transcription_confidence": 1
     }
+
+
+def _validated_batch(
+    root: Path, records: list[tuple[str, str, float]]
+) -> Path:
+    audio = root / "audio"
+    audio.mkdir(parents=True)
+    manifest_records = []
+    m2d_records = []
+    asr_records = []
+    for filename, video_id, start in records:
+        path = audio / filename
+        _wav(path)
+        with path.open("ab") as destination:
+            destination.write(filename.encode())
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest_records.append(
+            {
+                "candidate_id": f"{video_id}:{round(start * 1000)}",
+                "video_id": video_id,
+                "source_platform": "dailymotion",
+                "source_url": f"https://www.dailymotion.com/video/{video_id}",
+                "title": "English Movie Scene HD",
+                "duration_seconds": 120,
+                "uploader": "Movie Scenes",
+                "clip_start_seconds": start,
+                "local_path": f"audio/{filename}",
+                "sha256": digest,
+            }
+        )
+        m2d_records.append(
+            {
+                "filename": filename,
+                "accepted": True,
+                "background_bucket": "mixed_music_and_effects",
+                "rejection_reasons": [],
+                "windows": _strong_voice_windows(),
+            }
+        )
+        asr_records.append(
+            {"filename": filename, "accepted": True, "rejection_reasons": []}
+        )
+    (root / "manifest.json").write_text(json.dumps({"records": manifest_records}))
+    (root / "m2d-validation.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in m2d_records)
+    )
+    (root / "asr-validation.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in asr_records)
+    )
+    return root
+
+
+def test_merge_materialized_is_exact_diverse_and_deduplicated(tmp_path: Path) -> None:
+    first = _validated_batch(
+        tmp_path / "first",
+        [("one.wav", "video-a", 10.0), ("two.wav", "video-b", 20.0)],
+    )
+    second = _validated_batch(
+        tmp_path / "second",
+        [("overlap.wav", "video-a", 15.0), ("three.wav", "video-c", 30.0)],
+    )
+    output = tmp_path / "final"
+
+    merge_materialized(
+        Namespace(
+            batch=[first, second],
+            output_dir=output,
+            accepted_limit=3,
+            max_clips_per_video=1,
+            seed=7,
+            require_cinematic_mix=False,
+        )
+    )
+
+    manifest = json.loads((output / "manifest.json").read_text())
+    audit = json.loads((output / "audit.json").read_text())
+    assert manifest["accepted_record_count"] == 3
+    assert len({record["video_id"] for record in manifest["records"]}) == 3
+    assert audit["record_count"] == 3
+    assert audit["unique_sha256_count"] == 3
+    assert audit["all_requirements_pass"] is True

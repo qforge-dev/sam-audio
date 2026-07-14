@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sys
@@ -834,6 +835,192 @@ def materialize_accepted(args: argparse.Namespace) -> None:
     (args.output_dir / "m2d-validation.jsonl").write_text(normalized_results)
 
 
+def merge_materialized(args: argparse.Namespace) -> None:
+    """Build one exact, deduplicated final set from validated acquisition batches."""
+    from .youtube_random import _candidate_allowed
+
+    candidates: list[dict[str, Any]] = []
+    batch_summaries: list[dict[str, Any]] = []
+    for batch_index, batch_dir in enumerate(args.batch):
+        manifest = json.loads((batch_dir / "manifest.json").read_text())
+        m2d_lines = (batch_dir / "m2d-validation.jsonl").read_text().splitlines()
+        m2d_by_name = {
+            item["filename"]: _enforce_current_voice_gate(
+                item,
+                require_cinematic_mix=args.require_cinematic_mix,
+            )
+            for item in (
+                json.loads(line)
+                for line in m2d_lines
+                if line.strip()
+            )
+        }
+        asr_lines = (batch_dir / "asr-validation.jsonl").read_text().splitlines()
+        asr_by_name = {
+            item["filename"]: item
+            for item in (
+                json.loads(line)
+                for line in asr_lines
+                if line.strip()
+            )
+        }
+        combined_count = 0
+        for source_record in manifest.get("records", []):
+            filename = Path(source_record["local_path"]).name
+            m2d = m2d_by_name.get(filename)
+            asr = asr_by_name.get(filename)
+            if not m2d or not asr or not m2d.get("accepted") or not asr.get("accepted"):
+                continue
+            if not _candidate_allowed(source_record, profile="cinematic"):
+                continue
+            source_path = batch_dir / str(source_record["local_path"])
+            if not source_path.exists():
+                continue
+            combined_count += 1
+            candidates.append(
+                {
+                    "batch_index": batch_index,
+                    "batch_dir": batch_dir,
+                    "source_path": source_path,
+                    "filename": filename,
+                    "source_record": source_record,
+                    "m2d_validation": m2d,
+                    "asr_validation": asr,
+                }
+            )
+        batch_summaries.append(
+            {
+                "batch_index": batch_index,
+                "path": str(batch_dir),
+                "source_record_count": len(manifest.get("records", [])),
+                "combined_pass_count": combined_count,
+            }
+        )
+
+    random.Random(args.seed).shuffle(candidates)
+    selected: list[dict[str, Any]] = []
+    hashes: set[str] = set()
+    candidate_ids: set[str] = set()
+    starts_by_video: dict[tuple[str, str], list[float]] = {}
+    video_counts: Counter[tuple[str, str]] = Counter()
+    skip_counts: Counter[str] = Counter()
+    for item in candidates:
+        source_record = item["source_record"]
+        platform = str(source_record.get("source_platform") or "unknown")
+        video_id = str(source_record.get("video_id") or "unknown")
+        video_key = (platform, video_id)
+        candidate_id = str(
+            source_record.get("candidate_id")
+            or f"{video_id}:{round(float(source_record['clip_start_seconds']) * 1000)}"
+        )
+        digest = str(source_record.get("sha256") or _sha256(item["source_path"]))
+        start = float(source_record["clip_start_seconds"])
+        if digest in hashes:
+            skip_counts["duplicate_sha256"] += 1
+            continue
+        if candidate_id in candidate_ids:
+            skip_counts["duplicate_candidate"] += 1
+            continue
+        if any(
+            abs(start - existing) < 10.0
+            for existing in starts_by_video.get(video_key, [])
+        ):
+            skip_counts["overlapping_source_interval"] += 1
+            continue
+        if video_counts[video_key] >= args.max_clips_per_video:
+            skip_counts["source_video_cap"] += 1
+            continue
+        item["sha256"] = digest
+        selected.append(item)
+        hashes.add(digest)
+        candidate_ids.add(candidate_id)
+        starts_by_video.setdefault(video_key, []).append(start)
+        video_counts[video_key] += 1
+        if len(selected) >= args.accepted_limit:
+            break
+
+    if len(selected) < args.accepted_limit:
+        raise RuntimeError(
+            f"Only {len(selected)}/{args.accepted_limit} clips survive combined "
+            "validation and final deduplication"
+        )
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir = args.output_dir / "audio"
+    audio_dir.mkdir(exist_ok=True)
+    records: list[dict[str, Any]] = []
+    selected_names: set[str] = set()
+    for index, item in enumerate(selected):
+        filename = item["filename"]
+        if filename in selected_names:
+            filename = f"batch{item['batch_index']:02d}-{filename}"
+        selected_names.add(filename)
+        destination = audio_dir / filename
+        if not destination.exists():
+            try:
+                os.link(item["source_path"], destination)
+            except OSError:
+                shutil.copy2(item["source_path"], destination)
+        if _sha256(destination) != item["sha256"]:
+            raise RuntimeError(f"SHA-256 mismatch after materializing {filename}")
+        record = dict(item["source_record"])
+        record.update(
+            {
+                "record_index": index,
+                "local_path": f"audio/{filename}",
+                "source_batch_index": item["batch_index"],
+                "m2d_validation": item["m2d_validation"],
+                "asr_validation": item["asr_validation"],
+            }
+        )
+        records.append(record)
+    for stale in audio_dir.glob("*.wav"):
+        if stale.name not in selected_names:
+            stale.unlink()
+
+    final_manifest = {
+        "schema_version": 1,
+        "name": f"Cinematic dialogue + music + SFX final {args.accepted_limit}",
+        "created_at": _now(),
+        "selection_seed": args.seed,
+        "target_records": args.accepted_limit,
+        "accepted_record_count": len(records),
+        "maximum_clips_per_source_video": args.max_clips_per_video,
+        "source_batches": batch_summaries,
+        "source_candidate_count": len(candidates),
+        "deduplication_skip_counts": dict(sorted(skip_counts.items())),
+        "m2d_policy": CINEMATIC_POLICY_VERSION,
+        "foreground_voice_policy": ASR_POLICY_VERSION,
+        "explicit_metadata_policy": "cinematic_source_exclusions_v1",
+        "records": records,
+    }
+    temporary_manifest = args.output_dir / "manifest.json.tmp"
+    temporary_manifest.write_text(json.dumps(final_manifest, indent=2) + "\n")
+    os.replace(temporary_manifest, args.output_dir / "manifest.json")
+    audit = {
+        "verified_at": _now(),
+        "target_records": args.accepted_limit,
+        "record_count": len(records),
+        "audio_file_count": len(list(audio_dir.glob("*.wav"))),
+        "unique_sha256_count": len(hashes),
+        "unique_source_video_count": len(video_counts),
+        "maximum_observed_clips_per_source_video": max(video_counts.values()),
+        "all_requirements_pass": (
+            len(records) == args.accepted_limit
+            and len(list(audio_dir.glob("*.wav"))) == args.accepted_limit
+            and len(hashes) == args.accepted_limit
+            and max(video_counts.values()) <= args.max_clips_per_video
+            and all(record["m2d_validation"]["accepted"] for record in records)
+            and all(record["asr_validation"]["accepted"] for record in records)
+        ),
+        "source_batches": batch_summaries,
+        "deduplication_skip_counts": dict(sorted(skip_counts.items())),
+    }
+    (args.output_dir / "audit.json").write_text(json.dumps(audit, indent=2) + "\n")
+    if not audit["all_requirements_pass"]:
+        raise RuntimeError("Final merged dataset audit failed")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -878,6 +1065,18 @@ def _parser() -> argparse.ArgumentParser:
     materialize.add_argument("--require-cinematic-mix", action="store_true")
     materialize.add_argument("--accepted-limit", type=int)
     materialize.set_defaults(handler=materialize_accepted)
+
+    merge = subparsers.add_parser(
+        "merge-materialize",
+        help="Merge validated batches into one exact, deduplicated final set",
+    )
+    merge.add_argument("--batch", type=Path, action="append", required=True)
+    merge.add_argument("--output-dir", type=Path, required=True)
+    merge.add_argument("--accepted-limit", type=int, default=1000)
+    merge.add_argument("--max-clips-per-video", type=int, default=3)
+    merge.add_argument("--seed", type=int, default=20260715)
+    merge.add_argument("--require-cinematic-mix", action="store_true")
+    merge.set_defaults(handler=merge_materialized)
     return parser
 
 
