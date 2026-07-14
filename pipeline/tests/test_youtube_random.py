@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from sam_audio_pipeline.youtube_random import (
+    _accepted,
     _candidate_allowed,
     _cinematic_candidate_priority,
     _group_candidates_by_video,
@@ -241,6 +242,23 @@ def test_cached_candidates_are_refiltered_under_current_metadata_policy(
     assert json.loads((metadata / "search.json").read_text())[
         "unique_candidates"
     ] == 1
+
+
+def test_accepted_records_follow_current_metadata_policy() -> None:
+    allowed = {
+        "video_id": "allowed",
+        "title": "English Movie Scene HD",
+        "duration_seconds": 180,
+        "retrieval_status": "success",
+    }
+    excluded = {
+        "video_id": "excluded",
+        "title": "Prabhas Mass Entry Scene",
+        "duration_seconds": 180,
+        "retrieval_status": "success",
+    }
+
+    assert _accepted([allowed, excluded], profile="cinematic") == [allowed]
 
 
 def test_candidate_filter_rejects_short_live_and_pure_audio_results() -> None:

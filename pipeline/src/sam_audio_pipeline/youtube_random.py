@@ -1183,8 +1183,15 @@ def _load_attempts(
     return attempts, attempted
 
 
-def _accepted(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [item for item in attempts if item.get("retrieval_status") == "success"]
+def _accepted(
+    attempts: list[dict[str, Any]], *, profile: str = "general"
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in attempts
+        if item.get("retrieval_status") == "success"
+        and _candidate_allowed(item, profile=profile)
+    ]
 
 
 def _criteria(
@@ -1222,7 +1229,7 @@ def write_manifest(
     clips_per_video: int = 1,
     source: str = "youtube",
 ) -> Path:
-    records = _accepted(attempts)[:target]
+    records = _accepted(attempts, profile=profile)[:target]
     for index, record in enumerate(records):
         record["record_index"] = index
     status_counts: dict[str, int] = {}
@@ -1242,6 +1249,11 @@ def write_manifest(
             profile=profile, clips_per_video=clips_per_video, source=source
         ),
         "attempt_statuses": status_counts,
+        "metadata_excluded_success_count": sum(
+            item.get("retrieval_status") == "success"
+            and not _candidate_allowed(item, profile=profile)
+            for item in attempts
+        ),
         "records": records,
     }
     path = output_dir / "manifest.json"
@@ -1331,7 +1343,7 @@ def acquire_dataset(
     )
     attempts_path = output_dir / "attempts.jsonl"
     attempts, attempted = _load_attempts(attempts_path, output_dir)
-    accepted_count = len(_accepted(attempts))
+    accepted_count = len(_accepted(attempts, profile=profile))
     pending = [
         item
         for item in candidates
