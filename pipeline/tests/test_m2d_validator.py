@@ -7,10 +7,30 @@ from pathlib import Path
 import numpy as np
 
 from sam_audio_pipeline.m2d_validator import (
+    evaluate_asr,
     evaluate_probabilities,
     load_label_families,
     materialize_accepted,
 )
+
+
+def test_asr_gate_requires_decodable_foreground_voice() -> None:
+    accepted = evaluate_asr(
+        transcript="They have a magnet plane",
+        duration_after_vad=3.9,
+        average_log_probability=-0.49,
+        no_speech_probability=0.15,
+    )
+    assert accepted["accepted"] is True
+
+    chatter_hallucination = evaluate_asr(
+        transcript="Okay see you there",
+        duration_after_vad=9.4,
+        average_log_probability=-0.89,
+        no_speech_probability=0.23,
+    )
+    assert chatter_hallucination["accepted"] is False
+    assert "low_transcription_confidence" in chatter_hallucination["rejection_reasons"]
 
 
 def test_evaluate_probabilities_requires_temporal_overlap():
@@ -134,7 +154,15 @@ def _wav(path: Path) -> None:
 
 
 def _strong_voice_windows() -> list[dict[str, float | int]]:
-    return [{"speech_score": 0.5, "speech_rank": 1} for _ in range(9)]
+    return [
+        {
+            "speech_score": 0.5,
+            "speech_rank": 1,
+            "foreground_speech_score": 0.05,
+            "foreground_speech_rank": 2,
+        }
+        for _ in range(9)
+    ]
 
 
 def test_materialize_preserves_source_and_links_only_accepted(tmp_path: Path):
@@ -225,3 +253,78 @@ def test_materialize_preserves_source_and_links_only_accepted(tmp_path: Path):
     assert audit["accepted_record_count"] == 2
     assert audit["balanced_audio_files"] == 2
     assert audit["original_dataset_preserved"] is True
+
+
+def test_materialize_intersects_m2d_and_asr_acceptance(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    _wav(source / "voice.wav")
+    _wav(source / "chatter.wav")
+    results = tmp_path / "m2d.jsonl"
+    results.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "filename": filename,
+                    "accepted": True,
+                    "background_bucket": "music_led",
+                    "rejection_reasons": [],
+                    "windows": _strong_voice_windows(),
+                }
+            )
+            for filename in ("voice.wav", "chatter.wav")
+        )
+        + "\n"
+    )
+    asr_results = tmp_path / "asr.jsonl"
+    asr_results.write_text(
+        "\n".join(
+            (
+                json.dumps(
+                    {
+                        "filename": "voice.wav",
+                        "accepted": True,
+                        "rejection_reasons": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "filename": "chatter.wav",
+                        "accepted": False,
+                        "rejection_reasons": ["low_transcription_confidence"],
+                    }
+                ),
+            )
+        )
+        + "\n"
+    )
+    source_manifest = tmp_path / "manifest.json"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "records": [
+                    {"local_path": "audio/voice.wav"},
+                    {"local_path": "audio/chatter.wav"},
+                ]
+            }
+        )
+    )
+    output = tmp_path / "accepted"
+    materialize_accepted(
+        Namespace(
+            input_dir=source,
+            results=results,
+            asr_results=asr_results,
+            source_manifest=source_manifest,
+            output_dir=output,
+        )
+    )
+
+    assert (output / "audio" / "voice.wav").exists()
+    assert not (output / "audio" / "chatter.wav").exists()
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["accepted_record_count"] == 1
+    assert manifest["records"][0]["asr_validation"]["accepted"] is True
+    assert manifest["foreground_voice_rejection_reason_counts"] == {
+        "low_transcription_confidence": 1
+    }

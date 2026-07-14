@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from collections import Counter
@@ -20,6 +21,13 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 SPEECH_ROOT = "/m/09x0r"
+FOREGROUND_SPEECH_MIDS = {
+    "/m/05zppz",  # Male speech
+    "/m/02zsn",  # Female speech
+    "/m/0ytgt",  # Child speech
+    "/m/01h8n0",  # Conversation
+    "/m/02qldy",  # Narration / monologue
+}
 MUSIC_ROOT = "/m/04rlf"
 HUMAN_ROOT = "/m/0dgw9r"
 BACKGROUND_ROOTS = (
@@ -45,6 +53,13 @@ MIN_SPEECH_WINDOWS = 3
 MIN_STRONG_SPEECH_PROBABILITY = 0.10
 MAX_STRONG_SPEECH_RANK = 5
 MIN_STRONG_SPEECH_WINDOWS = 5
+MIN_FOREGROUND_SPEECH_PROBABILITY = 0.005
+MAX_FOREGROUND_SPEECH_RANK = 15
+MIN_FOREGROUND_SPEECH_WINDOWS = 4
+MIN_ASR_VAD_SECONDS = 1.5
+MIN_ASR_WORDS = 2
+MIN_ASR_AVG_LOGPROB = -0.75
+MAX_ASR_NO_SPEECH_PROBABILITY = 0.40
 MIN_CINEMATIC_MUSIC_PROBABILITY = 0.01
 MAX_CINEMATIC_MUSIC_RANK = 15
 MIN_CINEMATIC_MUSIC_WINDOWS = 4
@@ -55,8 +70,9 @@ MIN_BACKGROUND_WINDOWS = 4
 MIN_OVERLAP_WINDOWS = 3
 MAX_VOCAL_MUSIC_WINDOWS = 1
 TOP_LABELS = 8
-POLICY_VERSION = "spoken_dialogue_instrumental_background_m2d_v3"
-CINEMATIC_POLICY_VERSION = "cinematic_dialogue_music_sfx_m2d_v1"
+POLICY_VERSION = "spoken_dialogue_instrumental_background_m2d_v4"
+CINEMATIC_POLICY_VERSION = "cinematic_dialogue_music_sfx_m2d_v2"
+ASR_POLICY_VERSION = "foreground_voice_faster_whisper_v1"
 
 
 def _now() -> str:
@@ -99,12 +115,16 @@ def load_label_families(
         return {index for index, mid in enumerate(mids) if mid in family}
 
     speech = indices((SPEECH_ROOT,))
+    foreground_speech = {
+        index for index, mid in enumerate(mids) if mid in FOREGROUND_SPEECH_MIDS
+    }
     music = indices((MUSIC_ROOT,))
     human = indices((HUMAN_ROOT,))
     nonmusic_background = indices(BACKGROUND_ROOTS)
     vocal_music = indices(VOCAL_MUSIC_ROOTS)
     return labels, {
         "speech": speech,
+        "foreground_speech": foreground_speech,
         "music": music,
         "nonmusic_background": nonmusic_background,
         "background": music | nonmusic_background,
@@ -144,9 +164,13 @@ def evaluate_probabilities(
     windows: list[dict[str, Any]] = []
     for start, row in zip(starts, probabilities, strict=True):
         evidence = {
-            name: _family_evidence(row, families[name])
+            name: _family_evidence(
+                row,
+                families.get(name, families["speech"]),
+            )
             for name in (
                 "speech",
+                "foreground_speech",
                 "music",
                 "nonmusic_background",
                 "background",
@@ -160,6 +184,11 @@ def evaluate_probabilities(
         strong_speech_active = (
             evidence["speech"][0] >= MIN_STRONG_SPEECH_PROBABILITY
             and evidence["speech"][1] <= MAX_STRONG_SPEECH_RANK
+        )
+        foreground_speech_active = (
+            evidence["foreground_speech"][0]
+            >= MIN_FOREGROUND_SPEECH_PROBABILITY
+            and evidence["foreground_speech"][1] <= MAX_FOREGROUND_SPEECH_RANK
         )
         cinematic_music_active = (
             evidence["music"][0] >= MIN_CINEMATIC_MUSIC_PROBABILITY
@@ -196,6 +225,11 @@ def evaluate_probabilities(
                 "vocal_music_rank": evidence["vocal_music"][1],
                 "speech_active": speech_active,
                 "strong_speech_active": strong_speech_active,
+                "foreground_speech_score": round(
+                    evidence["foreground_speech"][0], 8
+                ),
+                "foreground_speech_rank": evidence["foreground_speech"][1],
+                "foreground_speech_active": foreground_speech_active,
                 "cinematic_music_active": cinematic_music_active,
                 "cinematic_sfx_active": cinematic_sfx_active,
                 "background_active": background_active,
@@ -214,6 +248,9 @@ def evaluate_probabilities(
 
     speech_windows = sum(item["speech_active"] for item in windows)
     strong_speech_windows = sum(item["strong_speech_active"] for item in windows)
+    foreground_speech_windows = sum(
+        item["foreground_speech_active"] for item in windows
+    )
     cinematic_music_windows = sum(
         item["cinematic_music_active"] for item in windows
     )
@@ -263,6 +300,7 @@ def evaluate_probabilities(
         "window_count": window_count,
         "speech_active_windows": speech_windows,
         "strong_speech_active_windows": strong_speech_windows,
+        "foreground_speech_active_windows": foreground_speech_windows,
         "cinematic_music_active_windows": cinematic_music_windows,
         "cinematic_sfx_active_windows": cinematic_sfx_windows,
         "background_active_windows": background_windows,
@@ -270,6 +308,9 @@ def evaluate_probabilities(
         "vocal_music_active_windows": vocal_music_windows,
         "speech_coverage": round(speech_windows / window_count, 6),
         "strong_speech_coverage": round(strong_speech_windows / window_count, 6),
+        "foreground_speech_coverage": round(
+            foreground_speech_windows / window_count, 6
+        ),
         "cinematic_music_coverage": round(
             cinematic_music_windows / window_count, 6
         ),
@@ -352,6 +393,11 @@ def score_directory(args: argparse.Namespace) -> None:
         "minimum_strong_speech_probability": MIN_STRONG_SPEECH_PROBABILITY,
         "maximum_strong_speech_rank": MAX_STRONG_SPEECH_RANK,
         "minimum_strong_speech_windows": MIN_STRONG_SPEECH_WINDOWS,
+        "minimum_foreground_speech_probability": (
+            MIN_FOREGROUND_SPEECH_PROBABILITY
+        ),
+        "maximum_foreground_speech_rank": MAX_FOREGROUND_SPEECH_RANK,
+        "minimum_foreground_speech_windows": MIN_FOREGROUND_SPEECH_WINDOWS,
         "minimum_cinematic_music_probability": MIN_CINEMATIC_MUSIC_PROBABILITY,
         "maximum_cinematic_music_rank": MAX_CINEMATIC_MUSIC_RANK,
         "minimum_cinematic_music_windows": MIN_CINEMATIC_MUSIC_WINDOWS,
@@ -392,6 +438,122 @@ def score_directory(args: argparse.Namespace) -> None:
     logger.info("Wrote %d new validation records to %s", processed, args.output)
 
 
+def evaluate_asr(
+    *,
+    transcript: str,
+    duration_after_vad: float,
+    average_log_probability: float,
+    no_speech_probability: float,
+) -> dict[str, Any]:
+    """Require decodable foreground speech rather than generic chatter labels."""
+    word_count = len(re.findall(r"[A-Za-z]+", transcript))
+    reasons: list[str] = []
+    if duration_after_vad < MIN_ASR_VAD_SECONDS:
+        reasons.append("insufficient_voice_activity")
+    if word_count < MIN_ASR_WORDS:
+        reasons.append("insufficient_decoded_words")
+    if average_log_probability < MIN_ASR_AVG_LOGPROB:
+        reasons.append("low_transcription_confidence")
+    if no_speech_probability > MAX_ASR_NO_SPEECH_PROBABILITY:
+        reasons.append("high_no_speech_probability")
+    return {
+        "accepted": not reasons,
+        "policy": ASR_POLICY_VERSION,
+        "rejection_reasons": reasons,
+        "transcript": transcript.strip(),
+        "word_count": word_count,
+        "duration_after_vad_seconds": round(duration_after_vad, 6),
+        "best_average_log_probability": round(average_log_probability, 8),
+        "lowest_no_speech_probability": round(no_speech_probability, 8),
+    }
+
+
+def score_asr_directory(args: argparse.Namespace) -> None:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as error:
+        raise RuntimeError(
+            "ASR scoring requires faster-whisper in the runtime environment"
+        ) from error
+
+    model = WhisperModel(
+        args.model,
+        device=args.device,
+        compute_type=args.compute_type,
+        download_root=(str(args.download_root) if args.download_root else None),
+    )
+    files = sorted(args.input_dir.glob(args.glob))
+    if args.limit:
+        files = files[: args.limit]
+    existing: set[str] = set()
+    if args.output.exists() and not args.overwrite:
+        existing = {
+            str(json.loads(line)["filename"])
+            for line in args.output.read_text().splitlines()
+            if line.strip()
+        }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    mode = "w" if args.overwrite else "a"
+    processed = 0
+    with args.output.open(mode, encoding="utf-8") as destination:
+        for index, path in enumerate(files, start=1):
+            if path.name in existing:
+                continue
+            segments_source, info = model.transcribe(
+                str(path),
+                language="en",
+                beam_size=args.beam_size,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
+            segments = list(segments_source)
+            transcript = " ".join(segment.text for segment in segments).strip()
+            best_log_probability = max(
+                (float(segment.avg_logprob) for segment in segments),
+                default=-99.0,
+            )
+            lowest_no_speech = min(
+                (float(segment.no_speech_prob) for segment in segments),
+                default=1.0,
+            )
+            result = {
+                "filename": path.name,
+                "scored_at": _now(),
+                "asr": {
+                    "model": args.model,
+                    "device": args.device,
+                    "compute_type": args.compute_type,
+                    "beam_size": args.beam_size,
+                },
+                **evaluate_asr(
+                    transcript=transcript,
+                    duration_after_vad=float(info.duration_after_vad),
+                    average_log_probability=best_log_probability,
+                    no_speech_probability=lowest_no_speech,
+                ),
+                "segments": [
+                    {
+                        "start_seconds": round(float(segment.start), 3),
+                        "end_seconds": round(float(segment.end), 3),
+                        "text": segment.text.strip(),
+                        "average_log_probability": round(
+                            float(segment.avg_logprob), 8
+                        ),
+                        "no_speech_probability": round(
+                            float(segment.no_speech_prob), 8
+                        ),
+                    }
+                    for segment in segments
+                ],
+            }
+            destination.write(json.dumps(result, separators=(",", ":")) + "\n")
+            destination.flush()
+            processed += 1
+            if index % 25 == 0 or index == len(files):
+                logger.info("ASR scored %d/%d clips", index, len(files))
+    logger.info("Wrote %d new ASR records to %s", processed, args.output)
+
+
 def _enforce_current_voice_gate(
     result: dict[str, Any], *, require_cinematic_mix: bool = False
 ) -> dict[str, Any]:
@@ -407,6 +569,31 @@ def _enforce_current_voice_gate(
             float(window.get("speech_score", 0.0))
             >= MIN_STRONG_SPEECH_PROBABILITY
             and int(window.get("speech_rank", 10_000)) <= MAX_STRONG_SPEECH_RANK
+        )
+        foreground_score = float(window.get("foreground_speech_score", 0.0))
+        foreground_rank = int(window.get("foreground_speech_rank", 10_000))
+        if "foreground_speech_score" not in window:
+            foreground_labels = [
+                item
+                for item in window.get("top_labels", [])
+                if item.get("mid") in FOREGROUND_SPEECH_MIDS
+            ]
+            if foreground_labels:
+                strongest = max(
+                    foreground_labels,
+                    key=lambda item: float(item.get("probability", 0.0)),
+                )
+                foreground_score = float(strongest.get("probability", 0.0))
+                foreground_rank = next(
+                    index
+                    for index, item in enumerate(window.get("top_labels", []), 1)
+                    if item is strongest
+                )
+        window["foreground_speech_score"] = foreground_score
+        window["foreground_speech_rank"] = foreground_rank
+        window["foreground_speech_active"] = (
+            foreground_score >= MIN_FOREGROUND_SPEECH_PROBABILITY
+            and foreground_rank <= MAX_FOREGROUND_SPEECH_RANK
         )
         window["cinematic_music_active"] = (
             float(window.get("music_score", 0.0))
@@ -424,6 +611,9 @@ def _enforce_current_voice_gate(
         bool(window["strong_speech_active"]) for window in windows
     )
     strong_voice_present = strong_speech_windows >= MIN_STRONG_SPEECH_WINDOWS
+    foreground_speech_windows = sum(
+        bool(window["foreground_speech_active"]) for window in windows
+    )
     cinematic_music_windows = sum(
         bool(window["cinematic_music_active"]) for window in windows
     )
@@ -462,6 +652,10 @@ def _enforce_current_voice_gate(
             "strong_speech_active_windows": strong_speech_windows,
             "strong_speech_coverage": round(
                 strong_speech_windows / max(1, len(windows)), 6
+            ),
+            "foreground_speech_active_windows": foreground_speech_windows,
+            "foreground_speech_coverage": round(
+                foreground_speech_windows / max(1, len(windows)), 6
             ),
             "cinematic_music_active_windows": cinematic_music_windows,
             "cinematic_sfx_active_windows": cinematic_sfx_windows,
@@ -510,7 +704,26 @@ def materialize_accepted(args: argparse.Namespace) -> None:
         for line in args.results.read_text().splitlines()
         if line.strip()
     ]
-    accepted = [item for item in results if item.get("accepted")]
+    asr_results_path = getattr(args, "asr_results", None)
+    asr_by_filename: dict[str, dict[str, Any]] = {}
+    if asr_results_path:
+        asr_by_filename = {
+            item["filename"]: item
+            for item in (
+                json.loads(line)
+                for line in asr_results_path.read_text().splitlines()
+                if line.strip()
+            )
+        }
+    accepted = [
+        item
+        for item in results
+        if item.get("accepted")
+        and (
+            not asr_results_path
+            or asr_by_filename.get(item["filename"], {}).get("accepted")
+        )
+    ]
     accepted_limit = getattr(args, "accepted_limit", None)
     if accepted_limit:
         accepted = accepted[:accepted_limit]
@@ -543,12 +756,18 @@ def materialize_accepted(args: argparse.Namespace) -> None:
                 "record_index": index,
                 "local_path": f"audio/{result['filename']}",
                 "m2d_validation": result,
+                "asr_validation": asr_by_filename.get(result["filename"]),
             }
         )
         records.append(original)
     rejection_counts = Counter(
         reason
         for result in results
+        for reason in result.get("rejection_reasons", [])
+    )
+    asr_rejection_counts = Counter(
+        reason
+        for result in asr_by_filename.values()
         for reason in result.get("rejection_reasons", [])
     )
     bucket_counts = Counter(item["background_bucket"] for item in accepted)
@@ -561,6 +780,12 @@ def materialize_accepted(args: argparse.Namespace) -> None:
         "accepted_record_count": len(records),
         "acceptance_rate": round(len(records) / max(1, len(results)), 6),
         "validator": "nttcslab/m2d AudioSet fine-tuned tagger",
+        "foreground_voice_validator": (
+            "faster-whisper" if asr_results_path else None
+        ),
+        "foreground_voice_policy": (
+            ASR_POLICY_VERSION if asr_results_path else None
+        ),
         "policy": (
             CINEMATIC_POLICY_VERSION
             if require_cinematic_mix
@@ -568,6 +793,9 @@ def materialize_accepted(args: argparse.Namespace) -> None:
         ),
         "background_bucket_counts": dict(sorted(bucket_counts.items())),
         "rejection_reason_counts": dict(sorted(rejection_counts.items())),
+        "foreground_voice_rejection_reason_counts": dict(
+            sorted(asr_rejection_counts.items())
+        ),
         "balanced_listening_subset": {
             "policy": "equal_music_led_and_nonmusic_led_v1",
             "record_count": len(balanced),
@@ -592,6 +820,7 @@ def materialize_accepted(args: argparse.Namespace) -> None:
             "policy",
             "background_bucket_counts",
             "rejection_reason_counts",
+            "foreground_voice_rejection_reason_counts",
         )
     }
     audit["original_dataset_preserved"] = True
@@ -623,11 +852,27 @@ def _parser() -> argparse.ArgumentParser:
     score.add_argument("--require-cinematic-mix", action="store_true")
     score.set_defaults(handler=score_directory)
 
+    asr_score = subparsers.add_parser(
+        "asr-score", help="Confirm decodable foreground voice with faster-whisper"
+    )
+    asr_score.add_argument("--input-dir", type=Path, required=True)
+    asr_score.add_argument("--output", type=Path, required=True)
+    asr_score.add_argument("--model", default="small.en")
+    asr_score.add_argument("--device", default="cuda")
+    asr_score.add_argument("--compute-type", default="float16")
+    asr_score.add_argument("--download-root", type=Path)
+    asr_score.add_argument("--beam-size", type=int, default=5)
+    asr_score.add_argument("--glob", default="*.wav")
+    asr_score.add_argument("--limit", type=int)
+    asr_score.add_argument("--overwrite", action="store_true")
+    asr_score.set_defaults(handler=score_asr_directory)
+
     materialize = subparsers.add_parser(
         "materialize", help="Create a folder containing only accepted clips"
     )
     materialize.add_argument("--input-dir", type=Path, required=True)
     materialize.add_argument("--results", type=Path, required=True)
+    materialize.add_argument("--asr-results", type=Path)
     materialize.add_argument("--source-manifest", type=Path, required=True)
     materialize.add_argument("--output-dir", type=Path, required=True)
     materialize.add_argument("--require-cinematic-mix", action="store_true")

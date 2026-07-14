@@ -9,10 +9,14 @@ import logging
 import math
 import os
 import random
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -228,6 +232,10 @@ CINEMATIC_EXCLUDED_TERMS = (
     "full movie",
     "youtube shorts",
     "#shorts",
+    "cinematic sound effects",
+    "action camera",
+    "whatsapp status",
+    "backsound",
     "bollywood",
     "hindi",
     "tamil",
@@ -236,8 +244,24 @@ CINEMATIC_EXCLUDED_TERMS = (
     "kannada",
     "bengali",
     "punjabi",
+    "marathi",
+    "gujarati",
+    "bhojpuri",
+    "mollywood",
+    "tollywood",
+    "kollywood",
     " india ",
     " indian ",
+    "mirzapur",
+    "taarak mehta",
+    "mammootty",
+    "vijayakanth",
+    "mohanlal",
+    "ajay devgan",
+    "sunny deol",
+    "sanjay dutt",
+    "cine curry",
+    "tamilbiscoot",
     "ary digital",
     "hum tv",
     "geo entertainment",
@@ -307,11 +331,21 @@ def build_queries(seed: int, count: int, *, profile: str = "general") -> list[st
     return queries
 
 
+def _query_for_source(query: str, source: str) -> str:
+    """Remove YouTube-only negative tokens for APIs that treat them literally."""
+    if source == "youtube":
+        return query
+    return " ".join(part for part in query.split() if not part.startswith("-"))
+
+
 def _candidate_allowed(item: dict[str, Any], *, profile: str = "general") -> bool:
     duration = float(item.get("duration") or 0.0)
     title = f" {str(item.get('title') or '').lower()} "
     uploader = f" {str(item.get('uploader') or item.get('channel') or '').lower()} "
-    text = title + uploader
+    description = f" {str(item.get('description') or '').lower()} "
+    tags = " " + " ".join(str(tag).lower() for tag in item.get("tags") or []) + " "
+    text = title + uploader + description + tags
+    normalized_text = f" {re.sub(r'[^a-z0-9]+', ' ', text).strip()} "
     excluded = (
         CINEMATIC_EXCLUDED_TERMS if profile == "cinematic" else EXCLUDED_TITLE_TERMS
     )
@@ -319,7 +353,11 @@ def _candidate_allowed(item: dict[str, Any], *, profile: str = "general") -> boo
         bool(item.get("id"))
         and 30.0 <= duration <= 3600.0
         and item.get("live_status") not in {"is_live", "is_upcoming"}
-        and not any(term in text for term in excluded)
+        and not any(
+            term in text
+            or f" {re.sub(r'[^a-z0-9]+', ' ', term).strip()} " in normalized_text
+            for term in excluded
+        )
         and (
             profile != "cinematic"
             or any(term in title for term in CINEMATIC_TITLE_TERMS)
@@ -327,7 +365,9 @@ def _candidate_allowed(item: dict[str, Any], *, profile: str = "general") -> boo
     )
 
 
-def _search(query: str, results: int, profile: str) -> list[dict[str, Any]]:
+def _search_youtube(
+    query: str, results: int, profile: str
+) -> list[dict[str, Any]]:
     response = _run(
         [
             sys.executable,
@@ -348,6 +388,49 @@ def _search(query: str, results: int, profile: str) -> list[dict[str, Any]]:
         for item in payload.get("entries", [])
         if _candidate_allowed(item, profile=profile)
     ]
+
+
+def _search_dailymotion(
+    query: str, results: int, profile: str
+) -> list[dict[str, Any]]:
+    fields = (
+        "id,title,description,duration,owner.screenname,url,language,tags,"
+        "created_time"
+    )
+    parameters = urllib.parse.urlencode(
+        {
+            "search": _query_for_source(query, "dailymotion"),
+            "fields": fields,
+            "limit": min(results, 100),
+            "sort": "relevance",
+        }
+    )
+    request = urllib.request.Request(
+        f"https://api.dailymotion.com/videos?{parameters}",
+        headers={"User-Agent": "sam-audio-dataset-builder/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+    items: list[dict[str, Any]] = []
+    for value in payload.get("list", []):
+        item = {
+            **value,
+            "uploader": value.get("owner.screenname"),
+            "source_url": value.get("url"),
+        }
+        if str(item.get("language") or "").lower() not in {"", "en"}:
+            continue
+        if _candidate_allowed(item, profile=profile):
+            items.append(item)
+    return items
+
+
+def _search(
+    query: str, results: int, profile: str, source: str = "youtube"
+) -> list[dict[str, Any]]:
+    if source == "dailymotion":
+        return _search_dailymotion(query, results, profile)
+    return _search_youtube(query, results, profile)
 
 
 def _sample_clip_starts(
@@ -383,6 +466,7 @@ def discover_candidates(
     minimum_candidates: int,
     profile: str = "general",
     clips_per_video: int = 1,
+    source: str = "youtube",
 ) -> list[dict[str, Any]]:
     metadata_dir = output_dir / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -394,6 +478,7 @@ def discover_candidates(
         compatible = (
             search_metadata.get("profile", "general") == profile
             and int(search_metadata.get("clips_per_video", 1)) == clips_per_video
+            and search_metadata.get("source", "youtube") == source
         )
         if compatible and len(existing) >= minimum_candidates:
             logger.info("Reusing %d discovered candidates", len(existing))
@@ -405,7 +490,7 @@ def discover_candidates(
     failures: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         pending = {
-            executor.submit(_search, query, results_per_query, profile): query
+            executor.submit(_search, query, results_per_query, profile, source): query
             for query in queries
         }
         for index, future in enumerate(as_completed(pending), start=1):
@@ -434,7 +519,15 @@ def discover_candidates(
                     found[candidate_id] = {
                         "candidate_id": candidate_id,
                         "video_id": video_id,
-                        "source_url": f"https://www.youtube.com/watch?v={video_id}",
+                        "source_url": (
+                            item.get("source_url")
+                            or (
+                                f"https://www.dailymotion.com/video/{video_id}"
+                                if source == "dailymotion"
+                                else f"https://www.youtube.com/watch?v={video_id}"
+                            )
+                        ),
+                        "source_platform": source,
                         "title": item.get("title"),
                         "duration_seconds": duration,
                         "uploader": item.get("uploader") or item.get("channel"),
@@ -444,7 +537,7 @@ def discover_candidates(
                         "clip_start_seconds": round(start, 3),
                         "clip_end_seconds": round(start + CLIP_SECONDS, 3),
                         "segment_index": segment_index,
-                        "selection": f"seeded_{profile}_youtube_search",
+                        "selection": f"seeded_{profile}_{source}_search",
                         "selection_seed": seed,
                         "mixture_bias": [
                             "dialogue",
@@ -468,7 +561,8 @@ def discover_candidates(
     search_path.write_text(
         json.dumps(
             {
-                "selection": f"seeded_{profile}_youtube_search",
+                "selection": f"seeded_{profile}_{source}_search",
+                "source": source,
                 "profile": profile,
                 "clips_per_video": clips_per_video,
                 "seed": seed,
@@ -605,8 +699,11 @@ def _download_section(
     *,
     youtube_client: str,
 ) -> tuple[subprocess.CompletedProcess[str], Path, str]:
+    source_platform = candidate.get("source_platform", "youtube")
     clients = (
-        ("default", "android") if youtube_client == "auto" else (youtube_client,)
+        ("dailymotion",)
+        if source_platform == "dailymotion"
+        else (("mweb", "default") if youtube_client == "auto" else (youtube_client,))
     )
     last_error: Exception | None = None
     for client in clients:
@@ -627,7 +724,14 @@ def _download_section(
             "--extractor-retries",
             "2",
         ]
-        if client == "android":
+        deno = shutil.which("deno") or str(Path.home() / ".deno" / "bin" / "deno")
+        if Path(deno).is_file():
+            command.extend(["--js-runtimes", f"deno:{deno}"])
+        if client == "mweb":
+            command.extend(
+                ["--extractor-args", "youtube:player_client=mweb"]
+            )
+        elif client == "android":
             command.extend(
                 [
                     "--extractor-args",
@@ -651,7 +755,7 @@ def _download_section(
             ]
         )
         try:
-            response = _run(command, timeout=150)
+            response = _run(command, timeout=75)
             return response, _source_file(download_root), client
         except Exception as error:
             last_error = error
@@ -698,12 +802,15 @@ def acquire_candidate(
     started = time.perf_counter()
     video_id = str(candidate["video_id"])
     start = float(candidate["clip_start_seconds"])
-    section_start = max(0.0, start - 1.0)
-    section_end = start + CLIP_SECONDS + 1.0
+    # HLS section boundaries can begin several seconds after the requested time.
+    # A five-second handle keeps the normalized excerpt at exactly ten seconds.
+    section_start = max(0.0, start - 5.0)
+    section_end = start + CLIP_SECONDS + 5.0
+    trim_offset = start - section_start
     destination = output_dir / "audio" / f"{video_id}_{round(start * 1000):010d}.wav"
     result = {**candidate, "attempted_at": _now()}
     try:
-        with tempfile.TemporaryDirectory(prefix="sam-youtube-random-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="sam-source-random-") as temporary:
             root = Path(temporary)
             download, source, retrieval_client = _download_section(
                 candidate,
@@ -723,7 +830,7 @@ def acquire_candidate(
                     "-nostdin",
                     "-y",
                     "-ss",
-                    "1.0",
+                    str(trim_offset),
                     "-i",
                     str(source),
                     "-t",
@@ -752,7 +859,8 @@ def acquire_candidate(
                 result["retrieval_status"] = "rejected"
             else:
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(normalized, destination)
+                # /tmp and the dataset volume may be different filesystems.
+                shutil.move(normalized, destination)
                 result.update(
                     {
                         "retrieval_status": "success",
@@ -804,7 +912,9 @@ def _accepted(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [item for item in attempts if item.get("retrieval_status") == "success"]
 
 
-def _criteria(*, profile: str = "general", clips_per_video: int = 1) -> dict[str, Any]:
+def _criteria(
+    *, profile: str = "general", clips_per_video: int = 1, source: str = "youtube"
+) -> dict[str, Any]:
     return {
         "clip_seconds": CLIP_SECONDS,
         "output": "stereo PCM16 WAV at 48 kHz",
@@ -818,7 +928,8 @@ def _criteria(*, profile: str = "general", clips_per_video: int = 1) -> dict[str
         "minimum_side_to_total_db": MIN_SIDE_TO_TOTAL_DB,
         "maximum_clipped_fraction": MAX_CLIPPED_FRACTION,
         "maximum_clips_per_video": clips_per_video,
-        "candidate_source": f"{profile} YouTube search; no AudioSet metadata",
+        "candidate_source": f"{profile} {source.title()} search; no AudioSet metadata",
+        "source_platform": source,
         "source_profile": profile,
         "explicit_metadata_exclusions": (
             list(CINEMATIC_EXCLUDED_TERMS) if profile == "cinematic" else []
@@ -834,6 +945,7 @@ def write_manifest(
     seed: int,
     profile: str = "general",
     clips_per_video: int = 1,
+    source: str = "youtube",
 ) -> Path:
     records = _accepted(attempts)[:target]
     for index, record in enumerate(records):
@@ -844,15 +956,15 @@ def write_manifest(
         status_counts[status] = status_counts.get(status, 0) + 1
     manifest = {
         "schema_version": 1,
-        "name": f"{profile.title()} YouTube {target} · seed {seed}",
+        "name": f"{profile.title()} {source.title()} {target} · seed {seed}",
         "created_at": _now(),
         "target_records": target,
         "accepted_records": len(records),
         "selection_seed": seed,
-        "selection": f"seeded_{profile}_youtube_search",
+        "selection": f"seeded_{profile}_{source}_search",
         "mixture_preference": ["dialogue", "music", "environmental_sfx"],
         "acceptance_criteria": _criteria(
-            profile=profile, clips_per_video=clips_per_video
+            profile=profile, clips_per_video=clips_per_video, source=source
         ),
         "attempt_statuses": status_counts,
         "records": records,
@@ -928,6 +1040,7 @@ def acquire_dataset(
     youtube_client: str,
     profile: str = "general",
     clips_per_video: int = 1,
+    source: str = "youtube",
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     candidates = discover_candidates(
@@ -939,6 +1052,7 @@ def acquire_dataset(
         minimum_candidates=math.ceil(total * candidate_multiplier),
         profile=profile,
         clips_per_video=clips_per_video,
+        source=source,
     )
     attempts_path = output_dir / "attempts.jsonl"
     attempts, attempted = _load_attempts(attempts_path, output_dir)
@@ -989,6 +1103,7 @@ def acquire_dataset(
                     seed=seed,
                     profile=profile,
                     clips_per_video=clips_per_video,
+                    source=source,
                 )
                 logger.info(
                     "Accepted %d/%d after %d new attempts",
@@ -1003,6 +1118,7 @@ def acquire_dataset(
         seed=seed,
         profile=profile,
         clips_per_video=clips_per_video,
+        source=source,
     )
     if accepted_count < total:
         raise RuntimeError(
@@ -1030,13 +1146,16 @@ def main() -> None:
         "--profile", choices=("general", "cinematic"), default="general"
     )
     parser.add_argument(
+        "--source", choices=("youtube", "dailymotion"), default="youtube"
+    )
+    parser.add_argument(
         "--clips-per-video",
         type=int,
         help="Defaults to 3 for cinematic and 1 for general acquisition",
     )
     parser.add_argument(
         "--youtube-client",
-        choices=("auto", "default", "android"),
+        choices=("auto", "default", "mweb", "android"),
         default="auto",
     )
     parser.add_argument("--verify-only", action="store_true")
@@ -1073,6 +1192,7 @@ def main() -> None:
         youtube_client=args.youtube_client,
         profile=args.profile,
         clips_per_video=clips_per_video,
+        source=args.source,
     )
     print(path)
 

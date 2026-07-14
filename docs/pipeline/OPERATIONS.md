@@ -227,6 +227,29 @@ uv run sam-pipeline-youtube-random \
   --max-attempts 6000
 ```
 
+If YouTube rejects the downloader host's public address, use the same gated
+acquisition pipeline against Dailymotion rather than weakening the selection
+policy or using account cookies:
+
+```bash
+uv run sam-pipeline-youtube-random \
+  --output /data/cinematic-raw-20260715 \
+  --source dailymotion \
+  --total 3500 \
+  --seed 20260715 \
+  --profile cinematic \
+  --clips-per-video 12 \
+  --query-count 500 \
+  --results-per-query 100 \
+  --candidate-multiplier 2 \
+  --max-attempts 9000
+```
+
+The Dailymotion path uses the public search API for metadata and `yt-dlp` only
+for the selected time sections. The same title, uploader, description, and tag
+exclusions apply, including explicit India/Indian and Indian-language source
+metadata. It does not infer a speaker's ethnicity or nationality from audio.
+
 Score with `--require-cinematic-mix` so dialogue, music, and non-music SFX are
 independent requirements. Materialize with the same flag and
 `--accepted-limit 1000` to create an exact 1,000-record result. The final
@@ -276,12 +299,46 @@ subset with equal music-led and non-music-led counts. Every record keeps the
 per-window scores, ranks, top labels, temporal coverage, rejection reasons,
 exact M2D checkpoint hash, and validator policy version.
 
-Policy v3 requires audible voice evidence in at least five 2-second windows:
+Policy v4 requires audible voice evidence in at least five 2-second windows:
 the M2D speech-family probability must be at least `0.10` and rank within the
 top five labels in each counted window. This strong gate is separate from the
 older low-confidence speech diagnostic and rejects clips tagged as speech only
 because of weak background evidence. Materializing an older M2D JSONL applies
-the v3 voice gate from its stored per-window scores without rerunning the model.
+the current voice gate from its stored per-window scores without rerunning the
+model.
+
+M2D also records foreground-speech subclass evidence, but it is diagnostic: on
+the cinematic pilot those sublabels were too sparse to use as a mandatory
+gate. Confirm audible foreground voice with faster-whisper instead:
+
+```bash
+PYTHONPATH=/app/pipeline/src /models/whisper-venv/bin/python \
+  -m sam_audio_pipeline.m2d_validator asr-score \
+  --input-dir /data/cinematic-raw-20260715/audio \
+  --output /data/cinematic-raw-20260715/asr-validation.jsonl \
+  --model small.en \
+  --download-root /models/faster-whisper
+```
+
+The ASR policy requires at least 1.5 seconds of VAD-positive audio, at least two
+decoded words, best segment average log probability of `-0.75` or better, and
+no-speech probability no higher than `0.40`. Against the completed human-review
+set it rejected 12 of 14 clips explicitly marked `lacking_voice` while retaining
+25 of a deterministic 30-clip Good/Perfect calibration sample. The M2D strong
+speech check remains required as an independent guard.
+
+Pass both validation files when creating the exact final set:
+
+```bash
+uv run sam-pipeline-m2d-validate materialize \
+  --input-dir /data/cinematic-raw-20260715/audio \
+  --results /data/cinematic-raw-20260715/m2d-validation.jsonl \
+  --asr-results /data/cinematic-raw-20260715/asr-validation.jsonl \
+  --source-manifest /data/cinematic-raw-20260715/manifest.json \
+  --output-dir /data/cinematic-final-1000-20260715 \
+  --require-cinematic-mix \
+  --accepted-limit 1000
+```
 
 ### Manual listening review
 

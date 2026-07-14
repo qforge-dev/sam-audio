@@ -8,6 +8,7 @@ import numpy as np
 
 from sam_audio_pipeline.youtube_random import (
     _candidate_allowed,
+    _query_for_source,
     _sample_clip_starts,
     analyze_wav,
     build_queries,
@@ -81,6 +82,31 @@ def test_cinematic_queries_and_metadata_filter_target_raw_scenes() -> None:
         },
         profile="cinematic",
     )
+    assert not _candidate_allowed(
+        {
+            "id": "punctuated-country",
+            "title": "Dramatic Movie Scene",
+            "description": "Produced in India.",
+            "duration": 180,
+        },
+        profile="cinematic",
+    )
+    assert not _candidate_allowed(
+        {
+            "id": "hidden-language",
+            "title": "Dramatic Movie Scene",
+            "description": "A popular Hindi-language movie clip from India",
+            "duration": 180,
+        },
+        profile="cinematic",
+    )
+
+
+def test_non_youtube_search_removes_negative_query_tokens() -> None:
+    query = "movie scene dialogue -reaction -India English"
+
+    assert _query_for_source(query, "youtube") == query
+    assert _query_for_source(query, "dailymotion") == "movie scene dialogue English"
     assert not _candidate_allowed(
         {
             "id": "language",
