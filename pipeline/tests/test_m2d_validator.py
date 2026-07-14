@@ -55,6 +55,43 @@ def test_evaluate_probabilities_requires_temporal_overlap():
     assert "insufficient_strong_speech" in result["rejection_reasons"]
 
 
+def test_cinematic_policy_requires_independent_music_and_sfx() -> None:
+    labels = [
+        {"mid": "speech", "display_name": "Speech"},
+        {"mid": "music", "display_name": "Music"},
+        {"mid": "sfx", "display_name": "Vehicle"},
+        {"mid": "other", "display_name": "Other"},
+    ]
+    families = {
+        "speech": {0},
+        "music": {1},
+        "nonmusic_background": {2},
+        "background": {1, 2},
+        "human": {0},
+        "vocal_music": {3},
+    }
+    complete_mix = np.asarray([[0.45, 0.30, 0.249, 0.001]] * 9)
+    result = evaluate_probabilities(
+        complete_mix, labels, families, require_cinematic_mix=True
+    )
+    assert result["accepted"] is True
+    assert result["cinematic_mix_pass"] is True
+
+    music_without_effects = np.asarray([[0.45, 0.548, 0.001, 0.001]] * 9)
+    result = evaluate_probabilities(
+        music_without_effects, labels, families, require_cinematic_mix=True
+    )
+    assert result["accepted"] is False
+    assert "insufficient_cinematic_sfx" in result["rejection_reasons"]
+
+    effects_without_music = np.asarray([[0.45, 0.001, 0.548, 0.001]] * 9)
+    result = evaluate_probabilities(
+        effects_without_music, labels, families, require_cinematic_mix=True
+    )
+    assert result["accepted"] is False
+    assert "insufficient_cinematic_music" in result["rejection_reasons"]
+
+
 def test_load_label_families_uses_ontology_descendants(tmp_path: Path):
     labels = tmp_path / "labels.csv"
     with labels.open("w", newline="") as destination:

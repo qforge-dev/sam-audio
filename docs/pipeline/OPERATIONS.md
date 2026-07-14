@@ -205,6 +205,34 @@ uv run sam-pipeline-youtube-random \
   --total 1000 --verify-only
 ```
 
+### Cinematic mixed-audio acquisition
+
+The cinematic profile is based on the completed 216-clip human-review findings
+in [`HUMAN_REVIEW_FINDINGS_20260714.md`](HUMAN_REVIEW_FINDINGS_20260714.md).
+It targets raw movie/TV/animated scenes, game cutscenes, short films, and
+produced news packages while rejecting review/reaction/vlog/tutorial/AI-voice
+metadata. It may retain up to three non-overlapping excerpts from one promising
+source:
+
+```bash
+uv run sam-pipeline-youtube-random \
+  --output /data/cinematic-raw-20260715 \
+  --total 3500 \
+  --seed 20260715 \
+  --profile cinematic \
+  --clips-per-video 3 \
+  --query-count 1600 \
+  --results-per-query 15 \
+  --candidate-multiplier 1.7 \
+  --max-attempts 6000
+```
+
+Score with `--require-cinematic-mix` so dialogue, music, and non-music SFX are
+independent requirements. Materialize with the same flag and
+`--accepted-limit 1000` to create an exact 1,000-record result. The final
+materialized set retains source URLs, exact timestamps, query provenance, and
+the human-feedback-derived policy version.
+
 ### M2D dialogue/background validation
 
 The technical YouTube gate does not prove that spoken dialogue and background

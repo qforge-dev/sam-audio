@@ -8,6 +8,7 @@ import numpy as np
 
 from sam_audio_pipeline.youtube_random import (
     _candidate_allowed,
+    _sample_clip_starts,
     analyze_wav,
     build_queries,
     quality_rejections,
@@ -42,6 +43,66 @@ def test_queries_are_reproducible_mix_biased_and_not_audioset() -> None:
     assert all(
         any(word in query for word in ("music", "soundtrack", "score"))
         for query in first
+    )
+
+
+def test_cinematic_queries_and_metadata_filter_target_raw_scenes() -> None:
+    queries = build_queries(31, 20, profile="cinematic")
+
+    assert all("-reaction" in query and "-Bollywood" in query for query in queries)
+    assert all(
+        any(
+            hint in query
+            for hint in ("English", "dialogue", "soundtrack", "cinematic")
+        )
+        for query in queries
+    )
+    assert all(
+        any(
+            kind in query
+            for kind in ("scene", "clip", "cutscene", "short film", "package")
+        )
+        for query in queries
+    )
+    assert _candidate_allowed(
+        {
+            "id": "scene",
+            "title": "Captain America Elevator Scene 4K",
+            "duration": 180,
+            "channel": "Movie Clips",
+        },
+        profile="cinematic",
+    )
+    assert not _candidate_allowed(
+        {
+            "id": "reaction",
+            "title": "Captain America Elevator Scene Reaction",
+            "duration": 180,
+        },
+        profile="cinematic",
+    )
+    assert not _candidate_allowed(
+        {
+            "id": "language",
+            "title": "Hindi Movie Scene",
+            "duration": 180,
+        },
+        profile="cinematic",
+    )
+
+
+def test_cinematic_segment_sampling_is_reproducible_and_non_overlapping() -> None:
+    first = _sample_clip_starts(
+        seed=42, video_id="movie", duration=180, clips_per_video=3
+    )
+    second = _sample_clip_starts(
+        seed=42, video_id="movie", duration=180, clips_per_video=3
+    )
+
+    assert first == second
+    assert len(first) == 3
+    assert all(
+        right - left >= 12 for left, right in zip(first, first[1:], strict=False)
     )
 
 

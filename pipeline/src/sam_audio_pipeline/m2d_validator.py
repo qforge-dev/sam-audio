@@ -45,11 +45,18 @@ MIN_SPEECH_WINDOWS = 3
 MIN_STRONG_SPEECH_PROBABILITY = 0.10
 MAX_STRONG_SPEECH_RANK = 5
 MIN_STRONG_SPEECH_WINDOWS = 5
+MIN_CINEMATIC_MUSIC_PROBABILITY = 0.01
+MAX_CINEMATIC_MUSIC_RANK = 15
+MIN_CINEMATIC_MUSIC_WINDOWS = 4
+MIN_CINEMATIC_SFX_PROBABILITY = 0.02
+MAX_CINEMATIC_SFX_RANK = 5
+MIN_CINEMATIC_SFX_WINDOWS = 1
 MIN_BACKGROUND_WINDOWS = 4
 MIN_OVERLAP_WINDOWS = 3
 MAX_VOCAL_MUSIC_WINDOWS = 1
 TOP_LABELS = 8
 POLICY_VERSION = "spoken_dialogue_instrumental_background_m2d_v3"
+CINEMATIC_POLICY_VERSION = "cinematic_dialogue_music_sfx_m2d_v1"
 
 
 def _now() -> str:
@@ -127,6 +134,7 @@ def evaluate_probabilities(
     families: dict[str, set[int]],
     *,
     starts: list[float] | None = None,
+    require_cinematic_mix: bool = False,
 ) -> dict[str, Any]:
     """Evaluate actual temporal overlap from M2D window probabilities."""
     if probabilities.ndim != 2 or probabilities.shape[1] != len(labels):
@@ -152,6 +160,14 @@ def evaluate_probabilities(
         strong_speech_active = (
             evidence["speech"][0] >= MIN_STRONG_SPEECH_PROBABILITY
             and evidence["speech"][1] <= MAX_STRONG_SPEECH_RANK
+        )
+        cinematic_music_active = (
+            evidence["music"][0] >= MIN_CINEMATIC_MUSIC_PROBABILITY
+            and evidence["music"][1] <= MAX_CINEMATIC_MUSIC_RANK
+        )
+        cinematic_sfx_active = (
+            evidence["nonmusic_background"][0] >= MIN_CINEMATIC_SFX_PROBABILITY
+            and evidence["nonmusic_background"][1] <= MAX_CINEMATIC_SFX_RANK
         )
         background_active = (
             evidence["background"][0] >= MIN_WINDOW_PROBABILITY
@@ -180,6 +196,8 @@ def evaluate_probabilities(
                 "vocal_music_rank": evidence["vocal_music"][1],
                 "speech_active": speech_active,
                 "strong_speech_active": strong_speech_active,
+                "cinematic_music_active": cinematic_music_active,
+                "cinematic_sfx_active": cinematic_sfx_active,
                 "background_active": background_active,
                 "vocal_music_active": vocal_music_active,
                 "overlap_active": speech_active and background_active,
@@ -196,6 +214,10 @@ def evaluate_probabilities(
 
     speech_windows = sum(item["speech_active"] for item in windows)
     strong_speech_windows = sum(item["strong_speech_active"] for item in windows)
+    cinematic_music_windows = sum(
+        item["cinematic_music_active"] for item in windows
+    )
+    cinematic_sfx_windows = sum(item["cinematic_sfx_active"] for item in windows)
     background_windows = sum(item["background_active"] for item in windows)
     overlap_windows = sum(item["overlap_active"] for item in windows)
     vocal_music_windows = sum(item["vocal_music_active"] for item in windows)
@@ -219,6 +241,11 @@ def evaluate_probabilities(
         rejections.append("insufficient_speech")
     if strong_speech_windows < MIN_STRONG_SPEECH_WINDOWS:
         rejections.append("insufficient_strong_speech")
+    if require_cinematic_mix:
+        if cinematic_music_windows < MIN_CINEMATIC_MUSIC_WINDOWS:
+            rejections.append("insufficient_cinematic_music")
+        if cinematic_sfx_windows < MIN_CINEMATIC_SFX_WINDOWS:
+            rejections.append("insufficient_cinematic_sfx")
     if background_windows < MIN_BACKGROUND_WINDOWS:
         rejections.append("insufficient_background")
     if overlap_windows < MIN_OVERLAP_WINDOWS:
@@ -228,17 +255,30 @@ def evaluate_probabilities(
     window_count = len(windows)
     return {
         "accepted": not rejections,
-        "policy": POLICY_VERSION,
+        "policy": (
+            CINEMATIC_POLICY_VERSION if require_cinematic_mix else POLICY_VERSION
+        ),
         "rejection_reasons": rejections,
         "background_bucket": background_bucket,
         "window_count": window_count,
         "speech_active_windows": speech_windows,
         "strong_speech_active_windows": strong_speech_windows,
+        "cinematic_music_active_windows": cinematic_music_windows,
+        "cinematic_sfx_active_windows": cinematic_sfx_windows,
         "background_active_windows": background_windows,
         "overlap_active_windows": overlap_windows,
         "vocal_music_active_windows": vocal_music_windows,
         "speech_coverage": round(speech_windows / window_count, 6),
         "strong_speech_coverage": round(strong_speech_windows / window_count, 6),
+        "cinematic_music_coverage": round(
+            cinematic_music_windows / window_count, 6
+        ),
+        "cinematic_sfx_coverage": round(cinematic_sfx_windows / window_count, 6),
+        "cinematic_mix_required": require_cinematic_mix,
+        "cinematic_mix_pass": (
+            cinematic_music_windows >= MIN_CINEMATIC_MUSIC_WINDOWS
+            and cinematic_sfx_windows >= MIN_CINEMATIC_SFX_WINDOWS
+        ),
         "background_coverage": round(background_windows / window_count, 6),
         "overlap_coverage": round(overlap_windows / window_count, 6),
         "vocal_music_coverage": round(vocal_music_windows / window_count, 6),
@@ -299,7 +339,11 @@ def score_directory(args: argparse.Namespace) -> None:
         "checkpoint": args.checkpoint.parent.name,
         "checkpoint_sha256": _sha256(args.checkpoint),
         "m2d_repository_commit": args.m2d_commit,
-        "policy": POLICY_VERSION,
+        "policy": (
+            CINEMATIC_POLICY_VERSION
+            if args.require_cinematic_mix
+            else POLICY_VERSION
+        ),
         "window_seconds": WINDOW_SECONDS,
         "window_hop_seconds": WINDOW_HOP_SECONDS,
         "minimum_window_probability": MIN_WINDOW_PROBABILITY,
@@ -308,6 +352,12 @@ def score_directory(args: argparse.Namespace) -> None:
         "minimum_strong_speech_probability": MIN_STRONG_SPEECH_PROBABILITY,
         "maximum_strong_speech_rank": MAX_STRONG_SPEECH_RANK,
         "minimum_strong_speech_windows": MIN_STRONG_SPEECH_WINDOWS,
+        "minimum_cinematic_music_probability": MIN_CINEMATIC_MUSIC_PROBABILITY,
+        "maximum_cinematic_music_rank": MAX_CINEMATIC_MUSIC_RANK,
+        "minimum_cinematic_music_windows": MIN_CINEMATIC_MUSIC_WINDOWS,
+        "minimum_cinematic_sfx_probability": MIN_CINEMATIC_SFX_PROBABILITY,
+        "maximum_cinematic_sfx_rank": MAX_CINEMATIC_SFX_RANK,
+        "minimum_cinematic_sfx_windows": MIN_CINEMATIC_SFX_WINDOWS,
         "minimum_background_windows": MIN_BACKGROUND_WINDOWS,
         "minimum_overlap_windows": MIN_OVERLAP_WINDOWS,
         "maximum_vocal_music_windows": MAX_VOCAL_MUSIC_WINDOWS,
@@ -327,7 +377,11 @@ def score_directory(args: argparse.Namespace) -> None:
                 "scored_at": _now(),
                 "m2d": metadata,
                 **evaluate_probabilities(
-                    probabilities, labels, families, starts=starts
+                    probabilities,
+                    labels,
+                    families,
+                    starts=starts,
+                    require_cinematic_mix=args.require_cinematic_mix,
                 ),
             }
             destination.write(json.dumps(result, separators=(",", ":")) + "\n")
@@ -338,9 +392,14 @@ def score_directory(args: argparse.Namespace) -> None:
     logger.info("Wrote %d new validation records to %s", processed, args.output)
 
 
-def _enforce_current_voice_gate(result: dict[str, Any]) -> dict[str, Any]:
-    """Apply the strong-voice gate to current and legacy M2D results."""
+def _enforce_current_voice_gate(
+    result: dict[str, Any], *, require_cinematic_mix: bool = False
+) -> dict[str, Any]:
+    """Apply current voice and optional cinematic gates to M2D results."""
     result = dict(result)
+    require_cinematic_mix = bool(
+        require_cinematic_mix or result.get("cinematic_mix_required")
+    )
     windows = []
     for source in result.get("windows", []):
         window = dict(source)
@@ -349,28 +408,75 @@ def _enforce_current_voice_gate(result: dict[str, Any]) -> dict[str, Any]:
             >= MIN_STRONG_SPEECH_PROBABILITY
             and int(window.get("speech_rank", 10_000)) <= MAX_STRONG_SPEECH_RANK
         )
+        window["cinematic_music_active"] = (
+            float(window.get("music_score", 0.0))
+            >= MIN_CINEMATIC_MUSIC_PROBABILITY
+            and int(window.get("music_rank", 10_000)) <= MAX_CINEMATIC_MUSIC_RANK
+        )
+        window["cinematic_sfx_active"] = (
+            float(window.get("nonmusic_background_score", 0.0))
+            >= MIN_CINEMATIC_SFX_PROBABILITY
+            and int(window.get("nonmusic_background_rank", 10_000))
+            <= MAX_CINEMATIC_SFX_RANK
+        )
         windows.append(window)
     strong_speech_windows = sum(
         bool(window["strong_speech_active"]) for window in windows
     )
     strong_voice_present = strong_speech_windows >= MIN_STRONG_SPEECH_WINDOWS
+    cinematic_music_windows = sum(
+        bool(window["cinematic_music_active"]) for window in windows
+    )
+    cinematic_sfx_windows = sum(
+        bool(window["cinematic_sfx_active"]) for window in windows
+    )
+    cinematic_mix_present = (
+        cinematic_music_windows >= MIN_CINEMATIC_MUSIC_WINDOWS
+        and cinematic_sfx_windows >= MIN_CINEMATIC_SFX_WINDOWS
+    )
     reasons = list(dict.fromkeys(result.get("rejection_reasons", [])))
     if not strong_voice_present and "insufficient_strong_speech" not in reasons:
         reasons.append("insufficient_strong_speech")
+    if require_cinematic_mix:
+        if (
+            cinematic_music_windows < MIN_CINEMATIC_MUSIC_WINDOWS
+            and "insufficient_cinematic_music" not in reasons
+        ):
+            reasons.append("insufficient_cinematic_music")
+        if (
+            cinematic_sfx_windows < MIN_CINEMATIC_SFX_WINDOWS
+            and "insufficient_cinematic_sfx" not in reasons
+        ):
+            reasons.append("insufficient_cinematic_sfx")
     previous_policy = result.get("policy")
+    policy = CINEMATIC_POLICY_VERSION if require_cinematic_mix else POLICY_VERSION
     result.update(
         {
-            "accepted": bool(result.get("accepted")) and strong_voice_present,
-            "policy": POLICY_VERSION,
+            "accepted": (
+                bool(result.get("accepted"))
+                and strong_voice_present
+                and (not require_cinematic_mix or cinematic_mix_present)
+            ),
+            "policy": policy,
             "rejection_reasons": reasons,
             "strong_speech_active_windows": strong_speech_windows,
             "strong_speech_coverage": round(
                 strong_speech_windows / max(1, len(windows)), 6
             ),
+            "cinematic_music_active_windows": cinematic_music_windows,
+            "cinematic_sfx_active_windows": cinematic_sfx_windows,
+            "cinematic_music_coverage": round(
+                cinematic_music_windows / max(1, len(windows)), 6
+            ),
+            "cinematic_sfx_coverage": round(
+                cinematic_sfx_windows / max(1, len(windows)), 6
+            ),
+            "cinematic_mix_required": require_cinematic_mix,
+            "cinematic_mix_pass": cinematic_mix_present,
             "windows": windows,
         }
     )
-    if previous_policy and previous_policy != POLICY_VERSION:
+    if previous_policy and previous_policy != policy:
         result["policy_migrated_from"] = previous_policy
     return result
 
@@ -395,12 +501,19 @@ def _materialize_audio(
 
 
 def materialize_accepted(args: argparse.Namespace) -> None:
+    require_cinematic_mix = bool(getattr(args, "require_cinematic_mix", False))
     results = [
-        _enforce_current_voice_gate(json.loads(line))
+        _enforce_current_voice_gate(
+            json.loads(line),
+            require_cinematic_mix=require_cinematic_mix,
+        )
         for line in args.results.read_text().splitlines()
         if line.strip()
     ]
     accepted = [item for item in results if item.get("accepted")]
+    accepted_limit = getattr(args, "accepted_limit", None)
+    if accepted_limit:
+        accepted = accepted[:accepted_limit]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     audio_dir = args.output_dir / "audio"
     _materialize_audio(args.input_dir, audio_dir, accepted)
@@ -448,7 +561,11 @@ def materialize_accepted(args: argparse.Namespace) -> None:
         "accepted_record_count": len(records),
         "acceptance_rate": round(len(records) / max(1, len(results)), 6),
         "validator": "nttcslab/m2d AudioSet fine-tuned tagger",
-        "policy": POLICY_VERSION,
+        "policy": (
+            CINEMATIC_POLICY_VERSION
+            if require_cinematic_mix
+            else POLICY_VERSION
+        ),
         "background_bucket_counts": dict(sorted(bucket_counts.items())),
         "rejection_reason_counts": dict(sorted(rejection_counts.items())),
         "balanced_listening_subset": {
@@ -503,6 +620,7 @@ def _parser() -> argparse.ArgumentParser:
     score.add_argument("--glob", default="*.wav")
     score.add_argument("--limit", type=int)
     score.add_argument("--overwrite", action="store_true")
+    score.add_argument("--require-cinematic-mix", action="store_true")
     score.set_defaults(handler=score_directory)
 
     materialize = subparsers.add_parser(
@@ -512,6 +630,8 @@ def _parser() -> argparse.ArgumentParser:
     materialize.add_argument("--results", type=Path, required=True)
     materialize.add_argument("--source-manifest", type=Path, required=True)
     materialize.add_argument("--output-dir", type=Path, required=True)
+    materialize.add_argument("--require-cinematic-mix", action="store_true")
+    materialize.add_argument("--accepted-limit", type=int)
     materialize.set_defaults(handler=materialize_accepted)
     return parser
 

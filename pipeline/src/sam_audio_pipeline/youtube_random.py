@@ -143,6 +143,122 @@ SEARCH_EXCLUSIONS = (
     "-official -lyrics -karaoke -playlist -album -mix -ambience -soundscape"
 )
 
+CINEMATIC_SOURCES = (
+    "movie clip",
+    "movie scene",
+    "film clip",
+    "TV show scene",
+    "TV series clip",
+    "animated movie scene",
+    "animated series clip",
+    "video game cutscene",
+    "game cinematic scene",
+    "short film scene",
+    "news package",
+)
+
+CINEMATIC_SCENES = (
+    "action dialogue",
+    "dramatic conversation",
+    "street dialogue",
+    "restaurant conversation",
+    "car dialogue",
+    "police scene dialogue",
+    "hospital scene dialogue",
+    "battle dialogue",
+    "chase dialogue",
+    "argument scene",
+    "suspense dialogue",
+    "comedy dialogue",
+    "crowd scene dialogue",
+    "workplace dialogue",
+)
+
+CINEMATIC_AUDIO_HINTS = (
+    "English HD",
+    "English 4K",
+    "dialogue HD",
+    "soundtrack scene",
+    "cinematic sound",
+)
+
+CINEMATIC_TITLE_TERMS = (
+    "scene",
+    "movie clip",
+    "film clip",
+    "short film",
+    "cutscene",
+    "cinematic",
+    "tv series",
+    "episode",
+    "news package",
+    "field report",
+)
+
+CINEMATIC_EXCLUDED_TERMS = (
+    *EXCLUDED_TITLE_TERMS,
+    "reaction",
+    "reacts",
+    "review",
+    "compilation",
+    "top 10",
+    "top 20",
+    "analysis",
+    "breakdown",
+    "explained",
+    "recap",
+    "interview",
+    "podcast",
+    "vlog",
+    "walking tour",
+    "walk tour",
+    "tutorial",
+    "how to",
+    "motivational",
+    "speech",
+    "audiobook",
+    "voice over",
+    "voiceover",
+    "text to speech",
+    "ai voice",
+    "fan edit",
+    "re-edit",
+    "dialogue edit",
+    "amv",
+    "full movie",
+    "youtube shorts",
+    "#shorts",
+    "bollywood",
+    "hindi",
+    "tamil",
+    "telugu",
+    "malayalam",
+    "kannada",
+    "bengali",
+    "punjabi",
+    " india ",
+    " indian ",
+    "ary digital",
+    "hum tv",
+    "geo entertainment",
+    "zee tv",
+    "colors tv",
+    "starplus",
+    "sony sab",
+    "learn english",
+    "english lesson",
+    "unit 1",
+    "unit 2",
+    "unit 3",
+    "unit 4",
+    "unit 5",
+)
+
+CINEMATIC_SEARCH_EXCLUSIONS = (
+    "-reaction -review -explained -recap -interview -vlog -tutorial "
+    "-Bollywood -Hindi -Tamil -Telugu -India -Indian -lyrics -AMV"
+)
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -158,22 +274,32 @@ def _run(command: list[str], *, timeout: float) -> subprocess.CompletedProcess[s
     )
 
 
-def build_queries(seed: int, count: int) -> list[str]:
-    """Create reproducible, mix-biased general YouTube search queries."""
+def build_queries(seed: int, count: int, *, profile: str = "general") -> list[str]:
+    """Create reproducible YouTube queries for a general or cinematic mix."""
     generator = random.Random(seed)
     queries: list[str] = []
     seen: set[str] = set()
     while len(queries) < count:
-        query = " ".join(
-            (
-                generator.choice(SCENES),
-                generator.choice(FORMATS),
-                generator.choice(ACTIVITIES),
-                generator.choice(AUDIO_HINTS),
-                str(generator.randint(2018, 2026)),
-                SEARCH_EXCLUSIONS,
+        if profile == "cinematic":
+            query = " ".join(
+                (
+                    generator.choice(CINEMATIC_SOURCES),
+                    generator.choice(CINEMATIC_SCENES),
+                    generator.choice(CINEMATIC_AUDIO_HINTS),
+                    CINEMATIC_SEARCH_EXCLUSIONS,
+                )
             )
-        )
+        else:
+            query = " ".join(
+                (
+                    generator.choice(SCENES),
+                    generator.choice(FORMATS),
+                    generator.choice(ACTIVITIES),
+                    generator.choice(AUDIO_HINTS),
+                    str(generator.randint(2018, 2026)),
+                    SEARCH_EXCLUSIONS,
+                )
+            )
         if query in seen:
             continue
         seen.add(query)
@@ -181,18 +307,27 @@ def build_queries(seed: int, count: int) -> list[str]:
     return queries
 
 
-def _candidate_allowed(item: dict[str, Any]) -> bool:
+def _candidate_allowed(item: dict[str, Any], *, profile: str = "general") -> bool:
     duration = float(item.get("duration") or 0.0)
-    title = str(item.get("title") or "").lower()
+    title = f" {str(item.get('title') or '').lower()} "
+    uploader = f" {str(item.get('uploader') or item.get('channel') or '').lower()} "
+    text = title + uploader
+    excluded = (
+        CINEMATIC_EXCLUDED_TERMS if profile == "cinematic" else EXCLUDED_TITLE_TERMS
+    )
     return (
         bool(item.get("id"))
         and 30.0 <= duration <= 3600.0
         and item.get("live_status") not in {"is_live", "is_upcoming"}
-        and not any(term in title for term in EXCLUDED_TITLE_TERMS)
+        and not any(term in text for term in excluded)
+        and (
+            profile != "cinematic"
+            or any(term in title for term in CINEMATIC_TITLE_TERMS)
+        )
     )
 
 
-def _search(query: str, results: int) -> list[dict[str, Any]]:
+def _search(query: str, results: int, profile: str) -> list[dict[str, Any]]:
     response = _run(
         [
             sys.executable,
@@ -208,7 +343,34 @@ def _search(query: str, results: int) -> list[dict[str, Any]]:
         timeout=75,
     )
     payload = json.loads(response.stdout)
-    return [item for item in payload.get("entries", []) if _candidate_allowed(item)]
+    return [
+        item
+        for item in payload.get("entries", [])
+        if _candidate_allowed(item, profile=profile)
+    ]
+
+
+def _sample_clip_starts(
+    *, seed: int, video_id: str, duration: float, clips_per_video: int
+) -> list[float]:
+    """Pick deterministic, non-overlapping ten-second excerpts from one source."""
+    lower = 5.0
+    upper = duration - CLIP_SECONDS - 5.0
+    if upper <= lower:
+        return []
+    maximum = max(1, math.floor((upper - lower) / (CLIP_SECONDS + 2.0)) + 1)
+    wanted = min(clips_per_video, maximum)
+    generator = random.Random(f"{seed}:{video_id}")
+    starts: list[float] = []
+    for _ in range(200):
+        if len(starts) >= wanted:
+            break
+        candidate = generator.uniform(lower, upper)
+        if all(abs(candidate - existing) >= CLIP_SECONDS + 2.0 for existing in starts):
+            starts.append(candidate)
+    if not starts:
+        starts.append(generator.uniform(lower, upper))
+    return sorted(starts)
 
 
 def discover_candidates(
@@ -219,22 +381,31 @@ def discover_candidates(
     results_per_query: int,
     workers: int,
     minimum_candidates: int,
+    profile: str = "general",
+    clips_per_video: int = 1,
 ) -> list[dict[str, Any]]:
     metadata_dir = output_dir / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     candidates_path = metadata_dir / "candidates.json"
-    if candidates_path.exists():
+    search_path = metadata_dir / "search.json"
+    if candidates_path.exists() and search_path.exists():
         existing = json.loads(candidates_path.read_text())
-        if len(existing) >= minimum_candidates:
+        search_metadata = json.loads(search_path.read_text())
+        compatible = (
+            search_metadata.get("profile", "general") == profile
+            and int(search_metadata.get("clips_per_video", 1)) == clips_per_video
+        )
+        if compatible and len(existing) >= minimum_candidates:
             logger.info("Reusing %d discovered candidates", len(existing))
             return existing
 
-    queries = build_queries(seed, query_count)
+    queries = build_queries(seed, query_count, profile=profile)
     found: dict[str, dict[str, Any]] = {}
+    found_videos: set[str] = set()
     failures: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         pending = {
-            executor.submit(_search, query, results_per_query): query
+            executor.submit(_search, query, results_per_query, profile): query
             for query in queries
         }
         for index, future in enumerate(as_completed(pending), start=1):
@@ -248,29 +419,42 @@ def discover_candidates(
                 continue
             for item in items:
                 video_id = str(item["id"])
-                if video_id in found:
+                if video_id in found_videos:
                     continue
+                found_videos.add(video_id)
                 duration = float(item["duration"])
-                cut_generator = random.Random(f"{seed}:{video_id}")
-                start = cut_generator.uniform(5.0, duration - CLIP_SECONDS - 5.0)
-                found[video_id] = {
-                    "video_id": video_id,
-                    "source_url": f"https://www.youtube.com/watch?v={video_id}",
-                    "title": item.get("title"),
-                    "duration_seconds": duration,
-                    "uploader": item.get("uploader") or item.get("channel"),
-                    "channel_id": item.get("channel_id"),
-                    "view_count": item.get("view_count"),
-                    "search_query": query,
-                    "clip_start_seconds": round(start, 3),
-                    "clip_end_seconds": round(start + CLIP_SECONDS, 3),
-                    "selection": "seeded_general_youtube_search",
-                    "selection_seed": seed,
-                    "mixture_bias": ["voice", "music", "environmental_sfx"],
-                    "source_audio_rights": (
-                        "Underlying media remains subject to its source terms."
-                    ),
-                }
+                starts = _sample_clip_starts(
+                    seed=seed,
+                    video_id=video_id,
+                    duration=duration,
+                    clips_per_video=clips_per_video,
+                )
+                for segment_index, start in enumerate(starts):
+                    candidate_id = f"{video_id}:{round(start * 1000)}"
+                    found[candidate_id] = {
+                        "candidate_id": candidate_id,
+                        "video_id": video_id,
+                        "source_url": f"https://www.youtube.com/watch?v={video_id}",
+                        "title": item.get("title"),
+                        "duration_seconds": duration,
+                        "uploader": item.get("uploader") or item.get("channel"),
+                        "channel_id": item.get("channel_id"),
+                        "view_count": item.get("view_count"),
+                        "search_query": query,
+                        "clip_start_seconds": round(start, 3),
+                        "clip_end_seconds": round(start + CLIP_SECONDS, 3),
+                        "segment_index": segment_index,
+                        "selection": f"seeded_{profile}_youtube_search",
+                        "selection_seed": seed,
+                        "mixture_bias": [
+                            "dialogue",
+                            "music",
+                            "environmental_sfx",
+                        ],
+                        "source_audio_rights": (
+                            "Underlying media remains subject to its source terms."
+                        ),
+                    }
             if index % 25 == 0:
                 logger.info(
                     "Searches %d/%d; %d unique candidates",
@@ -281,10 +465,12 @@ def discover_candidates(
     candidates = list(found.values())
     random.Random(seed).shuffle(candidates)
     candidates_path.write_text(json.dumps(candidates, indent=2) + "\n")
-    (metadata_dir / "search.json").write_text(
+    search_path.write_text(
         json.dumps(
             {
-                "selection": "seeded_general_youtube_search",
+                "selection": f"seeded_{profile}_youtube_search",
+                "profile": profile,
+                "clips_per_video": clips_per_video,
                 "seed": seed,
                 "queries": queries,
                 "results_per_query": results_per_query,
@@ -587,6 +773,13 @@ def acquire_candidate(
     return result
 
 
+def _candidate_key(item: dict[str, Any]) -> str:
+    return str(
+        item.get("candidate_id")
+        or f"{item['video_id']}:{round(float(item['clip_start_seconds']) * 1000)}"
+    )
+
+
 def _load_attempts(
     path: Path, output_dir: Path
 ) -> tuple[list[dict[str, Any]], set[str]]:
@@ -603,7 +796,7 @@ def _load_attempts(
         ).exists():
             continue
         attempts.append(item)
-        attempted.add(str(item["video_id"]))
+        attempted.add(_candidate_key(item))
     return attempts, attempted
 
 
@@ -611,7 +804,7 @@ def _accepted(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [item for item in attempts if item.get("retrieval_status") == "success"]
 
 
-def _criteria() -> dict[str, Any]:
+def _criteria(*, profile: str = "general", clips_per_video: int = 1) -> dict[str, Any]:
     return {
         "clip_seconds": CLIP_SECONDS,
         "output": "stereo PCM16 WAV at 48 kHz",
@@ -624,8 +817,12 @@ def _criteria() -> dict[str, Any]:
         "maximum_silent_run_seconds": MAX_SILENT_RUN_SECONDS,
         "minimum_side_to_total_db": MIN_SIDE_TO_TOTAL_DB,
         "maximum_clipped_fraction": MAX_CLIPPED_FRACTION,
-        "one_clip_per_unique_video": True,
-        "candidate_source": "general YouTube search; no AudioSet metadata",
+        "maximum_clips_per_video": clips_per_video,
+        "candidate_source": f"{profile} YouTube search; no AudioSet metadata",
+        "source_profile": profile,
+        "explicit_metadata_exclusions": (
+            list(CINEMATIC_EXCLUDED_TERMS) if profile == "cinematic" else []
+        ),
     }
 
 
@@ -635,6 +832,8 @@ def write_manifest(
     *,
     target: int,
     seed: int,
+    profile: str = "general",
+    clips_per_video: int = 1,
 ) -> Path:
     records = _accepted(attempts)[:target]
     for index, record in enumerate(records):
@@ -645,14 +844,16 @@ def write_manifest(
         status_counts[status] = status_counts.get(status, 0) + 1
     manifest = {
         "schema_version": 1,
-        "name": f"General YouTube random {target} · seed {seed}",
+        "name": f"{profile.title()} YouTube {target} · seed {seed}",
         "created_at": _now(),
         "target_records": target,
         "accepted_records": len(records),
         "selection_seed": seed,
-        "selection": "seeded_general_youtube_search",
-        "mixture_preference": ["voice", "music", "environmental_sfx"],
-        "acceptance_criteria": _criteria(),
+        "selection": f"seeded_{profile}_youtube_search",
+        "mixture_preference": ["dialogue", "music", "environmental_sfx"],
+        "acceptance_criteria": _criteria(
+            profile=profile, clips_per_video=clips_per_video
+        ),
         "attempt_statuses": status_counts,
         "records": records,
     }
@@ -669,7 +870,10 @@ def verify_dataset(output_dir: Path, *, target: int) -> dict[str, Any]:
     manifest = json.loads((output_dir / "manifest.json").read_text())
     records = manifest.get("records", [])
     failures: list[dict[str, Any]] = []
-    video_ids: set[str] = set()
+    video_counts: dict[str, int] = {}
+    clip_ids: set[str] = set()
+    criteria = manifest.get("acceptance_criteria", {})
+    clips_per_video = int(criteria.get("maximum_clips_per_video", 1))
     total_bytes = 0
     for record in records:
         path = output_dir / str(record["local_path"])
@@ -683,23 +887,28 @@ def verify_dataset(output_dir: Path, *, target: int) -> dict[str, Any]:
                 reasons.append("sha256")
             total_bytes += path.stat().st_size
         video_id = str(record["video_id"])
-        if video_id in video_ids:
-            reasons.append("duplicate_video")
-        video_ids.add(video_id)
+        clip_id = _candidate_key(record)
+        if clip_id in clip_ids:
+            reasons.append("duplicate_clip")
+        clip_ids.add(clip_id)
+        video_counts[video_id] = video_counts.get(video_id, 0) + 1
+        if video_counts[video_id] > clips_per_video:
+            reasons.append("too_many_clips_from_video")
         if reasons:
             failures.append({"video_id": video_id, "reasons": reasons})
     audit = {
         "verified_at": _now(),
         "target_records": target,
         "record_count": len(records),
-        "unique_video_count": len(video_ids),
+        "unique_video_count": len(video_counts),
+        "unique_clip_count": len(clip_ids),
         "total_duration_seconds": len(records) * CLIP_SECONDS,
         "total_bytes": total_bytes,
         "all_requirements_pass": (
-            len(records) == target and len(video_ids) == target and not failures
+            len(records) == target and len(clip_ids) == target and not failures
         ),
         "failures": failures,
-        "acceptance_criteria": _criteria(),
+        "acceptance_criteria": criteria,
     }
     (output_dir / "audit.json").write_text(json.dumps(audit, indent=2) + "\n")
     return audit
@@ -717,6 +926,8 @@ def acquire_dataset(
     candidate_multiplier: float,
     max_attempts: int,
     youtube_client: str,
+    profile: str = "general",
+    clips_per_video: int = 1,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     candidates = discover_candidates(
@@ -726,11 +937,17 @@ def acquire_dataset(
         results_per_query=results_per_query,
         workers=search_workers,
         minimum_candidates=math.ceil(total * candidate_multiplier),
+        profile=profile,
+        clips_per_video=clips_per_video,
     )
     attempts_path = output_dir / "attempts.jsonl"
     attempts, attempted = _load_attempts(attempts_path, output_dir)
     accepted_count = len(_accepted(attempts))
-    pending = [item for item in candidates if item["video_id"] not in attempted]
+    pending = [
+        item
+        for item in candidates
+        if _candidate_key(item) not in attempted
+    ]
     logger.info(
         "Starting with %d/%d accepted; %d candidates remain",
         accepted_count,
@@ -765,14 +982,28 @@ def acquire_dataset(
                     attempts.append(result)
                     attempt_log.write(json.dumps(result) + "\n")
                     attempt_log.flush()
-                write_manifest(output_dir, attempts, target=total, seed=seed)
+                write_manifest(
+                    output_dir,
+                    attempts,
+                    target=total,
+                    seed=seed,
+                    profile=profile,
+                    clips_per_video=clips_per_video,
+                )
                 logger.info(
                     "Accepted %d/%d after %d new attempts",
                     accepted_count,
                     total,
                     attempts_made,
                 )
-    manifest = write_manifest(output_dir, attempts, target=total, seed=seed)
+    manifest = write_manifest(
+        output_dir,
+        attempts,
+        target=total,
+        seed=seed,
+        profile=profile,
+        clips_per_video=clips_per_video,
+    )
     if accepted_count < total:
         raise RuntimeError(
             f"Only acquired {accepted_count}/{total} clips after "
@@ -796,6 +1027,14 @@ def main() -> None:
     parser.add_argument("--candidate-multiplier", type=float, default=3.0)
     parser.add_argument("--max-attempts", type=int)
     parser.add_argument(
+        "--profile", choices=("general", "cinematic"), default="general"
+    )
+    parser.add_argument(
+        "--clips-per-video",
+        type=int,
+        help="Defaults to 3 for cinematic and 1 for general acquisition",
+    )
+    parser.add_argument(
         "--youtube-client",
         choices=("auto", "default", "android"),
         default="auto",
@@ -808,6 +1047,11 @@ def main() -> None:
     )
     if args.total < 1:
         parser.error("--total must be positive")
+    clips_per_video = args.clips_per_video or (
+        3 if args.profile == "cinematic" else 1
+    )
+    if clips_per_video < 1:
+        parser.error("--clips-per-video must be positive")
     if args.verify_only:
         result = verify_dataset(args.output, target=args.total)
         print(json.dumps(result, indent=2))
@@ -827,6 +1071,8 @@ def main() -> None:
         candidate_multiplier=args.candidate_multiplier,
         max_attempts=max_attempts,
         youtube_client=args.youtube_client,
+        profile=args.profile,
+        clips_per_video=clips_per_video,
     )
     print(path)
 
