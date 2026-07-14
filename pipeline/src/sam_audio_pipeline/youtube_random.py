@@ -306,6 +306,27 @@ CINEMATIC_EXCLUDED_TERMS = (
     "unit 5",
 )
 
+CINEMATIC_PRIORITY_WEIGHTS = (
+    ("cutscene", 8),
+    ("movie clip", 8),
+    ("movie scene", 7),
+    ("cinematic", 6),
+    ("full episode", 5),
+    ("short film", 5),
+    ("animated", 4),
+    ("battle scene", 4),
+    ("dialogue", 4),
+    ("fight scene", 4),
+    ("episode", 3),
+    ("chase", 3),
+    ("english", 3),
+    ("4k", 1),
+    (" hd", 1),
+    ("amazing", -2),
+    ("best scene", -3),
+    ("funny clips", -3),
+)
+
 CINEMATIC_SEARCH_EXCLUSIONS = (
     "-reaction -review -explained -recap -interview -vlog -tutorial "
     "-Bollywood -Hindi -Tamil -Telugu -India -Indian -lyrics -AMV"
@@ -392,6 +413,12 @@ def _candidate_allowed(item: dict[str, Any], *, profile: str = "general") -> boo
             or any(term in title for term in CINEMATIC_TITLE_TERMS)
         )
     )
+
+
+def _cinematic_candidate_priority(item: dict[str, Any]) -> int:
+    """Rank explicit cinematic source markers without inspecting the speaker."""
+    title = f" {str(item.get('title') or '').lower()} "
+    return sum(weight for term, weight in CINEMATIC_PRIORITY_WEIGHTS if term in title)
 
 
 def _search_youtube(
@@ -1320,6 +1347,10 @@ def acquire_dataset(
         pending,
         grouped=(source == "dailymotion" and clips_per_video > 1),
     )
+    if profile == "cinematic":
+        work_groups.sort(
+            key=lambda group: _cinematic_candidate_priority(group[0]), reverse=True
+        )
     limited_groups: list[list[dict[str, Any]]] = []
     remaining_attempt_capacity = max_attempts
     for group in work_groups:

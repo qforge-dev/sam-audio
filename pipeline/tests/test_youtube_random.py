@@ -9,6 +9,7 @@ import numpy as np
 
 from sam_audio_pipeline.youtube_random import (
     _candidate_allowed,
+    _cinematic_candidate_priority,
     _group_candidates_by_video,
     _query_for_source,
     _sample_clip_starts,
@@ -144,6 +145,16 @@ def test_cinematic_segment_sampling_is_reproducible_and_non_overlapping() -> Non
     assert all(
         right - left >= 12 for left, right in zip(first, first[1:], strict=False)
     )
+
+
+def test_explicit_cinematic_titles_are_prioritized_over_generic_clips() -> None:
+    cinematic = {
+        "title": "English Animated Movie Clip Battle Scene 4K HD",
+    }
+    generic = {"title": "Amazing Best Scene Funny Clips"}
+
+    assert _cinematic_candidate_priority(cinematic) > 0
+    assert _cinematic_candidate_priority(generic) < 0
 
 
 def test_long_cinematic_sources_can_supply_many_distinct_excerpts() -> None:
