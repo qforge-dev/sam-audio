@@ -23,6 +23,7 @@ from sam_audio_pipeline.m2d_validator import (
 def test_runtime_asr_concurrency_is_bounded_and_failure_safe(tmp_path: Path) -> None:
     control = tmp_path / "autoscale-control.json"
 
+    assert _runtime_asr_concurrency(None, 2) == 2
     assert _runtime_asr_concurrency(control, 2) == 1
     control.write_text(json.dumps({"asr_concurrency": 2}))
     assert _runtime_asr_concurrency(control, 2) == 2

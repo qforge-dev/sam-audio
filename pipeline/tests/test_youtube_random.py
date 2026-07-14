@@ -9,15 +9,22 @@ import numpy as np
 
 from sam_audio_pipeline.youtube_random import (
     CANDIDATE_DURATION_POLICY,
+    DAILYMOTION_SEARCH_POLICY,
     MAX_SOURCE_DURATION_SECONDS,
     _accepted,
     _candidate_allowed,
     _cinematic_candidate_priority,
+    _dailymotion_search_page,
     _group_candidates_by_video,
+    _load_source_scan_priors,
+    _order_scanned_source_groups,
     _query_for_source,
+    _remaining_scan_source_budget,
     _runtime_worker_limit,
     _sample_clip_starts,
+    _scan_group_has_remaining_work,
     _use_full_source_for_group,
+    acquire_scanned_source_group,
     analyze_wav,
     build_queries,
     discover_candidates,
@@ -54,6 +61,163 @@ def test_runtime_download_limit_is_bounded_and_failure_safe(tmp_path: Path) -> N
     assert _runtime_worker_limit(control, maximum=8, default=6) == 6
 
 
+def test_source_level_failure_marks_every_group_candidate_attempted(
+    tmp_path: Path,
+) -> None:
+    candidates = [
+        {
+            "candidate_id": f"video:{index}",
+            "video_id": "video",
+            "source_clip_budget": 2,
+        }
+        for index in range(2)
+    ]
+
+    results = acquire_scanned_source_group(
+        candidates,
+        tmp_path,
+        scanner=None,
+        cache_dir=tmp_path / "cache",
+        guidance={"video": {"accepted": 2}},
+    )
+
+    assert [item["candidate_id"] for item in results] == ["video:0", "video:1"]
+    assert all(
+        item["retrieval_status"] == "source_budget_exhausted" for item in results
+    )
+
+
+def test_scan_budget_does_not_double_count_accepted_claims() -> None:
+    remaining = _remaining_scan_source_budget(
+        16,
+        accepted_count=5,
+        accepted_starts=[0.0, 30.0, 60.0, 90.0, 120.0],
+        claimed_starts=[0.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0],
+    )
+
+    assert remaining == 9
+
+
+def test_exhausted_cached_scan_group_is_removed_before_scheduling(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    group = [
+        {
+            "video_id": "scene",
+            "source_platform": "dailymotion",
+            "source_clip_budget": 16,
+        }
+    ]
+    (cache / "dailymotion-scene.json").write_text(
+        json.dumps(
+            {
+                "policy": "whole_source_proxy_m2d_v1",
+                "clip_seconds": 10.0,
+                "claimed_starts": [30.0],
+                "regions": [{"start_seconds": 30.0}],
+            }
+        )
+    )
+
+    assert not _scan_group_has_remaining_work(
+        group, cache_dir=cache, guidance={}
+    )
+    assert _scan_group_has_remaining_work(
+        group,
+        cache_dir=cache,
+        guidance={"scene": {"attempted_starts": [], "accepted_starts": []}},
+    ) is False
+
+
+def test_unseen_scan_group_is_kept_for_exploration(tmp_path: Path) -> None:
+    group = [
+        {
+            "video_id": "new-scene",
+            "source_platform": "dailymotion",
+            "source_clip_budget": 16,
+        }
+    ]
+
+    assert _scan_group_has_remaining_work(
+        group, cache_dir=tmp_path, guidance={}
+    )
+
+
+def test_scanned_source_order_learns_productive_uploaders(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    candidates = [
+        {
+            "video_id": "known-good",
+            "uploader": "productive",
+            "search_query": "good query",
+            "duration_seconds": 120,
+        },
+        {
+            "video_id": "known-bad",
+            "uploader": "unproductive",
+            "search_query": "bad query",
+            "duration_seconds": 120,
+        },
+    ]
+    (cache / "good.json").write_text(
+        json.dumps({"video_id": "known-good", "regions": [{}] * 8})
+    )
+    (cache / "bad.json").write_text(
+        json.dumps({"video_id": "known-bad", "regions": []})
+    )
+    priors = _load_source_scan_priors(cache, candidates)
+    groups = [
+        [
+            {
+                "video_id": "new-bad",
+                "uploader": "unproductive",
+                "search_query": "bad query",
+                "duration_seconds": 120,
+            }
+        ],
+        [
+            {
+                "video_id": "new-good",
+                "uploader": "productive",
+                "search_query": "good query",
+                "duration_seconds": 120,
+            }
+        ],
+    ]
+
+    ordered = _order_scanned_source_groups(groups, {}, scan_priors=priors)
+
+    assert ordered[0][0]["video_id"] == "new-good"
+
+
+def test_source_order_optimizes_final_yield_not_only_m2d_regions() -> None:
+    groups = [
+        [{"video_id": "foreign", "uploader": "foreign", "duration_seconds": 120}],
+        [{"video_id": "english", "uploader": "english", "duration_seconds": 120}],
+    ]
+    scan_priors = {
+        "uploader": {"foreign": 10.0, "english": 4.0},
+        "query": {},
+    }
+    content_priors = {
+        "uploader": {"foreign": 0.1, "english": 0.9},
+        "query": {},
+        "global": {"acceptance": 0.5},
+    }
+
+    ordered = _order_scanned_source_groups(
+        groups,
+        {},
+        scan_priors=scan_priors,
+        content_priors=content_priors,
+    )
+
+    assert ordered[0][0]["video_id"] == "english"
+
+
 def test_queries_are_reproducible_mix_biased_and_not_audioset() -> None:
     first = build_queries(17, 20)
     second = build_queries(17, 20)
@@ -66,6 +230,18 @@ def test_queries_are_reproducible_mix_biased_and_not_audioset() -> None:
         any(word in query for word in ("music", "soundtrack", "score"))
         for query in first
     )
+
+
+def test_dailymotion_search_pages_are_reproducible_and_seeded() -> None:
+    queries = build_queries(17, 20, profile="cinematic")
+    first = [_dailymotion_search_page(17, query) for query in queries]
+    second = [_dailymotion_search_page(17, query) for query in queries]
+    another_seed = [_dailymotion_search_page(18, query) for query in queries]
+
+    assert first == second
+    assert all(1 <= page <= 6 for page in first)
+    assert len(set(first)) >= 4
+    assert first != another_seed
 
 
 def test_cinematic_queries_and_metadata_filter_target_raw_scenes() -> None:
@@ -265,6 +441,7 @@ def test_cached_candidates_are_refiltered_under_current_metadata_policy(
                 "clips_per_video": 48,
                 "source": "dailymotion",
                 "candidate_duration_policy": CANDIDATE_DURATION_POLICY,
+                "search_page_policy": DAILYMOTION_SEARCH_POLICY,
             }
         )
     )

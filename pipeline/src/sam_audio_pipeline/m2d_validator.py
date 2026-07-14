@@ -630,7 +630,7 @@ class _M2DAllowlistTail:
 
 def _runtime_asr_concurrency(path: Path | None, maximum: int) -> int:
     if not path:
-        return 1
+        return max(1, maximum)
     try:
         payload = json.loads(path.read_text())
         value = payload.get("asr_concurrency")

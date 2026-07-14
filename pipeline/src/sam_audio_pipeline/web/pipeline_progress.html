@@ -44,6 +44,9 @@
     .pipeline span { padding:6px 9px; border-radius:8px; background:var(--panel2); border:1px solid var(--line); color:#bdcad5; }
     .flow-note { margin:-4px 0 16px; padding:13px 16px; border:1px solid var(--line); border-radius:11px; background:var(--panel2); color:var(--muted); }
     .flow-note.balanced { border-color:rgba(86,212,145,.35); color:#bcebd2; }
+    .flow-note.healthy { border-color:rgba(86,212,145,.35); color:#bcebd2; }
+    .flow-note.warming_up { border-color:rgba(103,183,255,.4); color:#b9ddff; }
+    .flow-note.healthy_low_yield { border-color:rgba(247,199,93,.4); color:#f7dda2; }
     .flow-note.constrained { border-color:rgba(247,199,93,.4); color:#f7dda2; }
     .flow-note.stalled { border-color:rgba(255,139,139,.45); color:#ffb5b5; }
     .error { color:#ff8b8b; white-space:pre-wrap; }
@@ -74,12 +77,15 @@
     <div class="section-head" id="flowHeading" hidden><div><h2>Pipeline flow</h2><p>Gross source processing versus final accepted output over the same rolling window.</p></div></div>
     <section class="funnel" id="flow" hidden></section>
     <p class="flow-note" id="flowNote" hidden></p>
+    <div class="section-head" id="strategyHeading" hidden><div><h2>Scan-before-extract experiment</h2><p>Only the post-deployment cohort is used here, so the old random sampler cannot hide the result.</p></div></div>
+    <section class="funnel" id="strategy" hidden></section>
+    <section class="funnel" id="sourceScans" hidden></section>
     <section class="funnel" id="funnel"></section>
     <section class="funnel" id="queues"></section>
     <div class="section-head" id="autoscalerHeading" hidden><div><h2>Adaptive worker control</h2><p>Queue pressure and aggregate host resources determine live concurrency limits.</p></div></div>
     <section class="funnel" id="autoscaler" hidden></section>
-    <div class="section-head" id="throughputHeading" hidden><div><h2>Rolling throughput</h2><p>Audio duration processed per wall-clock minute; use queue growth to locate bottlenecks.</p></div></div>
-    <div class="table-wrap" id="throughputWrap" hidden><table><thead><tr><th>Stage</th><th>Clips in window</th><th>Clips/min</th><th>Audio min/min</th><th>Equivalent audio hours/hour</th></tr></thead><tbody id="throughput"></tbody></table></div>
+    <div class="section-head" id="throughputHeading" hidden><div><h2>Rolling throughput</h2><p>Use 5 minutes for immediate movement, 15 for tuning, and 60 for the stable trend.</p></div></div>
+    <div class="table-wrap" id="throughputWrap" hidden><table><thead><tr><th>Window / stage</th><th>Clips</th><th>Clips/min</th><th>Audio min/min</th><th>Audio hours/hour</th></tr></thead><tbody id="throughput"></tbody></table></div>
     <div class="section-head" id="batchHeading"><div><h2>Acquisition batches</h2><p>Counts update every five seconds.</p></div></div>
     <div class="table-wrap"><table><thead><tr><th>Batch</th><th>Status</th><th>Attempts</th><th>Downloaded</th><th>M2D scored</th><th>M2D pass</th><th>Speech scored</th><th>Speech pass</th><th>Combined</th></tr></thead><tbody id="batches"></tbody></table></div>
     <div class="section-head" id="workerHeading" hidden><div><h2>Independent workers</h2><p>Each producer and consumer advances at its own rate.</p></div></div>
@@ -141,7 +147,7 @@
           $('flowHeading').hidden = false;
           $('flow').hidden = false;
           $('flow').innerHTML = [
-            ['Flow health', label(flowState), 'Balanced means no unhealthy worker or unconsumed queue'],
+            ['Flow state', label(flowState), 'Health and yield are reported separately from raw queue movement'],
             ['Source processed', `${Number(flow.processed_audio_hours_per_wall_hour || 0).toFixed(2)} h/h`, 'Hours of source audio processed per wall-clock hour'],
             ['Accepted output', `${Number(flow.accepted_audio_hours_per_wall_hour || 0).toFixed(2)} h/h`, 'Hours surviving every gate per wall-clock hour'],
             ['Rolling yield', `${Number(flow.rolling_yield_percent || 0).toFixed(2)}%`, `Accepted output ÷ processed input over ${number(flow.window_minutes)} minutes`]
@@ -149,11 +155,44 @@
           $('flowNote').hidden = false;
           $('flowNote').className = `flow-note ${flowState}`;
           $('flowNote').textContent = `${Number(flow.processed_audio_hours_per_wall_hour || 0).toFixed(2)} hours of source audio are being processed per wall-clock hour and ${Number(flow.accepted_audio_hours_per_wall_hour || 0).toFixed(2)} hours are being accepted. ${flow.explanation || ''}`;
+          const strategy = data.strategy;
+          if (strategy) {
+            const cohort = strategy.cohort || {};
+            const baseline = strategy.baseline || {};
+            const scans = strategy.source_scans || {};
+            const scan5 = (scans.recent_windows || {})['5'] || {};
+            const tuning = strategy.latest_tuning || strategy.concurrency_tuning || null;
+            const multiplier = strategy.accepted_rate_multiplier == null ? 'warming up' : `${Number(strategy.accepted_rate_multiplier).toFixed(2)}×`;
+            $('strategyHeading').hidden = false;
+            $('strategy').hidden = false;
+            const strategyCards = [
+              ['Cohort age', `${Number(cohort.observed_minutes || 0).toFixed(1)} min`, `${number(cohort.proxy_selected)} of ${number(cohort.downloaded)} downloads came from proxy-selected regions`],
+              ['M2D precision', `${Number(cohort.m2d_pass_percent || 0).toFixed(1)}%`, `${number(cohort.m2d_accepted)} / ${number(cohort.m2d_scored)} scored clips passed`],
+              ['Final cohort yield', `${Number(cohort.final_yield_percent || 0).toFixed(1)}%`, `${number(cohort.accepted)} / ${number(cohort.downloaded)} downloads reached the dataset`],
+              ['Accepted-rate change', multiplier, `${Number(baseline.accepted_audio_hours_per_hour || 0).toFixed(2)} before → ${Number(cohort.accepted_audio_hours_per_hour || 0).toFixed(2)} audio h/h now`]
+            ];
+            if (tuning) {
+              const tuningCohort = tuning.cohort || {};
+              const tuningMultiplier = tuning.accepted_rate_multiplier == null ? 'warming up' : `${Number(tuning.accepted_rate_multiplier).toFixed(2)}×`;
+              const activeText = tuning.current_download_concurrency ? `${number(tuning.current_download_concurrency)} active · ` : '';
+              strategyCards.push([tuning.label || '8→16 worker tuning', tuningMultiplier, `${activeText}${Number(tuning.baseline_accepted_audio_hours_per_hour || 0).toFixed(2)} before → ${Number(tuningCohort.accepted_audio_hours_per_hour || 0).toFixed(2)} audio h/h over ${Number(tuningCohort.observed_minutes || 0).toFixed(1)} min`]);
+            }
+            $('strategy').innerHTML = strategyCards.map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
+            $('sourceScans').hidden = false;
+            $('sourceScans').innerHTML = [
+              ['Sources scanned', number(scans.scanned_sources), `${Number(scan5.sources_per_minute || 0).toFixed(1)}/min over the last 5 min · low-bandwidth stereo 16 kHz proxy timelines`],
+              ['Sources with matches', `${number(scans.passing_sources)} · ${Number(scans.source_match_percent || 0).toFixed(1)}%`, `${Number(scan5.matching_sources_per_minute || 0).toFixed(1)} matching sources/min now · ${number(scans.no_match_sources)} no-match · ${number(scans.quality_rejected_sources)} source-quality rejects`],
+              ['Passing regions found', number(scans.passing_regions), `${number(scans.claimed_regions)} claimed (${Number(scans.region_claim_percent || 0).toFixed(1)}%)`],
+              ['Scan phase time', `${Number(scans.model_scan_seconds || 0).toFixed(1)} s`, `${Number(scans.source_download_seconds || 0).toFixed(1)} s transfer + ${Number(scans.proxy_decode_seconds || 0).toFixed(1)} s proxy decode across ${number(scans.timed_sources)} newly timed sources`]
+            ].map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
+          } else {
+            $('strategyHeading').hidden = true; $('strategy').hidden = true; $('sourceScans').hidden = true;
+          }
           const metrics = [
-            ['downloaded','Downloaded','Passed stereo/source quality'], ['m2d_scored','M2D scored','Voice + music + SFX model'],
-            ['m2d_accepted','M2D pass','Includes non-vocal music'], ['asr_scored','Speech scored','Foreground speech decoded'],
-            ['asr_accepted','Speech pass','Confident English dialogue'], ['accepted','Accepted','All automated gates passed'],
-            ['rejected_total','Rejected','Failed M2D, ASR, dedupe, or source diversity'], ['snapshots','Snapshots','Immutable S3 releases']
+            ['downloaded','Lifetime downloaded','Passed stereo/source quality'],
+            ['m2d_accepted','Lifetime M2D pass','Dialogue + instrumental music + SFX'],
+            ['asr_accepted','Lifetime speech pass','Confident English foreground dialogue'],
+            ['accepted','Lifetime accepted','All automated gates and diversity checks']
           ];
           $('funnel').innerHTML = metrics.map(([key,title,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${number(data.counts[key])}</strong><small>${help}</small></div>`).join('');
           const queueMetrics = [
@@ -174,7 +213,7 @@
             $('autoscaler').hidden = false;
             $('autoscaler').innerHTML = [
               ['Bottleneck', label(autoscaler.bottleneck), `Decision: ${(autoscaler.decision || ['hold']).map(label).join(', ')}`],
-              ['Aggregate CPU', `${Number(autoscaler.cpu_percent || 0).toFixed(1)}%`, 'Across all CPU cores, not one process/core'],
+              ['Aggregate CPU', `${Number(autoscaler.cpu_smoothed_percent ?? autoscaler.cpu_percent ?? 0).toFixed(1)}%`, `Smoothed for scaling; current sample ${Number(autoscaler.cpu_percent || 0).toFixed(1)}% across all cores`],
               ['Acquisition limit', `${number(limits.download_concurrency)} / ${number(downloadBounds[1])}`, `Autoscaling range ${number(downloadBounds[0])}–${number(downloadBounds[1])}`],
               ['ASR inference slots', `${number(limits.asr_concurrency)} / ${number(asrBounds[1])}`, `${gpuText} · range ${number(asrBounds[0])}–${number(asrBounds[1])}`]
             ].map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
@@ -183,7 +222,8 @@
             $('autoscaler').hidden = true;
           }
           $('throughputHeading').hidden = false; $('throughputWrap').hidden = false;
-          $('throughput').innerHTML = Object.entries(data.throughput).map(([stage,rate]) => `<tr><td><strong>${label(stage)}</strong><br><small class="muted">${Number(rate.observed_minutes).toFixed(1)} of ${number(rate.rolling_window_minutes)} min observed</small></td><td>${number(rate.clips)}</td><td>${Number(rate.clips_per_minute).toFixed(2)}</td><td>${Number(rate.audio_minutes_per_minute).toFixed(2)}</td><td>${Number(rate.audio_hours_per_hour).toFixed(2)}</td></tr>`).join('');
+          const windows = data.throughput_windows || {'60': data.throughput};
+          $('throughput').innerHTML = Object.entries(windows).flatMap(([window,rates]) => Object.entries(rates).map(([stage,rate]) => `<tr><td><strong>${window} min · ${label(stage)}</strong><br><small class="muted">${Number(rate.observed_minutes).toFixed(1)} min observed</small></td><td>${number(rate.clips)}</td><td>${Number(rate.clips_per_minute).toFixed(2)}</td><td>${Number(rate.audio_minutes_per_minute).toFixed(2)}</td><td>${Number(rate.audio_hours_per_hour).toFixed(2)}</td></tr>`)).join('');
           $('batchHeading').hidden = true;
           $('batches').closest('.table-wrap').hidden = true;
           $('workerHeading').hidden = false; $('workerWrap').hidden = false;

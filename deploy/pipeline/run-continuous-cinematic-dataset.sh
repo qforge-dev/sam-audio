@@ -35,6 +35,8 @@ AUTOSCALE_INTERVAL_SECONDS=${SAM_CONTINUOUS_AUTOSCALE_INTERVAL_SECONDS:-10}
 BASE_CLIPS_PER_VIDEO=${SAM_CONTINUOUS_BASE_CLIPS_PER_VIDEO:-16}
 SOURCE_CONTENT_MINUTES_PER_HOUR=${SAM_CONTINUOUS_SOURCE_CONTENT_MINUTES_PER_HOUR:-10}
 MAX_DURATION_SCALED_CLIPS_PER_VIDEO=${SAM_CONTINUOUS_MAX_DURATION_SCALED_CLIPS_PER_VIDEO:-60}
+SOURCE_SCAN_ENABLED=${SAM_CONTINUOUS_SOURCE_SCAN_ENABLED:-true}
+SOURCE_SCAN_BATCH_SIZE=${SAM_CONTINUOUS_SOURCE_SCAN_BATCH_SIZE:-128}
 
 for value in "$DOWNLOAD_WORKERS" "$SEARCH_WORKERS" "$M2D_WORKERS" "$ASR_WORKERS" "$UPLOAD_CONCURRENCY"; do
   if (( value < 1 )); then
@@ -54,7 +56,8 @@ fi
 export PYTHONPATH="$PIPELINE_ROOT/src"
 export HF_HOME=${HF_HOME:-/home/ubuntu/.cache/huggingface}
 mkdir -p "$RUNS_DIR" "$WORKSPACE/raw-audio" "$WORKSPACE/accepted/audio" \
-  "$WORKSPACE/m2d-validation" "$WORKSPACE/asr-validation"
+  "$WORKSPACE/m2d-validation" "$WORKSPACE/asr-validation" \
+  "$WORKSPACE/source-scans"
 cd "$PIPELINE_ROOT"
 
 configure_args=(
@@ -69,7 +72,11 @@ configure_args=(
   --base-clips-per-video "$BASE_CLIPS_PER_VIDEO"
   --source-content-minutes-per-hour "$SOURCE_CONTENT_MINUTES_PER_HOUR"
   --max-duration-scaled-clips-per-video "$MAX_DURATION_SCALED_CLIPS_PER_VIDEO"
+  --source-scan-batch-size "$SOURCE_SCAN_BATCH_SIZE"
 )
+if [[ "$SOURCE_SCAN_ENABLED" == "true" ]]; then
+  configure_args+=(--source-scan-enabled)
+fi
 if [[ "$AUTOSCALE_ENABLED" == "true" ]]; then
   configure_args+=(--autoscaling-enabled)
 fi
@@ -108,7 +115,22 @@ download_forever() {
   seed=$(test -s "$seed_file" && tr -dc '0-9' < "$seed_file" || date -u +%Y%m%d)
   while true; do
     local run_dir="$RUNS_DIR/run-$seed"
-    nice -n 10 "$PIPELINE_PYTHON" -m sam_audio_pipeline.youtube_random \
+    local scan_args=()
+    if [[ "$SOURCE_SCAN_ENABLED" == "true" ]]; then
+      scan_args=(
+        --scan-before-extract
+        --source-scan-cache "$WORKSPACE/source-scans"
+        --catalog "$WORKSPACE/catalog.sqlite3"
+        --m2d-repo "$M2D_REPO"
+        --m2d-checkpoint "$M2D_CHECKPOINT"
+        --m2d-class-labels "$CLASS_LABELS"
+        --m2d-ontology "$ONTOLOGY"
+        --m2d-device cuda
+        --m2d-batch-size "$SOURCE_SCAN_BATCH_SIZE"
+        --yt-dlp-python "$PIPELINE_PYTHON"
+      )
+    fi
+    nice -n 10 "$MODEL_PYTHON" -m sam_audio_pipeline.youtube_random \
       --output "$run_dir" \
       --source dailymotion \
       --profile cinematic \
@@ -124,7 +146,8 @@ download_forever() {
       --download-workers "$DOWNLOAD_WORKERS" \
       --worker-limit-file "$WORKSPACE/autoscale-control.json" \
       --candidate-multiplier 1.8 \
-      --max-attempts 40000 || true
+      --max-attempts 40000 \
+      "${scan_args[@]}" || true
     seed=$((seed + 1))
     printf '%s\n' "$seed" > "$seed_file.tmp"
     mv "$seed_file.tmp" "$seed_file"
@@ -134,7 +157,10 @@ download_forever() {
 shutdown() {
   trap - TERM INT EXIT
   jobs -pr | xargs -r kill 2>/dev/null || true
-  wait || true
+  # systemd uses KillMode=control-group, so grandchildren are terminated too.
+  # Waiting on the shell job table here can spin on stale subprocess PIDs and
+  # force every routine restart to hit TimeoutStopSec.
+  exit 0
 }
 trap shutdown TERM INT EXIT
 

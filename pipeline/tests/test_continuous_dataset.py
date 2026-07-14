@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from sam_audio_pipeline.continuous_dataset import (
+    _smoothed_cpu_percent,
     _snapshot_manifest,
     assemble_once,
     autoscale_decision,
@@ -119,6 +120,12 @@ def _autoscale(**overrides: object) -> dict[str, object]:
     }
     settings.update(overrides)
     return autoscale_decision(**settings)  # type: ignore[arg-type]
+
+
+def test_cpu_scaling_signal_uses_an_ema_for_bursty_ffmpeg_load() -> None:
+    assert _smoothed_cpu_percent(20.0, None) == 20.0
+    assert _smoothed_cpu_percent(100.0, 20.0) == 40.0
+    assert _smoothed_cpu_percent(100.0, 40.0) == 55.0
 
 
 def test_autoscaler_scales_asr_only_for_a_real_backlog_with_headroom() -> None:
@@ -252,7 +259,7 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
     assert progress["counts"]["rejected_total"] == 0
     assert progress["next_snapshot"]["remaining"] == 4999
     assert progress["throughput"]["download"]["audio_minutes_per_minute"] > 0
-    assert progress["flow"]["state"] == "balanced"
+    assert progress["flow"]["state"] == "healthy"
     assert progress["flow"]["processed_audio_hours_per_wall_hour"] > 0
     assert progress["flow"]["accepted_audio_hours_per_wall_hour"] > 0
     assert progress["flow"]["rolling_yield_percent"] == 100.0

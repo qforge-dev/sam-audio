@@ -570,6 +570,150 @@ def _throughput(
     }
 
 
+def _cohort_funnel(
+    connection: sqlite3.Connection,
+    *,
+    since: datetime,
+    clip_seconds: float,
+    now: datetime,
+) -> dict[str, Any]:
+    """Measure one acquisition cohort through every downstream gate."""
+    row = connection.execute(
+        """SELECT COUNT(*) AS downloaded,
+        SUM(CASE WHEN m.filename IS NULL THEN 0 ELSE 1 END) AS m2d_scored,
+        SUM(COALESCE(m.accepted,0)) AS m2d_accepted,
+        SUM(CASE WHEN s.filename IS NULL THEN 0 ELSE 1 END) AS asr_scored,
+        SUM(COALESCE(s.accepted,0)) AS asr_accepted,
+        SUM(CASE WHEN a.sha256 IS NULL THEN 0 ELSE 1 END) AS accepted,
+        SUM(CASE WHEN x.reason='overlap' THEN 1 ELSE 0 END) AS overlap_rejected,
+        SUM(CASE WHEN json_extract(r.record_json,'$.selection')=
+        'whole_source_proxy_scan' THEN 1 ELSE 0 END) AS proxy_selected
+        FROM records r LEFT JOIN m2d_scores m USING(filename)
+        LEFT JOIN asr_scores s USING(filename)
+        LEFT JOIN accepted a USING(sha256)
+        LEFT JOIN rejected x USING(sha256)
+        WHERE r.discovered_at>=?""",
+        (since.isoformat(),),
+    ).fetchone()
+    keys = (
+        "downloaded",
+        "m2d_scored",
+        "m2d_accepted",
+        "asr_scored",
+        "asr_accepted",
+        "accepted",
+        "overlap_rejected",
+        "proxy_selected",
+    )
+    counts = {key: int(row[index] or 0) for index, key in enumerate(keys)}
+    elapsed_minutes = max(1.0, (now - since).total_seconds() / 60.0)
+
+    def percentage(numerator: int, denominator: int) -> float:
+        return round(100.0 * numerator / denominator, 2) if denominator else 0.0
+
+    counts.update(
+        {
+            "since": since.isoformat(),
+            "observed_minutes": round(elapsed_minutes, 3),
+            "m2d_pass_percent": percentage(
+                counts["m2d_accepted"], counts["m2d_scored"]
+            ),
+            "asr_pass_percent": percentage(
+                counts["asr_accepted"], counts["asr_scored"]
+            ),
+            "final_yield_percent": percentage(
+                counts["accepted"], counts["downloaded"]
+            ),
+            "post_asr_keep_percent": percentage(
+                counts["accepted"], counts["asr_accepted"]
+            ),
+            "processed_audio_hours_per_hour": round(
+                counts["downloaded"] * clip_seconds / 60.0 / elapsed_minutes, 4
+            ),
+            "accepted_audio_hours_per_hour": round(
+                counts["accepted"] * clip_seconds / 60.0 / elapsed_minutes, 4
+            ),
+        }
+    )
+    return counts
+
+
+def _source_scan_status(workspace: Path) -> dict[str, Any]:
+    cache_dir = workspace / "source-scans"
+    scanned = passing_sources = passing_regions = claimed_regions = 0
+    quality_rejected = no_matches = timed_sources = 0
+    scan_seconds = download_seconds = proxy_seconds = 0.0
+    now = datetime.now(UTC)
+    recent = {
+        "5": {"sources": 0, "matches": 0, "regions": 0},
+        "15": {"sources": 0, "matches": 0, "regions": 0},
+    }
+    for path in cache_dir.glob("*.json"):
+        try:
+            item = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        scanned += 1
+        regions = item.get("regions") or []
+        if regions:
+            passing_sources += 1
+        elif item.get("rejection_reasons"):
+            quality_rejected += 1
+        else:
+            no_matches += 1
+        passing_regions += len(regions)
+        claimed_regions += len(item.get("claimed_starts") or [])
+        scan_seconds += float(item.get("scan_seconds") or 0.0)
+        if item.get("download_seconds") is not None:
+            timed_sources += 1
+            download_seconds += float(item.get("download_seconds") or 0.0)
+            proxy_seconds += float(item.get("proxy_seconds") or 0.0)
+        try:
+            scanned_at = datetime.fromisoformat(str(item["scanned_at"]))
+            age_minutes = (now - scanned_at).total_seconds() / 60.0
+        except (KeyError, TypeError, ValueError):
+            age_minutes = float("inf")
+        for window, values in recent.items():
+            if age_minutes <= float(window):
+                values["sources"] += 1
+                values["matches"] += int(bool(regions))
+                values["regions"] += len(regions)
+    return {
+        "policy": "whole_source_proxy_m2d_v1",
+        "scanned_sources": scanned,
+        "passing_sources": passing_sources,
+        "source_match_percent": round(
+            100.0 * passing_sources / scanned, 2
+        )
+        if scanned
+        else 0.0,
+        "quality_rejected_sources": quality_rejected,
+        "no_match_sources": no_matches,
+        "passing_regions": passing_regions,
+        "claimed_regions": claimed_regions,
+        "region_claim_percent": round(
+            100.0 * claimed_regions / passing_regions, 2
+        )
+        if passing_regions
+        else 0.0,
+        "model_scan_seconds": round(scan_seconds, 3),
+        "timed_sources": timed_sources,
+        "source_download_seconds": round(download_seconds, 3),
+        "proxy_decode_seconds": round(proxy_seconds, 3),
+        "recent_windows": {
+            window: {
+                **values,
+                "sources_per_minute": round(values["sources"] / float(window), 3),
+                "matching_sources_per_minute": round(
+                    values["matches"] / float(window), 3
+                ),
+                "regions_per_minute": round(values["regions"] / float(window), 3),
+            }
+            for window, values in recent.items()
+        },
+    }
+
+
 def progress_snapshot(
     workspace: Path,
     snapshot_size: int = 5000,
@@ -602,38 +746,47 @@ def progress_snapshot(
     accepted = counts["accepted"]
     next_snapshot = (accepted // snapshot_size + 1) * snapshot_size
     clip_seconds = 30.0
-    throughput = {
-        "download": _throughput(
-            connection,
-            table="records",
-            timestamp_column="discovered_at",
-            clip_seconds=clip_seconds,
-            window_minutes=throughput_window_minutes,
-        ),
-        "m2d": _throughput(
-            connection,
-            table="m2d_scores",
-            timestamp_column="scored_at",
-            clip_seconds=clip_seconds,
-            window_minutes=throughput_window_minutes,
-        ),
-        "asr": _throughput(
-            connection,
-            table="asr_scores",
-            timestamp_column="scored_at",
-            clip_seconds=clip_seconds,
-            window_minutes=throughput_window_minutes,
-        ),
-        "accepted": _throughput(
-            connection,
-            table="accepted",
-            timestamp_column="accepted_at",
-            clip_seconds=clip_seconds,
-            window_minutes=throughput_window_minutes,
-        ),
-    }
+    throughput_windows = {}
+    for window in (5.0, 15.0, throughput_window_minutes):
+        throughput_windows[f"{window:g}"] = {
+            "download": _throughput(
+                connection,
+                table="records",
+                timestamp_column="discovered_at",
+                clip_seconds=clip_seconds,
+                window_minutes=window,
+            ),
+            "m2d": _throughput(
+                connection,
+                table="m2d_scores",
+                timestamp_column="scored_at",
+                clip_seconds=clip_seconds,
+                window_minutes=window,
+            ),
+            "asr": _throughput(
+                connection,
+                table="asr_scores",
+                timestamp_column="scored_at",
+                clip_seconds=clip_seconds,
+                window_minutes=window,
+            ),
+            "accepted": _throughput(
+                connection,
+                table="accepted",
+                timestamp_column="accepted_at",
+                clip_seconds=clip_seconds,
+                window_minutes=window,
+            ),
+        }
+    throughput = throughput_windows[f"{throughput_window_minutes:g}"]
     current_hours = accepted * clip_seconds / 3600.0
-    accepted_rate = throughput["accepted"]["audio_hours_per_hour"]
+    responsive_throughput = throughput_windows["15"]["accepted"]
+    use_responsive_eta = responsive_throughput["observed_minutes"] >= 10.0
+    accepted_rate = (
+        responsive_throughput["audio_hours_per_hour"]
+        if use_responsive_eta
+        else throughput["accepted"]["audio_hours_per_hour"]
+    )
     remaining_hours = max(0.0, target_hours - current_hours)
     eta_wall_hours = remaining_hours / accepted_rate if accepted_rate > 0 else None
     config_path = workspace / "config.json"
@@ -645,11 +798,134 @@ def progress_snapshot(
         autoscaler = json.loads((workspace / "autoscaler.json").read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         autoscaler = {"enabled": False, "state": "not_started"}
+    waiting_for_assembly = connection.execute(
+        """SELECT COUNT(*) FROM asr_scores s JOIN records r USING(filename)
+        LEFT JOIN accepted a USING(sha256) LEFT JOIN rejected x USING(sha256)
+        WHERE s.accepted=1 AND a.sha256 IS NULL AND x.sha256 IS NULL"""
+    ).fetchone()[0]
     queues = {
         "waiting_for_m2d": max(0, counts["downloaded"] - counts["m2d_scored"]),
         "waiting_for_asr": max(0, counts["m2d_accepted"] - counts["asr_scored"]),
-        "waiting_for_assembly": max(0, counts["asr_accepted"] - counts["accepted"]),
+        "waiting_for_assembly": int(waiting_for_assembly),
     }
+    strategy_path = workspace / "experiments" / "whole-source-live-baseline.json"
+    strategy: dict[str, Any] | None = None
+    try:
+        baseline = json.loads(strategy_path.read_text())
+        deployed_at = datetime.fromisoformat(str(baseline["deployed_at"]))
+        cohort = _cohort_funnel(
+            connection, since=deployed_at, clip_seconds=clip_seconds, now=now
+        )
+        baseline_flow = baseline.get("baseline", {}).get("flow", {})
+        baseline_rate = float(
+            baseline_flow.get("accepted_audio_hours_per_wall_hour") or 0.0
+        )
+        current_rate = float(cohort["accepted_audio_hours_per_hour"])
+        strategy = {
+            "policy": "whole_source_proxy_m2d_v1",
+            "deployed_at": deployed_at.isoformat(),
+            "baseline": {
+                "processed_audio_hours_per_hour": float(
+                    baseline_flow.get("processed_audio_hours_per_wall_hour") or 0.0
+                ),
+                "accepted_audio_hours_per_hour": baseline_rate,
+                "yield_percent": float(
+                    baseline_flow.get("rolling_yield_percent") or 0.0
+                ),
+            },
+            "cohort": cohort,
+            "accepted_rate_multiplier": (
+                round(current_rate / baseline_rate, 3) if baseline_rate else None
+            ),
+            "source_scans": _source_scan_status(workspace),
+        }
+        tuning_path = workspace / "experiments" / "concurrency-8-to-16.json"
+        try:
+            tuning_marker = json.loads(tuning_path.read_text())
+            tuning_started = datetime.fromisoformat(str(tuning_marker["started_at"]))
+            tuning_cohort = _cohort_funnel(
+                connection,
+                since=tuning_started,
+                clip_seconds=clip_seconds,
+                now=now,
+            )
+            tuning_baseline_rate = float(
+                tuning_marker.get("before", {})
+                .get("strategy", {})
+                .get("cohort", {})
+                .get("accepted_audio_hours_per_hour")
+                or 0.0
+            )
+            tuning_rate = float(tuning_cohort["accepted_audio_hours_per_hour"])
+            strategy["concurrency_tuning"] = {
+                "started_at": tuning_started.isoformat(),
+                "baseline_download_concurrency": 8,
+                "current_download_concurrency": int(
+                    autoscaler.get("limits", {}).get("download_concurrency") or 0
+                ),
+                "baseline_accepted_audio_hours_per_hour": tuning_baseline_rate,
+                "cohort": tuning_cohort,
+                "accepted_rate_multiplier": (
+                    round(tuning_rate / tuning_baseline_rate, 3)
+                    if tuning_baseline_rate
+                    else None
+                ),
+            }
+        except (
+            FileNotFoundError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            OSError,
+        ):
+            pass
+        latest_tuning_path = workspace / "experiments" / "latest-tuning.json"
+        if not latest_tuning_path.exists():
+            latest_tuning_path = (
+                workspace / "experiments" / "immediate-productive-source-reuse.json"
+            )
+        try:
+            latest_marker = json.loads(latest_tuning_path.read_text())
+            latest_started = datetime.fromisoformat(str(latest_marker["started_at"]))
+            latest_cohort = _cohort_funnel(
+                connection,
+                since=latest_started,
+                clip_seconds=clip_seconds,
+                now=now,
+            )
+            latest_baseline_rate = float(
+                latest_marker.get("baseline_accepted_audio_hours_per_hour")
+                or latest_marker.get("before", {})
+                .get("throughput_windows", {})
+                .get("5", {})
+                .get("accepted", {})
+                .get("audio_hours_per_hour")
+                or 0.0
+            )
+            latest_rate = float(latest_cohort["accepted_audio_hours_per_hour"])
+            strategy["latest_tuning"] = {
+                "label": str(latest_marker.get("label") or "Latest tuning"),
+                "started_at": latest_started.isoformat(),
+                "baseline_accepted_audio_hours_per_hour": latest_baseline_rate,
+                "cohort": latest_cohort,
+                "accepted_rate_multiplier": (
+                    round(latest_rate / latest_baseline_rate, 3)
+                    if latest_baseline_rate
+                    else None
+                ),
+            }
+        except (
+            FileNotFoundError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            OSError,
+        ):
+            pass
+    except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError, OSError):
+        pass
     stalled_stages = [
         stage
         for stage, backlog, recent_clips in (
@@ -666,11 +942,29 @@ def progress_snapshot(
     unhealthy_workers = [
         worker["worker"] for worker in workers if worker["state"] != "running"
     ]
+    processed_rate = float(throughput["download"]["audio_hours_per_hour"])
+    output_rate = float(throughput["accepted"]["audio_hours_per_hour"])
+    rolling_yield = output_rate / processed_rate * 100.0 if processed_rate else 0.0
     constrained_by = str(autoscaler.get("bottleneck") or "")
     if stalled_stages or unhealthy_workers:
         flow_state = "stalled"
         flow_explanation = (
             "A pending queue has no recent consumer output or a worker is unhealthy."
+        )
+    elif strategy and (
+        strategy["cohort"]["observed_minutes"] < 15
+        or strategy["cohort"]["m2d_scored"] < 20
+    ):
+        flow_state = "warming_up"
+        flow_explanation = (
+            "The new acquisition strategy is live; its cohort is still too small "
+            "for a stable throughput comparison."
+        )
+    elif rolling_yield < 8.0:
+        flow_state = "healthy_low_yield"
+        flow_explanation = (
+            "Workers are healthy, but fewer than 8% of processed clips reach the "
+            "dataset. Candidate selection—not a stalled consumer—is limiting output."
         )
     elif constrained_by in {"cpu", "m2d", "asr"}:
         flow_state = "constrained"
@@ -679,14 +973,11 @@ def progress_snapshot(
             f"{constrained_by} pressure. This is constrained, not stalled."
         )
     else:
-        flow_state = "balanced"
+        flow_state = "healthy"
         flow_explanation = (
             "Workers are healthy and every pending queue has recent consumer output. "
             "The processing/output gap is filtering yield, not stuck work."
         )
-    processed_rate = float(throughput["download"]["audio_hours_per_hour"])
-    output_rate = float(throughput["accepted"]["audio_hours_per_hour"])
-    rolling_yield = output_rate / processed_rate * 100.0 if processed_rate else 0.0
     payload = {
         "mode": "continuous",
         "updated_at": _now(),
@@ -713,6 +1004,8 @@ def progress_snapshot(
         "worker_config": worker_config,
         "autoscaler": autoscaler,
         "throughput": throughput,
+        "throughput_windows": throughput_windows,
+        "strategy": strategy,
         "goal": {
             "target_audio_hours": target_hours,
             "current_audio_hours": round(current_hours, 4),
@@ -730,7 +1023,9 @@ def progress_snapshot(
                 else None
             ),
             "estimate_basis": (
-                f"rolling {throughput_window_minutes:g}-minute accepted throughput"
+                "rolling 15-minute accepted throughput"
+                if use_responsive_eta
+                else f"rolling {throughput_window_minutes:g}-minute accepted throughput"
             ),
         },
         "published_snapshots": published,
@@ -754,6 +1049,15 @@ def _cpu_percent(sample_seconds: float = 0.5) -> float:
     total_delta = max(1, total_after - total_before)
     busy = total_delta - (idle_after - idle_before)
     return round(max(0.0, min(100.0, busy * 100.0 / total_delta)), 2)
+
+
+def _smoothed_cpu_percent(
+    current: float, previous: float | None, *, alpha: float = 0.25
+) -> float:
+    """Smooth bursty ffmpeg load so one sample cannot collapse acquisition."""
+    if previous is None:
+        return current
+    return round(alpha * current + (1.0 - alpha) * previous, 2)
 
 
 def _gpu_status() -> dict[str, float | None]:
@@ -863,9 +1167,23 @@ def run_autoscaler_once(args: argparse.Namespace) -> dict[str, Any]:
             "download_concurrency": args.download_max,
             "asr_concurrency": args.asr_min,
         }
+    try:
+        previous_status = json.loads(status_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        previous_status = {}
     connection = connect(workspace)
     counts = pipeline_counts(connection)
     cpu = _cpu_percent()
+    previous_cpu_ema = previous_status.get("cpu_smoothed_percent")
+    cpu_ema = _smoothed_cpu_percent(
+        cpu,
+        float(previous_cpu_ema) if previous_cpu_ema is not None else None,
+    )
+    cpu_emergency_streak = (
+        int(previous_status.get("cpu_emergency_sample_streak") or 0) + 1
+        if cpu >= args.cpu_emergency
+        else 0
+    )
     gpu = _gpu_status()
     m2d_backlog = max(0, counts["downloaded"] - counts["m2d_scored"])
     asr_backlog = max(0, counts["m2d_accepted"] - counts["asr_scored"])
@@ -876,7 +1194,7 @@ def run_autoscaler_once(args: argparse.Namespace) -> dict[str, Any]:
         asr_concurrency=int(control.get("asr_concurrency", args.asr_min)),
         m2d_backlog=m2d_backlog,
         asr_backlog=asr_backlog,
-        cpu_percent=cpu,
+        cpu_percent=cpu_ema,
         gpu_free_mb=gpu["memory_free_mb"],
         download_min=args.download_min,
         download_max=args.download_max,
@@ -895,7 +1213,7 @@ def run_autoscaler_once(args: argparse.Namespace) -> dict[str, Any]:
         if last_changed_at
         else float("inf")
     )
-    emergency = cpu >= args.cpu_emergency
+    emergency = cpu_emergency_streak >= 3
     apply_change = bool(decision["actions"]) and (
         elapsed >= args.cooldown_seconds or emergency
     )
@@ -922,6 +1240,8 @@ def run_autoscaler_once(args: argparse.Namespace) -> dict[str, Any]:
                         "previous": previous,
                         "current": control,
                         "cpu_percent": cpu,
+                        "cpu_smoothed_percent": cpu_ema,
+                        "cpu_emergency_sample_streak": cpu_emergency_streak,
                         "gpu": gpu,
                         "m2d_backlog": m2d_backlog,
                         "asr_backlog": asr_backlog,
@@ -970,6 +1290,8 @@ def run_autoscaler_once(args: argparse.Namespace) -> dict[str, Any]:
         "observed_at": now.isoformat(),
         "bottleneck": decision["bottleneck"],
         "cpu_percent": cpu,
+        "cpu_smoothed_percent": cpu_ema,
+        "cpu_emergency_sample_streak": cpu_emergency_streak,
         "gpu": gpu,
         "queues": {"m2d": m2d_backlog, "asr": asr_backlog},
         "limits": {
@@ -1382,6 +1704,8 @@ def main() -> None:
         type=int,
         default=DEFAULT_MAX_CLIPS_PER_SOURCE,
     )
+    configure.add_argument("--source-scan-enabled", action="store_true")
+    configure.add_argument("--source-scan-batch-size", type=int, default=128)
     autoscale = commands.add_parser("autoscale")
     autoscale.add_argument("--workspace", type=Path, required=True)
     autoscale.add_argument("--download-min", type=int, default=2)
@@ -1476,6 +1800,8 @@ def main() -> None:
                 "--max-duration-scaled-clips-per-video must be at least "
                 "--base-clips-per-video"
             )
+        if args.source_scan_batch_size < 1:
+            parser.error("--source-scan-batch-size must be positive")
         _atomic_json(
             args.workspace / "config.json",
             {
@@ -1498,6 +1824,17 @@ def main() -> None:
                     content_minutes_per_hour=(args.source_content_minutes_per_hour),
                     max_clips=args.max_duration_scaled_clips_per_video,
                 ),
+                "acquisition_strategy": {
+                    "policy": (
+                        "whole_source_proxy_m2d_v1"
+                        if args.source_scan_enabled
+                        else "random_positions"
+                    ),
+                    "scan_before_extract": args.source_scan_enabled,
+                    "proxy_sample_rate_hz": 16_000,
+                    "m2d_scan_batch_size": args.source_scan_batch_size,
+                    "source_mix": "70% proven / 30% exploration",
+                },
                 "coordinator_workers": {
                     "promoter": 1,
                     "assembler": 1,
