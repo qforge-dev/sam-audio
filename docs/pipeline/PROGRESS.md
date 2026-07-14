@@ -114,6 +114,14 @@ was an example batch size, not a workflow limit.
   from an already-failed job whose source objects never reached S3. The current
   AudioSet set reports 98 stereo and two mono originals with exact codec,
   sample-rate, bit-depth, and bitrate facts.
+- Local general-YouTube set `youtube-random-1000-20260714` contains exactly
+  1,000 ten-second WAVs from 1,000 unique direct YouTube videos selected across
+  288 randomized mix-biased queries. Its independent audit passes with no
+  failures: every output is stereo PCM16/48 kHz, all source streams are stereo
+  at 44.1 kHz or better and at least 120.084 kbps, and every loudness, silence,
+  true-stereo, clipping, duration, uniqueness, existence, and SHA-256 gate
+  passes. The audio payload is 1,920,078,000 bytes; no AudioSet record metadata
+  or AudioSet candidate source was used.
 - Live mono-filter job `5ec26b1bb28b420a9245e21d475d26be` completed with
   `non_stereo_input`, one input channel, zero chunks, zero stems, and zero model
   tasks. A live `targets=voice` API canary produced only voice and residual
