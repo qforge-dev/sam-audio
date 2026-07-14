@@ -33,6 +33,8 @@
     .progress { height: 7px; background: #24303c; border-radius: 99px; overflow: hidden; }
     .progress > div { height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); width: 0; transition: width .25s; }
     .header-actions { margin-left: auto; display: flex; gap: 8px; }
+    .reviewer-pill { color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 8px 11px; }
+    .reviewer-pill strong { color: var(--blue); }
     .quiet-btn { color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 9px; padding: 8px 11px; text-decoration: none; }
     .layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); min-height: 0; }
     aside { border-right: 1px solid var(--line); background: #0e151d; min-height: calc(100vh - 72px); display: flex; flex-direction: column; }
@@ -45,6 +47,7 @@
     .clip-row { display: grid; grid-template-columns: 32px 1fr auto; gap: 8px; padding: 11px 13px; border-bottom: 1px solid #1c2834; cursor: pointer; }
     .clip-row:hover { background: #14202b; }
     .clip-row.active { background: #1a2b3a; box-shadow: inset 3px 0 var(--blue); }
+    .clip-row.claimed-other { opacity: .52; }
     .clip-index { color: #708397; font-variant-numeric: tabular-nums; }
     .clip-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .clip-file { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -52,6 +55,7 @@
     .status-dot.good { background: var(--green); }
     .status-dot.perfect { background: var(--gold); box-shadow: 0 0 0 3px rgba(247,199,93,.12); }
     .status-dot.not_ok { background: var(--red); }
+    .status-dot.claimed { background: var(--blue); box-shadow: 0 0 0 3px rgba(103,183,255,.12); }
     main { padding: 28px clamp(22px, 4vw, 64px) 60px; overflow-y: auto; }
     .review-card { max-width: 950px; margin: 0 auto; }
     .eyebrow { color: var(--blue); text-transform: uppercase; letter-spacing: .12em; font-size: 11px; font-weight: 700; }
@@ -62,6 +66,7 @@
     .player-shell { padding: 18px; border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(140deg, #141e29, #0f171f); }
     audio { width: 100%; height: 46px; display: block; }
     .player-meta { display: flex; justify-content: space-between; gap: 12px; margin-top: 12px; color: var(--muted); font-size: 12px; }
+    .assignment { margin: 0 0 10px; color: var(--blue); font-size: 12px; font-weight: 700; }
     .metrics { display: flex; gap: 14px; }
     .decision-title { margin: 26px 0 12px; font-size: 13px; color: var(--muted); font-weight: 600; }
     .decision-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
@@ -87,6 +92,13 @@
     .shortcut { color: #6f8294; font-size: 11px; margin-top: 14px; }
     .toast { position: fixed; right: 22px; bottom: 22px; padding: 10px 14px; border-radius: 9px; background: #edf7f1; color: #10251b; font-weight: 700; opacity: 0; transform: translateY(8px); transition: .2s; pointer-events: none; }
     .toast.show { opacity: 1; transform: translateY(0); }
+    .modal { position: fixed; inset: 0; z-index: 50; display: none; place-items: center; padding: 18px; background: rgba(5,9,13,.82); backdrop-filter: blur(7px); }
+    .modal.open { display: grid; }
+    .modal-card { width: min(440px, 100%); padding: 25px; border-radius: 16px; border: 1px solid var(--line); background: var(--panel); box-shadow: 0 25px 80px rgba(0,0,0,.45); }
+    .modal-card h3 { margin: 0 0 7px; font-size: 22px; }
+    .modal-card p { margin: 0 0 17px; color: var(--muted); }
+    .modal-card input { width: 100%; padding: 11px 12px; border-radius: 9px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+    .modal-card button { width: 100%; margin-top: 12px; padding: 11px; border: 0; border-radius: 9px; background: var(--blue); color: #061522; font-weight: 850; }
     .empty { color: var(--muted); padding: 25px; text-align: center; }
     @media (max-width: 800px) {
       header { flex-wrap: wrap; }
@@ -106,7 +118,11 @@
         <div class="progress-label"><span id="progressText">0 / 0 reviewed</span><span id="summaryText"></span></div>
         <div class="progress"><div id="progressBar"></div></div>
       </div>
-      <div class="header-actions"><a class="quiet-btn" href="/api/export.csv">Export CSV</a></div>
+      <div class="header-actions">
+        <span class="reviewer-pill" id="activeReviewers"></span>
+        <button class="reviewer-pill" id="reviewerButton">Reviewer: <strong id="reviewerName"></strong></button>
+        <a class="quiet-btn" id="exportLink" href="/api/export.csv">Export CSV</a>
+      </div>
     </header>
     <div class="layout">
       <aside>
@@ -132,6 +148,7 @@
           <div class="filename" id="clipFilename"></div>
           <div class="chips" id="chips"></div>
           <div class="player-shell">
+            <div class="assignment" id="assignmentText"></div>
             <audio id="audio" controls preload="metadata"></audio>
             <div class="player-meta">
               <span id="bucketText"></span>
@@ -154,26 +171,81 @@
             </div>
           </div>
           <div class="footer-nav">
-            <button class="nav-btn" id="prevBtn">← Previous</button>
             <button class="nav-btn" id="clearBtn">Clear mark</button>
-            <button class="nav-btn" id="nextBtn">Next →</button>
+            <button class="nav-btn" id="skipBtn">Skip · random next →</button>
             <label class="auto"><input type="checkbox" id="autoPlay" checked> Play next automatically</label>
           </div>
-          <div class="shortcut">Shortcuts: Space play/pause · G good · P perfect · X not OK · ←/→ navigate</div>
+          <div class="shortcut">Shortcuts: Space play/pause · G good · P perfect · X not OK · → random next</div>
         </div>
       </main>
     </div>
   </div>
   <div class="toast" id="toast">Saved</div>
+  <div class="modal" id="identityModal">
+    <div class="modal-card">
+      <h3>Who is reviewing?</h3>
+      <p>Each browser gets a separate random queue, so you and your friend never receive the same live clip.</p>
+      <input id="identityName" maxlength="80" placeholder="Your name" autocomplete="nickname">
+      <button id="identitySave">Start reviewing</button>
+    </div>
+  </div>
   <script>
-    const app = { state: null, filtered: [], current: null };
+    const app = { state: null, filtered: [], current: null, identity: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
     const pct = value => value == null ? '—' : `${Math.round(value * 100)}%`;
+    const pathClipIndex = location.pathname.indexOf('/clip/');
+    const BASE = pathClipIndex >= 0
+      ? location.pathname.slice(0, pathClipIndex)
+      : (location.pathname === '/' ? '' : location.pathname.replace(/\/$/, ''));
+    const api = path => `${BASE}${path}`;
+    const identityBody = () => ({reviewer_id: app.identity.id, reviewer_name: app.identity.name});
+    const isMine = clip => clip?.claim?.reviewer_id === app.identity?.id;
+
+    async function fetchJson(path, options = {}) {
+      const response = await fetch(api(path), options);
+      const payload = await response.json();
+      if (!response.ok) {
+        const error = new Error(payload.detail || `Request failed (${response.status})`);
+        error.status = response.status;
+        throw error;
+      }
+      return payload;
+    }
+
+    function storedIdentity() {
+      try {
+        const value = JSON.parse(localStorage.getItem('sam-reviewer') || 'null');
+        return value?.id && value?.name ? value : null;
+      } catch (_) { return null; }
+    }
+
+    function requestIdentity(forceNew = false) {
+      return new Promise(resolve => {
+        $('identityModal').classList.add('open');
+        $('identityName').value = forceNew ? '' : (storedIdentity()?.name || '');
+        $('identityName').focus();
+        const saveIdentity = () => {
+          const name = $('identityName').value.trim();
+          if (!name) return;
+          const previous = forceNew ? null : storedIdentity();
+          app.identity = {id: previous?.id || crypto.randomUUID(), name};
+          localStorage.setItem('sam-reviewer', JSON.stringify(app.identity));
+          $('identityModal').classList.remove('open');
+          $('reviewerName').textContent = name;
+          resolve(app.identity);
+        };
+        $('identitySave').onclick = saveIdentity;
+        $('identityName').onkeydown = event => { if (event.key === 'Enter') saveIdentity(); };
+      });
+    }
 
     async function init() {
-      const response = await fetch('/api/state');
-      app.state = await response.json();
+      app.identity = storedIdentity();
+      if (!app.identity) await requestIdentity();
+      $('reviewerName').textContent = app.identity.name;
+      $('exportLink').href = api('/api/export.csv');
+      await refreshState();
       $('datasetName').textContent = `${app.state.dataset.name} · ${app.state.summary.total} clips`;
       for (const [key, label] of Object.entries(app.state.reason_labels)) {
         $('reasonGrid').insertAdjacentHTML('beforeend', `<label class="reason"><input type="checkbox" value="${key}"><span>${esc(label)}</span></label>`);
@@ -185,9 +257,23 @@
       $('bucketFilter').addEventListener('change', applyFilters);
       bindActions();
       applyFilters();
-      const routeName = location.pathname.startsWith('/clip/') ? decodeURIComponent(location.pathname.slice(6)) : null;
-      const initial = app.state.clips.find(c => c.filename === routeName) || app.filtered.find(c => !c.review) || app.filtered[0];
-      if (initial) selectClip(initial.filename, false);
+      const routePrefix = `${BASE}/clip/`;
+      const routeName = location.pathname.startsWith(routePrefix)
+        ? decodeURIComponent(location.pathname.slice(routePrefix.length))
+        : null;
+      if (routeName && app.state.clips.some(clip => clip.filename === routeName)) {
+        await openClip(routeName, false);
+      } else {
+        await claimNext(false);
+      }
+      setInterval(heartbeat, 30000);
+    }
+
+    async function refreshState() {
+      app.state = await fetchJson('/api/state');
+      if (app.current) app.current = app.state.clips.find(clip => clip.filename === app.current.filename) || null;
+      updateProgress();
+      applyFilters();
     }
 
     function applyFilters() {
@@ -201,7 +287,6 @@
           && (!query || `${clip.filename} ${clip.title || ''} ${clip.uploader || ''}`.toLowerCase().includes(query));
       });
       renderList();
-      if (app.current && !app.filtered.some(c => c.filename === app.current.filename) && app.filtered[0]) selectClip(app.filtered[0].filename);
     }
 
     function renderList() {
@@ -210,11 +295,14 @@
         const index = app.state.clips.indexOf(clip) + 1;
         const active = app.current?.filename === clip.filename ? ' active' : '';
         const decision = clip.review?.decision || '';
-        return `<div class="clip-row${active}" data-file="${esc(clip.filename)}">
-          <div class="clip-index">${index}</div><div><div class="clip-title">${esc(clip.title || clip.filename)}</div><div class="clip-file">${esc(clip.background_bucket?.replaceAll('_',' ') || '')}</div></div><span class="status-dot ${decision}"></span>
+        const claimedOther = clip.claim && !isMine(clip);
+        const claimText = claimedOther ? ` · ${clip.claim.reviewer_name} reviewing` : '';
+        const status = decision || (clip.claim ? 'claimed' : '');
+        return `<div class="clip-row${active}${claimedOther ? ' claimed-other' : ''}" data-file="${esc(clip.filename)}">
+          <div class="clip-index">${index}</div><div><div class="clip-title">${esc(clip.title || clip.filename)}</div><div class="clip-file">${esc(clip.background_bucket?.replaceAll('_',' ') || '')}${esc(claimText)}</div></div><span class="status-dot ${status}"></span>
         </div>`;
       }).join('');
-      document.querySelectorAll('.clip-row').forEach(row => row.addEventListener('click', () => selectClip(row.dataset.file)));
+      document.querySelectorAll('.clip-row').forEach(row => row.addEventListener('click', () => openClip(row.dataset.file)));
     }
 
     function selectClip(filename, updateHistory = true) {
@@ -228,47 +316,96 @@
       $('bucketText').textContent = (clip.background_bucket || '').replaceAll('_', ' ');
       $('metrics').innerHTML = `<span>speech ${pct(clip.speech_coverage)}</span><span>background ${pct(clip.background_coverage)}</span><span>overlap ${pct(clip.overlap_coverage)}</span>`;
       $('chips').innerHTML = clip.top_labels.map(label => `<span class="chip">${esc(label)}</span>`).join('');
-      $('audio').src = `/api/audio/${encodeURIComponent(clip.filename)}`;
+      $('audio').src = api(`/api/audio/${encodeURIComponent(clip.filename)}`);
+      const canReview = !clip.review && isMine(clip);
+      $('assignmentText').textContent = clip.review
+        ? `Completed by ${clip.review.reviewer_name || 'a reviewer'}`
+        : isMine(clip)
+          ? `Randomly assigned to ${app.identity.name} · lease kept active while this page is open`
+          : clip.claim
+            ? `Currently assigned to ${clip.claim.reviewer_name}`
+            : 'Not currently assigned';
+      for (const id of ['goodBtn', 'perfectBtn', 'badBtn']) $(id).disabled = !canReview;
+      $('clearBtn').disabled = !clip.review || !(!clip.review.reviewer_id || clip.review.reviewer_id === app.identity.id);
       document.querySelectorAll('.decision').forEach(button => button.classList.remove('selected'));
       if (clip.review?.decision) $(`${clip.review.decision === 'not_ok' ? 'bad' : clip.review.decision}Btn`).classList.add('selected');
       $('badPanel').classList.toggle('open', clip.review?.decision === 'not_ok');
       document.querySelectorAll('#reasonGrid input').forEach(box => box.checked = clip.review?.reasons?.includes(box.value) || false);
       $('note').value = clip.review?.note || '';
-      if (updateHistory) history.pushState({filename}, '', `/clip/${encodeURIComponent(filename)}`);
+      if (updateHistory) history.pushState({filename}, '', `${BASE}/clip/${encodeURIComponent(filename)}`);
       renderList();
       const row = document.querySelector(`.clip-row[data-file="${CSS.escape(filename)}"]`);
       row?.scrollIntoView({block: 'nearest'});
       if ($('autoPlay').checked) $('audio').play().catch(() => {});
     }
 
-    async function save(decision, reasons = [], note = '') {
-      if (!app.current) return;
-      const reviewedClip = app.current;
-      const reviewedIndex = app.state.clips.indexOf(reviewedClip);
-      const response = await fetch(`/api/reviews/${encodeURIComponent(reviewedClip.filename)}`, {
-        method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({decision, reasons, note})
+    async function releaseCurrent() {
+      if (!app.current || app.current.review || !isMine(app.current)) return;
+      try {
+        await fetchJson(`/api/claims/${encodeURIComponent(app.current.filename)}`, {
+          method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify(identityBody())
+        });
+      } catch (_) {}
+    }
+
+    async function openClip(filename, updateHistory = true) {
+      const clip = app.state.clips.find(item => item.filename === filename);
+      if (!clip) return;
+      if (clip.review) {
+        await releaseCurrent();
+        await refreshState();
+        selectClip(filename, updateHistory);
+        return;
+      }
+      if (!isMine(clip)) await releaseCurrent();
+      try {
+        await fetchJson(`/api/claims/${encodeURIComponent(filename)}`, {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(identityBody())
+        });
+        await refreshState();
+        selectClip(filename, updateHistory);
+      } catch (error) {
+        toast(error.message);
+        await refreshState();
+        await claimNext(false);
+      }
+    }
+
+    async function claimNext(release = true) {
+      const releaseFilename = release && app.current && !app.current.review && isMine(app.current)
+        ? app.current.filename : null;
+      const payload = await fetchJson('/api/claims/next', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({...identityBody(), release_filename: releaseFilename})
       });
-      const payload = await response.json();
-      if (!response.ok) { alert(payload.detail || 'Could not save review'); return; }
-      reviewedClip.review = payload.review;
-      app.state.summary = payload.summary;
-      updateProgress();
-      toast(decision === 'perfect' ? 'Marked perfect' : decision === 'good' ? 'Marked good' : 'Marked not OK');
-      applyFilters();
-      nextUnreviewed(reviewedIndex);
+      await refreshState();
+      if (payload.filename) {
+        selectClip(payload.filename);
+      } else {
+        app.current = null;
+        $('counter').textContent = 'Queue complete';
+        $('clipTitle').textContent = 'No unreviewed clips are currently available';
+        $('clipFilename').textContent = 'Another reviewer may still have an active lease.';
+        $('assignmentText').textContent = 'The queue will reopen automatically when a lease expires.';
+        $('audio').removeAttribute('src');
+        for (const id of ['goodBtn', 'perfectBtn', 'badBtn', 'clearBtn']) $(id).disabled = true;
+      }
     }
 
-    function nextUnreviewed(currentIndex) {
-      const ordered = [...app.state.clips.slice(currentIndex + 1), ...app.state.clips.slice(0, currentIndex)];
-      const next = ordered.find(clip => !clip.review);
-      if (next) selectClip(next.filename);
-      else selectRelative(1);
-    }
-
-    function selectRelative(delta) {
-      if (!app.filtered.length) return;
-      const index = Math.max(0, app.filtered.findIndex(c => c.filename === app.current?.filename));
-      selectClip(app.filtered[(index + delta + app.filtered.length) % app.filtered.length].filename);
+    async function save(decision, reasons = [], note = '') {
+      if (!app.current || app.current.review || !isMine(app.current)) return;
+      const reviewedClip = app.current;
+      try {
+        await fetchJson(`/api/reviews/${encodeURIComponent(reviewedClip.filename)}`, {
+          method: 'PUT', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({...identityBody(), decision, reasons, note})
+        });
+        toast(decision === 'perfect' ? 'Marked perfect' : decision === 'good' ? 'Marked good' : 'Marked not OK');
+        await claimNext(false);
+      } catch (error) {
+        alert(error.message);
+        await refreshState();
+      }
     }
 
     function updateProgress() {
@@ -276,6 +413,20 @@
       $('progressText').textContent = `${s.reviewed} / ${s.total} reviewed`;
       $('summaryText').textContent = `${s.perfect} perfect · ${s.good} good · ${s.not_ok} not OK`;
       $('progressBar').style.width = `${s.total ? s.reviewed / s.total * 100 : 0}%`;
+      const names = s.active_reviewers || [];
+      $('activeReviewers').textContent = names.length ? `${names.length} active: ${names.join(', ')}` : 'No active leases';
+    }
+
+    async function heartbeat() {
+      if (!app.current || app.current.review || !isMine(app.current)) return;
+      try {
+        await fetchJson(`/api/claims/${encodeURIComponent(app.current.filename)}`, {
+          method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(identityBody())
+        });
+      } catch (error) {
+        toast(error.message);
+        await claimNext(false);
+      }
     }
 
     function bindActions() {
@@ -284,24 +435,33 @@
       $('badBtn').onclick = () => $('badPanel').classList.add('open');
       $('cancelBad').onclick = () => $('badPanel').classList.remove('open');
       $('saveBad').onclick = () => save('not_ok', [...document.querySelectorAll('#reasonGrid input:checked')].map(x => x.value), $('note').value);
-      $('prevBtn').onclick = () => selectRelative(-1);
-      $('nextBtn').onclick = () => selectRelative(1);
+      $('skipBtn').onclick = () => claimNext(true);
       $('clearBtn').onclick = async () => {
         if (!app.current) return;
-        const response = await fetch(`/api/reviews/${encodeURIComponent(app.current.filename)}`, {method:'DELETE'});
-        const payload = await response.json();
-        if (!response.ok) return;
-        app.current.review = null; app.state.summary = payload.summary; updateProgress(); applyFilters(); toast('Mark cleared');
+        const filename = app.current.filename;
+        try {
+          await fetchJson(`/api/reviews/${encodeURIComponent(filename)}`, {
+            method:'DELETE', headers:{'Content-Type':'application/json'}, body: JSON.stringify(identityBody())
+          });
+          toast('Mark cleared');
+          await refreshState();
+          await openClip(filename, false);
+        } catch (error) { alert(error.message); }
       };
-      window.onpopstate = event => { if (event.state?.filename) selectClip(event.state.filename, false); };
+      $('reviewerButton').onclick = async () => {
+        await releaseCurrent();
+        await requestIdentity(true);
+        await refreshState();
+        await claimNext(false);
+      };
+      window.onpopstate = event => { if (event.state?.filename) openClip(event.state.filename, false); };
       document.addEventListener('keydown', event => {
         if (['INPUT','TEXTAREA','SELECT'].includes(event.target.tagName)) return;
         if (event.code === 'Space') { event.preventDefault(); $('audio').paused ? $('audio').play() : $('audio').pause(); }
         if (event.key.toLowerCase() === 'g') save('good');
         if (event.key.toLowerCase() === 'p') save('perfect');
         if (event.key.toLowerCase() === 'x') $('badPanel').classList.add('open');
-        if (event.key === 'ArrowLeft') selectRelative(-1);
-        if (event.key === 'ArrowRight') selectRelative(1);
+        if (event.key === 'ArrowRight') claimNext(true);
       });
       updateProgress();
     }

@@ -7,16 +7,17 @@ import csv
 import io
 import json
 import os
+import secrets
 import threading
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 Decision = Literal["good", "perfect", "not_ok"]
 Reason = Literal[
@@ -36,10 +37,31 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-class ReviewUpdate(BaseModel):
+class ReviewerIdentity(BaseModel):
+    reviewer_id: str = Field(min_length=8, max_length=80, pattern=r"^[\w-]+$")
+    reviewer_name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("reviewer_name")
+    @classmethod
+    def clean_reviewer_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Reviewer name cannot be empty")
+        return value
+
+
+class ClaimNextRequest(ReviewerIdentity):
+    release_filename: str | None = None
+
+
+class ReviewUpdate(ReviewerIdentity):
     decision: Decision
     reasons: list[Reason] = Field(default_factory=list)
     note: str = Field(default="", max_length=1000)
+
+
+class ClaimConflict(RuntimeError):
+    """Raised when another reviewer owns a live clip lease."""
 
 
 class ReviewStore:
@@ -49,6 +71,7 @@ class ReviewStore:
         *,
         audio_directory: str,
         annotations_path: Path | None = None,
+        claim_seconds: int = 600,
     ):
         self.dataset_dir = dataset_dir.resolve()
         self.audio_directory = audio_directory
@@ -71,7 +94,8 @@ class ReviewStore:
         self.filenames = self._selected_filenames()
         self.filename_set = set(self.filenames)
         self.lock = threading.Lock()
-        self.reviews = self._load_reviews()
+        self.claim_seconds = max(30, claim_seconds)
+        self.reviews, self.claims = self._load_annotations()
 
     def _selected_filenames(self) -> list[str]:
         subset = self.manifest.get("balanced_listening_subset", {})
@@ -88,26 +112,38 @@ class ReviewStore:
             raise ValueError(f"No WAV files found in {self.audio_dir}")
         return filenames
 
-    def _load_reviews(self) -> dict[str, dict[str, Any]]:
+    def _load_annotations(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         if not self.annotations_path.exists():
-            return {}
+            return {}, {}
         payload = json.loads(self.annotations_path.read_text())
         reviews = payload.get("reviews", {})
         if not isinstance(reviews, dict):
             raise ValueError("manual-review.json has an invalid reviews object")
-        return {
+        claims = payload.get("claims", {})
+        if not isinstance(claims, dict):
+            raise ValueError("manual-review.json has an invalid claims object")
+        selected_reviews = {
             filename: review
             for filename, review in reviews.items()
             if filename in self.filename_set and isinstance(review, dict)
         }
+        selected_claims = {
+            filename: claim
+            for filename, claim in claims.items()
+            if filename in self.filename_set and isinstance(claim, dict)
+        }
+        return selected_reviews, selected_claims
 
     def _save(self) -> None:
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "dataset_dir": str(self.dataset_dir),
             "audio_directory": self.audio_directory,
             "updated_at": _now(),
             "reviews": self.reviews,
+            "claims": self.claims,
         }
         self.annotations_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.annotations_path.with_suffix(
@@ -115,6 +151,31 @@ class ReviewStore:
         )
         temporary.write_text(json.dumps(payload, indent=2) + "\n")
         os.replace(temporary, self.annotations_path)
+
+    def _claim_expired(self, claim: dict[str, Any]) -> bool:
+        try:
+            return datetime.fromisoformat(str(claim["expires_at"])) <= datetime.now(UTC)
+        except (KeyError, TypeError, ValueError):
+            return True
+
+    def _prune_claims(self) -> bool:
+        expired = [
+            filename
+            for filename, claim in self.claims.items()
+            if self._claim_expired(claim) or filename in self.reviews
+        ]
+        for filename in expired:
+            self.claims.pop(filename, None)
+        return bool(expired)
+
+    def _new_claim(self, identity: ReviewerIdentity) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        return {
+            "reviewer_id": identity.reviewer_id,
+            "reviewer_name": identity.reviewer_name.strip(),
+            "claimed_at": now.isoformat(),
+            "expires_at": (now + timedelta(seconds=self.claim_seconds)).isoformat(),
+        }
 
     def _record_summary(self, filename: str) -> dict[str, Any]:
         record = self.records_by_name.get(filename, {})
@@ -136,42 +197,52 @@ class ReviewStore:
             "vocal_music_coverage": validation.get("vocal_music_coverage"),
             "top_labels": [name for name, _ in labels.most_common(6)],
             "review": self.reviews.get(filename),
+            "claim": self.claims.get(filename),
         }
 
     def state(self) -> dict[str, Any]:
-        clips = [self._record_summary(filename) for filename in self.filenames]
-        decisions = Counter(
-            review.get("decision") for review in self.reviews.values()
-        )
-        reviewed = sum(decisions.values())
-        return {
-            "dataset": {
-                "name": self.manifest.get("name"),
-                "dataset_dir": str(self.dataset_dir),
-                "audio_directory": self.audio_directory,
-                "annotations_path": str(self.annotations_path),
-            },
-            "summary": {
-                "total": len(self.filenames),
-                "reviewed": reviewed,
-                "unreviewed": len(self.filenames) - reviewed,
-                "good": decisions["good"],
-                "perfect": decisions["perfect"],
-                "not_ok": decisions["not_ok"],
-            },
-            "reason_labels": {
-                "lacking_music": "Lacking music",
-                "lacking_background_audio": "Lacking background audio / SFX",
-                "vocal_music": "Singing or vocal music",
-                "speech_not_dialogue": "Speech is not dialogue",
-                "too_low_quality": "Too low quality",
-                "too_quiet": "Too quiet",
-                "distorted_or_clipped": "Distorted or clipped",
-                "wrong_balance": "Wrong voice/background balance",
-                "other": "Other",
-            },
-            "clips": clips,
-        }
+        with self.lock:
+            if self._prune_claims():
+                self._save()
+            clips = [self._record_summary(filename) for filename in self.filenames]
+            decisions = Counter(
+                review.get("decision") for review in self.reviews.values()
+            )
+            reviewed = sum(decisions.values())
+            active_reviewers = sorted(
+                {claim["reviewer_name"] for claim in self.claims.values()}
+            )
+            return {
+                "dataset": {
+                    "name": self.manifest.get("name"),
+                    "dataset_dir": str(self.dataset_dir),
+                    "audio_directory": self.audio_directory,
+                    "annotations_path": str(self.annotations_path),
+                },
+                "summary": {
+                    "total": len(self.filenames),
+                    "reviewed": reviewed,
+                    "unreviewed": len(self.filenames) - reviewed,
+                    "good": decisions["good"],
+                    "perfect": decisions["perfect"],
+                    "not_ok": decisions["not_ok"],
+                    "active_claims": len(self.claims),
+                    "available": len(self.filenames) - reviewed - len(self.claims),
+                    "active_reviewers": active_reviewers,
+                },
+                "reason_labels": {
+                    "lacking_music": "Lacking music",
+                    "lacking_background_audio": "Lacking background audio / SFX",
+                    "vocal_music": "Singing or vocal music",
+                    "speech_not_dialogue": "Speech is not dialogue",
+                    "too_low_quality": "Too low quality",
+                    "too_quiet": "Too quiet",
+                    "distorted_or_clipped": "Distorted or clipped",
+                    "wrong_balance": "Wrong voice/background balance",
+                    "other": "Other",
+                },
+                "clips": clips,
+            }
 
     def audio_path(self, filename: str) -> Path:
         if Path(filename).name != filename or filename not in self.filename_set:
@@ -181,6 +252,85 @@ class ReviewStore:
             raise KeyError(filename)
         return path
 
+    def claim_next(self, request: ClaimNextRequest) -> str | None:
+        with self.lock:
+            changed = self._prune_claims()
+            if request.release_filename:
+                current = self.claims.get(request.release_filename)
+                if current and current.get("reviewer_id") == request.reviewer_id:
+                    self.claims.pop(request.release_filename, None)
+                    changed = True
+            owned = next(
+                (
+                    filename
+                    for filename, claim in self.claims.items()
+                    if claim.get("reviewer_id") == request.reviewer_id
+                ),
+                None,
+            )
+            if owned:
+                self.claims[owned] = self._new_claim(request)
+                self._save()
+                return owned
+            candidates = [
+                filename
+                for filename in self.filenames
+                if filename not in self.reviews and filename not in self.claims
+            ]
+            if not candidates:
+                if changed:
+                    self._save()
+                return None
+            filename = secrets.choice(candidates)
+            self.claims[filename] = self._new_claim(request)
+            self._save()
+            return filename
+
+    def claim(self, filename: str, identity: ReviewerIdentity) -> bool:
+        if filename not in self.filename_set:
+            raise KeyError(filename)
+        with self.lock:
+            self._prune_claims()
+            if filename in self.reviews:
+                return False
+            existing = self.claims.get(filename)
+            if existing and existing.get("reviewer_id") != identity.reviewer_id:
+                raise ClaimConflict(
+                    f"This clip is being reviewed by {existing['reviewer_name']}"
+                )
+            for other_filename, other_claim in list(self.claims.items()):
+                if (
+                    other_filename != filename
+                    and other_claim.get("reviewer_id") == identity.reviewer_id
+                ):
+                    self.claims.pop(other_filename, None)
+            self.claims[filename] = self._new_claim(identity)
+            self._save()
+            return True
+
+    def heartbeat(self, filename: str, identity: ReviewerIdentity) -> dict[str, Any]:
+        if filename not in self.filename_set:
+            raise KeyError(filename)
+        with self.lock:
+            self._prune_claims()
+            claim = self.claims.get(filename)
+            if not claim or claim.get("reviewer_id") != identity.reviewer_id:
+                raise ClaimConflict("This clip is no longer assigned to you")
+            claim = self._new_claim(identity)
+            self.claims[filename] = claim
+            self._save()
+            return claim
+
+    def release(self, filename: str, identity: ReviewerIdentity) -> None:
+        if filename not in self.filename_set:
+            raise KeyError(filename)
+        with self.lock:
+            self._prune_claims()
+            claim = self.claims.get(filename)
+            if claim and claim.get("reviewer_id") == identity.reviewer_id:
+                self.claims.pop(filename, None)
+                self._save()
+
     def update(self, filename: str, update: ReviewUpdate) -> dict[str, Any]:
         if filename not in self.filename_set:
             raise KeyError(filename)
@@ -189,9 +339,7 @@ class ReviewStore:
         if "other" in update.reasons and not update.note.strip():
             raise ValueError("The Other reason requires a note")
         reasons = (
-            list(dict.fromkeys(update.reasons))
-            if update.decision == "not_ok"
-            else []
+            list(dict.fromkeys(update.reasons)) if update.decision == "not_ok" else []
         )
         note = update.note.strip() if update.decision == "not_ok" else ""
         review = {
@@ -199,16 +347,34 @@ class ReviewStore:
             "reasons": reasons,
             "note": note,
             "updated_at": _now(),
+            "reviewer_id": update.reviewer_id,
+            "reviewer_name": update.reviewer_name.strip(),
         }
         with self.lock:
+            self._prune_claims()
+            claim = self.claims.get(filename)
+            if not claim or claim.get("reviewer_id") != update.reviewer_id:
+                raise ClaimConflict("This clip is not assigned to you")
+            if filename in self.reviews:
+                raise ClaimConflict("This clip has already been reviewed")
             self.reviews[filename] = review
+            self.claims.pop(filename, None)
             self._save()
         return review
 
-    def clear(self, filename: str) -> None:
+    def clear(self, filename: str, identity: ReviewerIdentity) -> None:
         if filename not in self.filename_set:
             raise KeyError(filename)
         with self.lock:
+            existing = self.reviews.get(filename)
+            if existing and existing.get("reviewer_id") not in {
+                None,
+                identity.reviewer_id,
+            }:
+                raise ClaimConflict(
+                    f"Only {existing.get('reviewer_name', 'the original reviewer')} "
+                    "can clear this mark"
+                )
             self.reviews.pop(filename, None)
             self._save()
 
@@ -220,6 +386,8 @@ class ReviewStore:
             "reasons",
             "note",
             "updated_at",
+            "reviewer_id",
+            "reviewer_name",
             "background_bucket",
             "title",
             "source_url",
@@ -236,6 +404,8 @@ class ReviewStore:
                     "reasons": "|".join(review.get("reasons", [])),
                     "note": review.get("note", ""),
                     "updated_at": review.get("updated_at", ""),
+                    "reviewer_id": review.get("reviewer_id", ""),
+                    "reviewer_name": review.get("reviewer_name", ""),
                     "background_bucket": summary["background_bucket"],
                     "title": summary["title"],
                     "source_url": summary["source_url"],
@@ -245,7 +415,7 @@ class ReviewStore:
 
 
 def create_review_app(store: ReviewStore) -> FastAPI:
-    app = FastAPI(title="SAM Audio Manual Review", version="1.0.0")
+    app = FastAPI(title="SAM Audio Manual Review", version="2.0.0")
     html_path = Path(__file__).parent / "web" / "manual_review.html"
 
     def page() -> HTMLResponse:
@@ -267,6 +437,10 @@ def create_review_app(store: ReviewStore) -> FastAPI:
     def state() -> dict[str, Any]:
         return store.state()
 
+    @app.get("/healthz")
+    def health() -> dict[str, Any]:
+        return {"status": "ready", "summary": store.state()["summary"]}
+
     @app.get("/api/audio/{filename}")
     def audio(filename: str) -> FileResponse:
         try:
@@ -283,6 +457,8 @@ def create_review_app(store: ReviewStore) -> FastAPI:
             raise HTTPException(status_code=404, detail="Clip not found") from error
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+        except ClaimConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         return {
             "filename": filename,
             "review": review,
@@ -290,16 +466,51 @@ def create_review_app(store: ReviewStore) -> FastAPI:
         }
 
     @app.delete("/api/reviews/{filename}")
-    def clear_review(filename: str) -> dict[str, Any]:
+    def clear_review(filename: str, identity: ReviewerIdentity) -> dict[str, Any]:
         try:
-            store.clear(filename)
+            store.clear(filename, identity)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Clip not found") from error
+        except ClaimConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         return {
             "filename": filename,
             "review": None,
             "summary": store.state()["summary"],
         }
+
+    @app.post("/api/claims/next")
+    def claim_next(request: ClaimNextRequest) -> dict[str, Any]:
+        filename = store.claim_next(request)
+        return {"filename": filename, "summary": store.state()["summary"]}
+
+    @app.post("/api/claims/{filename}")
+    def claim(filename: str, identity: ReviewerIdentity) -> dict[str, Any]:
+        try:
+            claimed = store.claim(filename, identity)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Clip not found") from error
+        except ClaimConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"filename": filename, "claimed": claimed}
+
+    @app.put("/api/claims/{filename}")
+    def heartbeat(filename: str, identity: ReviewerIdentity) -> dict[str, Any]:
+        try:
+            claim_record = store.heartbeat(filename, identity)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Clip not found") from error
+        except ClaimConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"filename": filename, "claim": claim_record}
+
+    @app.delete("/api/claims/{filename}")
+    def release(filename: str, identity: ReviewerIdentity) -> dict[str, Any]:
+        try:
+            store.release(filename, identity)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Clip not found") from error
+        return {"filename": filename, "released": True}
 
     @app.get("/api/export.csv")
     def export_csv() -> StreamingResponse:
@@ -319,6 +530,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--annotations", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18081)
+    parser.add_argument("--claim-seconds", type=int, default=600)
     return parser
 
 
@@ -328,6 +540,7 @@ def main() -> None:
         args.dataset_dir,
         audio_directory=args.audio_directory,
         annotations_path=args.annotations,
+        claim_seconds=args.claim_seconds,
     )
     uvicorn.run(create_review_app(store), host=args.host, port=args.port)
 

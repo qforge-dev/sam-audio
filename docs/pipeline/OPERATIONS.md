@@ -260,7 +260,8 @@ uv run sam-pipeline-review \
   --port 18081
 ```
 
-Open `http://127.0.0.1:18081/`. Each clip can be marked **Good**, **Perfect**,
+Open `http://127.0.0.1:18081/`. Each browser first asks for a reviewer name,
+then receives a random unreviewed clip. Each clip can be marked **Good**, **Perfect**,
 or **Not OK**. Not OK supports multiple reasons: lacking music, lacking
 background audio/SFX, singing or vocal music, speech that is not dialogue, low
 quality, low volume, distortion/clipping, wrong voice/background balance, or an
@@ -273,6 +274,26 @@ URL. `Export CSV` downloads a flat table suitable for analysis and later policy
 tuning. Use `--annotations /some/path.json` to store annotations elsewhere, or
 `--audio-directory audio` to review all M2D-accepted clips instead of the
 balanced subset.
+
+The app supports multiple reviewers against one annotation file. Assignment is
+an atomic random lease: the server never gives a live clip to two reviewers,
+rejects stale or conflicting submissions with HTTP 409, renews an open clip in
+the browser, and releases an abandoned clip after 10 minutes. Saving or skipping
+immediately assigns another random clip. Reviewer identity and attribution are
+included in JSON and CSV exports. Change the lease with `--claim-seconds`.
+
+For a shared server, install `deploy/pipeline/sam-pipeline-review.service`, set
+`SAM_REVIEW_DATASET_DIR` in `/etc/sam-audio-review.env`, and install the Nginx
+template after replacing `__REVIEW_PATH__` with a random path. Keep the Python
+service bound to `127.0.0.1`; only Nginx should be public. The frontend derives
+its API and audio URLs from the Nginx path prefix, so refreshable clip links also
+work through the shared URL.
+
+If the EC2 security group cannot accept port 80, run the optional
+`sam-audio-review-tunnel.service`. It exposes the Nginx origin through an
+outbound Cloudflare Quick Tunnel without changing inbound firewall rules. Quick
+Tunnel hostnames are temporary and can change when the tunnel restarts; use a
+named Cloudflare Tunnel and DNS hostname for a permanent production URL.
 
 ## AudioSet validation batches
 
