@@ -266,6 +266,8 @@ or **Not OK**. Not OK supports multiple reasons: lacking music, lacking
 background audio/SFX, singing or vocal music, speech that is not dialogue, low
 quality, low volume, distortion/clipping, wrong voice/background balance, or an
 Other reason with a required note. Keyboard shortcuts are shown in the app.
+Press `X` to open Not OK, `1`–`9` to toggle its rejection reasons, `Enter`
+to save, or `Esc` to cancel. This keeps multi-reason tagging keyboard-only.
 
 Progress is written atomically after every decision to
 `manual-review.json` inside the dataset directory, so closing or refreshing the

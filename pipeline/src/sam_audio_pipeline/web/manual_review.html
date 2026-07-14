@@ -81,6 +81,8 @@
     .reason-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
     .reason { display: flex; align-items: center; gap: 9px; padding: 9px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; }
     .reason input { accent-color: var(--red); }
+    .reason kbd { margin-left: auto; min-width: 20px; padding: 2px 5px; border: 1px solid var(--line); border-radius: 5px; background: var(--card); color: var(--muted); font: 700 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; }
+    .bad-shortcuts { margin: 9px 0 0; color: var(--muted); font-size: 12px; }
     textarea { margin-top: 12px; min-height: 78px; resize: vertical; }
     .bad-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
     .save-bad { background: var(--red); color: #260707; border: 0; border-radius: 9px; padding: 9px 15px; font-weight: 800; }
@@ -164,10 +166,11 @@
           <div class="bad-panel" id="badPanel">
             <h3>What disqualifies this clip?</h3>
             <div class="reason-grid" id="reasonGrid"></div>
+            <div class="bad-shortcuts">Press 1–9 to toggle reasons · Enter to save · Esc to cancel</div>
             <textarea id="note" placeholder="Other reason or useful detail for improving the pipeline…"></textarea>
             <div class="bad-actions">
-              <button class="nav-btn" id="cancelBad">Cancel</button>
-              <button class="save-bad" id="saveBad">Save Not OK</button>
+              <button class="nav-btn" id="cancelBad">Cancel · Esc</button>
+              <button class="save-bad" id="saveBad">Save Not OK · Enter</button>
             </div>
           </div>
           <div class="footer-nav">
@@ -175,7 +178,7 @@
             <button class="nav-btn" id="skipBtn">Skip · random next →</button>
             <label class="auto"><input type="checkbox" id="autoPlay" checked> Play next automatically</label>
           </div>
-          <div class="shortcut">Shortcuts: Space play/pause · G good · P perfect · X not OK · → random next</div>
+          <div class="shortcut">Shortcuts: Space play/pause · G good · P perfect · X not OK · 1–9 reasons · Enter save · → random next</div>
         </div>
       </main>
     </div>
@@ -247,9 +250,9 @@
       $('exportLink').href = api('/api/export.csv');
       await refreshState();
       $('datasetName').textContent = `${app.state.dataset.name} · ${app.state.summary.total} clips`;
-      for (const [key, label] of Object.entries(app.state.reason_labels)) {
-        $('reasonGrid').insertAdjacentHTML('beforeend', `<label class="reason"><input type="checkbox" value="${key}"><span>${esc(label)}</span></label>`);
-      }
+      Object.entries(app.state.reason_labels).forEach(([key, label], index) => {
+        $('reasonGrid').insertAdjacentHTML('beforeend', `<label class="reason"><input type="checkbox" value="${key}"><span>${esc(label)}</span><kbd>${index + 1}</kbd></label>`);
+      });
       const buckets = [...new Set(app.state.clips.map(c => c.background_bucket).filter(Boolean))].sort();
       for (const bucket of buckets) $('bucketFilter').insertAdjacentHTML('beforeend', `<option value="${esc(bucket)}">${esc(bucket.replaceAll('_', ' '))}</option>`);
       $('search').addEventListener('input', applyFilters);
@@ -430,11 +433,13 @@
     }
 
     function bindActions() {
+      const selectedReasons = () => [...document.querySelectorAll('#reasonGrid input:checked')].map(x => x.value);
+      const saveNotOk = () => save('not_ok', selectedReasons(), $('note').value);
       $('goodBtn').onclick = () => save('good');
       $('perfectBtn').onclick = () => save('perfect');
       $('badBtn').onclick = () => $('badPanel').classList.add('open');
       $('cancelBad').onclick = () => $('badPanel').classList.remove('open');
-      $('saveBad').onclick = () => save('not_ok', [...document.querySelectorAll('#reasonGrid input:checked')].map(x => x.value), $('note').value);
+      $('saveBad').onclick = saveNotOk;
       $('skipBtn').onclick = () => claimNext(true);
       $('clearBtn').onclick = async () => {
         if (!app.current) return;
@@ -450,6 +455,7 @@
       };
       $('reviewerButton').onclick = async () => {
         await releaseCurrent();
+        app.current = null;
         await requestIdentity(true);
         await refreshState();
         await claimNext(false);
@@ -457,6 +463,23 @@
       window.onpopstate = event => { if (event.state?.filename) openClip(event.state.filename, false); };
       document.addEventListener('keydown', event => {
         if (['INPUT','TEXTAREA','SELECT'].includes(event.target.tagName)) return;
+        const badPanelOpen = $('badPanel').classList.contains('open');
+        if (badPanelOpen && /^[1-9]$/.test(event.key)) {
+          event.preventDefault();
+          const reason = document.querySelectorAll('#reasonGrid input')[Number(event.key) - 1];
+          if (reason) reason.checked = !reason.checked;
+          return;
+        }
+        if (badPanelOpen && event.key === 'Enter') {
+          event.preventDefault();
+          saveNotOk();
+          return;
+        }
+        if (badPanelOpen && event.key === 'Escape') {
+          event.preventDefault();
+          $('badPanel').classList.remove('open');
+          return;
+        }
         if (event.code === 'Space') { event.preventDefault(); $('audio').paused ? $('audio').play() : $('audio').pause(); }
         if (event.key.toLowerCase() === 'g') save('good');
         if (event.key.toLowerCase() === 'p') save('perfect');
