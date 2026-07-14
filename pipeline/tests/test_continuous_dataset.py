@@ -11,6 +11,7 @@ import numpy as np
 from sam_audio_pipeline.continuous_dataset import (
     _snapshot_manifest,
     assemble_once,
+    autoscale_decision,
     catalog_records,
     connect,
     progress_snapshot,
@@ -33,6 +34,56 @@ def _wav(path: Path) -> None:
         destination.setsampwidth(2)
         destination.setframerate(sample_rate)
         destination.writeframes(np.rint(samples * 32767).astype("<i2").tobytes())
+
+
+def _autoscale(**overrides: object) -> dict[str, object]:
+    settings: dict[str, object] = {
+        "download_concurrency": 8,
+        "asr_concurrency": 1,
+        "m2d_backlog": 0,
+        "asr_backlog": 0,
+        "cpu_percent": 40.0,
+        "gpu_free_mb": 14_500.0,
+        "download_min": 2,
+        "download_max": 8,
+        "asr_min": 1,
+        "asr_max": 2,
+        "cpu_low": 55.0,
+        "cpu_high": 85.0,
+        "m2d_backlog_high": 64,
+        "asr_backlog_high": 8,
+        "gpu_reserve_mb": 12_000.0,
+    }
+    settings.update(overrides)
+    return autoscale_decision(**settings)  # type: ignore[arg-type]
+
+
+def test_autoscaler_scales_asr_only_for_a_real_backlog_with_headroom() -> None:
+    decision = _autoscale(asr_backlog=8, m2d_backlog=64)
+
+    assert decision["asr_concurrency"] == 2
+    assert decision["download_concurrency"] == 8
+    assert decision["actions"] == ["increase_asr"]
+
+
+def test_autoscaler_reduces_producer_pressure_when_resources_are_constrained() -> None:
+    cpu = _autoscale(cpu_percent=95.0)
+    no_gpu_room = _autoscale(asr_backlog=8, gpu_free_mb=5_000.0)
+
+    assert cpu["download_concurrency"] == 7
+    assert cpu["actions"] == ["reduce_download_for_cpu"]
+    assert no_gpu_room["download_concurrency"] == 7
+    assert no_gpu_room["actions"] == ["reduce_download_for_asr"]
+
+
+def test_autoscaler_reclaims_idle_asr_then_increases_acquisition() -> None:
+    idle_asr = _autoscale(asr_concurrency=2)
+    source_starved = _autoscale(download_concurrency=7, cpu_percent=30.0)
+
+    assert idle_asr["asr_concurrency"] == 1
+    assert idle_asr["actions"] == ["decrease_idle_asr"]
+    assert source_starved["download_concurrency"] == 8
+    assert source_starved["actions"] == ["increase_download"]
 
 
 def test_independent_workers_promote_score_and_assemble_incrementally(

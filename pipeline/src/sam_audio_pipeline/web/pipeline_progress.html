@@ -69,6 +69,8 @@
     </section>
     <section class="funnel" id="funnel"></section>
     <section class="funnel" id="queues"></section>
+    <div class="section-head" id="autoscalerHeading" hidden><div><h2>Adaptive worker control</h2><p>Queue pressure and aggregate host resources determine live concurrency limits.</p></div></div>
+    <section class="funnel" id="autoscaler" hidden></section>
     <div class="section-head" id="throughputHeading" hidden><div><h2>Rolling throughput</h2><p>Audio duration processed per wall-clock minute; use queue growth to locate bottlenecks.</p></div></div>
     <div class="table-wrap" id="throughputWrap" hidden><table><thead><tr><th>Stage</th><th>Clips in window</th><th>Clips/min</th><th>Audio min/min</th><th>Equivalent audio hours/hour</th></tr></thead><tbody id="throughput"></tbody></table></div>
     <div class="section-head" id="batchHeading"><div><h2>Acquisition batches</h2><p>Counts update every five seconds.</p></div></div>
@@ -140,13 +142,35 @@
             ['waiting_for_assembly','Assembly queue','Full passes waiting for catalog materialization']
           ];
           $('queues').innerHTML = queueMetrics.map(([key,title,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${number(data.queues[key])}</strong><small>${help}</small></div>`).join('');
+          const autoscaler = data.autoscaler || {};
+          if (autoscaler.enabled) {
+            const gpu = autoscaler.gpu || {};
+            const limits = autoscaler.limits || {};
+            const bounds = autoscaler.bounds || {};
+            const downloadBounds = bounds.download || [0, 0];
+            const asrBounds = bounds.asr || [0, 0];
+            const gpuText = gpu.memory_free_mb == null ? 'GPU telemetry unavailable' : `${number(gpu.memory_free_mb)} MB free · ${number(gpu.utilization_percent)}% utilization`;
+            $('autoscalerHeading').hidden = false;
+            $('autoscaler').hidden = false;
+            $('autoscaler').innerHTML = [
+              ['Bottleneck', label(autoscaler.bottleneck), `Decision: ${(autoscaler.decision || ['hold']).map(label).join(', ')}`],
+              ['Aggregate CPU', `${Number(autoscaler.cpu_percent || 0).toFixed(1)}%`, 'Across all CPU cores, not one process/core'],
+              ['Acquisition limit', `${number(limits.download_concurrency)} / ${number(downloadBounds[1])}`, `Autoscaling range ${number(downloadBounds[0])}–${number(downloadBounds[1])}`],
+              ['ASR inference slots', `${number(limits.asr_concurrency)} / ${number(asrBounds[1])}`, `${gpuText} · range ${number(asrBounds[0])}–${number(asrBounds[1])}`]
+            ].map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
+          } else {
+            $('autoscalerHeading').hidden = true;
+            $('autoscaler').hidden = true;
+          }
           $('throughputHeading').hidden = false; $('throughputWrap').hidden = false;
           $('throughput').innerHTML = Object.entries(data.throughput).map(([stage,rate]) => `<tr><td><strong>${label(stage)}</strong><br><small class="muted">${Number(rate.observed_minutes).toFixed(1)} of ${number(rate.rolling_window_minutes)} min observed</small></td><td>${number(rate.clips)}</td><td>${Number(rate.clips_per_minute).toFixed(2)}</td><td>${Number(rate.audio_minutes_per_minute).toFixed(2)}</td><td>${Number(rate.audio_hours_per_hour).toFixed(2)}</td></tr>`).join('');
           $('batchHeading').hidden = true;
           $('batches').closest('.table-wrap').hidden = true;
           $('workerHeading').hidden = false; $('workerWrap').hidden = false;
           const configured = data.worker_config || {};
-          $('workers').innerHTML = data.workers.map(worker => `<tr><td><strong>${label(worker.worker)}</strong></td><td><span class="status ${worker.state}">${label(worker.state)}</span></td><td>${new Date(worker.updated_at).toLocaleTimeString()}</td><td>${Object.entries(worker.details || {}).map(([key,value]) => `${label(key)} ${number(value)}`).join(' · ')}</td></tr>`).join('') + `<tr><td><strong>Configured pools</strong></td><td><span class="status running">scalable</span></td><td>service environment</td><td>download ${number(configured.download_workers)} · M2D ${number(configured.m2d_workers)} · ASR ${number(configured.asr_workers)} · S3 concurrency ${number(configured.upload_concurrency)}</td></tr>`;
+          const downloadBounds = configured.download_concurrency_bounds || [configured.download_workers, configured.download_workers];
+          const asrBounds = configured.asr_inference_concurrency_bounds || [1, 1];
+          $('workers').innerHTML = data.workers.map(worker => `<tr><td><strong>${label(worker.worker)}</strong></td><td><span class="status ${worker.state}">${label(worker.state)}</span></td><td>${new Date(worker.updated_at).toLocaleTimeString()}</td><td>${Object.entries(worker.details || {}).map(([key,value]) => `${label(key)} ${number(value)}`).join(' · ')}</td></tr>`).join('') + `<tr><td><strong>Configured pools</strong></td><td><span class="status running">${configured.autoscaling_enabled ? 'autoscaling' : 'fixed'}</span></td><td>service environment</td><td>download ${number(downloadBounds[0])}–${number(downloadBounds[1])} · M2D processes ${number(configured.m2d_workers)} · ASR processes ${number(configured.asr_workers)} / inference slots ${number(asrBounds[0])}–${number(asrBounds[1])} · S3 concurrency ${number(configured.upload_concurrency)}</td></tr>`;
           $('snapshotHeading').hidden = false; $('snapshotWrap').hidden = false;
           $('snapshots').innerHTML = data.published_snapshots.length ? data.published_snapshots.map(snapshot => `<tr><td><strong>${snapshot.snapshot_id}</strong></td><td>${number(snapshot.record_count)}</td><td>${new Date(snapshot.published_at).toLocaleString()}</td><td>${snapshot.s3_prefix}</td></tr>`).join('') : '<tr><td colspan="4" class="muted">The first snapshot will publish automatically at 5,000 accepted clips.</td></tr>';
           $('combinedNote').textContent = 'Every accepted clip passes stereo/source quality, metadata exclusions, duration-scaled M2D voice + instrumental music + SFX overlap, English foreground speech, deduplication, and source diversity. Manual review is diagnostic only.';

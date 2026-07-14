@@ -419,9 +419,7 @@ def _cinematic_candidate_priority(item: dict[str, Any]) -> int:
     return sum(weight for term, weight in CINEMATIC_PRIORITY_WEIGHTS if term in title)
 
 
-def _search_youtube(
-    query: str, results: int, profile: str
-) -> list[dict[str, Any]]:
+def _search_youtube(query: str, results: int, profile: str) -> list[dict[str, Any]]:
     response = _run(
         [
             sys.executable,
@@ -444,12 +442,9 @@ def _search_youtube(
     ]
 
 
-def _search_dailymotion(
-    query: str, results: int, profile: str
-) -> list[dict[str, Any]]:
+def _search_dailymotion(query: str, results: int, profile: str) -> list[dict[str, Any]]:
     fields = (
-        "id,title,description,duration,owner.screenname,url,language,tags,"
-        "created_time"
+        "id,title,description,duration,owner.screenname,url,language,tags,created_time"
     )
     parameters = urllib.parse.urlencode(
         {
@@ -549,9 +544,7 @@ def discover_candidates(
                     candidates_path.write_text(json.dumps(filtered, indent=2) + "\n")
                     search_metadata["unique_candidates"] = len(filtered)
                     search_metadata["metadata_policy_refiltered_at"] = _now()
-                    search_path.write_text(
-                        json.dumps(search_metadata, indent=2) + "\n"
-                    )
+                    search_path.write_text(json.dumps(search_metadata, indent=2) + "\n")
                 logger.info("Reusing %d discovered candidates", len(filtered))
                 return filtered
 
@@ -692,9 +685,7 @@ def analyze_wav(path: Path) -> dict[str, Any]:
             1.0 if np.array_equal(samples[:, 0], samples[:, 1]) else 0.0
         )
     else:
-        channel_correlation = float(
-            np.corrcoef(samples[:, 0], samples[:, 1])[0, 1]
-        )
+        channel_correlation = float(np.corrcoef(samples[:, 0], samples[:, 1])[0, 1])
     return {
         "channels": channels,
         "is_stereo": True,
@@ -832,9 +823,7 @@ def _download_section(
         if Path(deno).is_file():
             command.extend(["--js-runtimes", f"deno:{deno}"])
         if client == "mweb":
-            command.extend(
-                ["--extractor-args", "youtube:player_client=mweb"]
-            )
+            command.extend(["--extractor-args", "youtube:player_client=mweb"])
         elif client == "android":
             command.extend(
                 [
@@ -936,6 +925,8 @@ def _normalize_candidate_from_source(
             "-t",
             str(CLIP_SECONDS),
             "-vn",
+            "-threads",
+            "1",
             "-ac",
             "2",
             "-ar",
@@ -1018,10 +1009,7 @@ def acquire_candidate_group(
     youtube_client: str = "auto",
 ) -> list[dict[str, Any]]:
     """Retrieve multiple Dailymotion sections with one metadata session."""
-    if (
-        len(candidates) <= 1
-        or candidates[0].get("source_platform") != "dailymotion"
-    ):
+    if len(candidates) <= 1 or candidates[0].get("source_platform") != "dailymotion":
         return [
             acquire_candidate(item, output_dir, youtube_client=youtube_client)
             for item in candidates
@@ -1158,6 +1146,20 @@ def _group_candidates_by_video(
     return list(groups.values())
 
 
+def _runtime_worker_limit(path: Path | None, *, maximum: int, default: int) -> int:
+    """Read an autoscaler limit without making acquisition depend on it."""
+    if not path:
+        return max(1, min(maximum, default))
+    try:
+        payload = json.loads(path.read_text())
+        value = payload.get("download_concurrency")
+        if value is None:
+            value = payload.get("limits", {}).get("download_concurrency")
+        return max(1, min(maximum, int(value)))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return max(1, min(maximum, default))
+
+
 def _candidate_key(item: dict[str, Any]) -> str:
     return str(
         item.get("candidate_id")
@@ -1176,9 +1178,10 @@ def _load_attempts(
         if not line.strip():
             continue
         item = json.loads(line)
-        if item.get("retrieval_status") == "success" and not (
-            output_dir / str(item.get("local_path"))
-        ).exists():
+        if (
+            item.get("retrieval_status") == "success"
+            and not (output_dir / str(item.get("local_path"))).exists()
+        ):
             continue
         attempts.append(item)
         attempted.add(_candidate_key(item))
@@ -1330,6 +1333,7 @@ def acquire_dataset(
     profile: str = "general",
     clips_per_video: int = 1,
     source: str = "youtube",
+    worker_limit_file: Path | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     candidates = discover_candidates(
@@ -1346,11 +1350,7 @@ def acquire_dataset(
     attempts_path = output_dir / "attempts.jsonl"
     attempts, attempted = _load_attempts(attempts_path, output_dir)
     accepted_count = len(_accepted(attempts, profile=profile))
-    pending = [
-        item
-        for item in candidates
-        if _candidate_key(item) not in attempted
-    ]
+    pending = [item for item in candidates if _candidate_key(item) not in attempted]
     logger.info(
         "Starting with %d/%d accepted; %d candidates remain",
         accepted_count,
@@ -1394,9 +1394,17 @@ def acquire_dataset(
                 in_flight[future] = None
                 return True
 
-            for _ in range(download_workers):
-                if not submit_next():
-                    break
+            def fill_available_slots() -> None:
+                limit = _runtime_worker_limit(
+                    worker_limit_file,
+                    maximum=download_workers,
+                    default=download_workers,
+                )
+                while accepted_count < total and len(in_flight) < limit:
+                    if not submit_next():
+                        break
+
+            fill_available_slots()
 
             while in_flight:
                 completed, _ = wait(in_flight, return_when=FIRST_COMPLETED)
@@ -1432,8 +1440,7 @@ def acquire_dataset(
                         total,
                         attempts_made,
                     )
-                    if accepted_count < total:
-                        submit_next()
+                fill_available_slots()
     manifest = write_manifest(
         output_dir,
         attempts,
@@ -1465,6 +1472,7 @@ def main() -> None:
     parser.add_argument("--results-per-query", type=int, default=12)
     parser.add_argument("--search-workers", type=int, default=8)
     parser.add_argument("--download-workers", type=int, default=8)
+    parser.add_argument("--worker-limit-file", type=Path)
     parser.add_argument("--candidate-multiplier", type=float, default=3.0)
     parser.add_argument("--max-attempts", type=int)
     parser.add_argument(
@@ -1494,9 +1502,7 @@ def main() -> None:
     if args.clip_seconds <= 0:
         parser.error("--clip-seconds must be positive")
     CLIP_SECONDS = float(args.clip_seconds)
-    clips_per_video = args.clips_per_video or (
-        3 if args.profile == "cinematic" else 1
-    )
+    clips_per_video = args.clips_per_video or (3 if args.profile == "cinematic" else 1)
     if clips_per_video < 1:
         parser.error("--clips-per-video must be positive")
     if args.verify_only:
@@ -1521,6 +1527,7 @@ def main() -> None:
         profile=args.profile,
         clips_per_video=clips_per_video,
         source=args.source,
+        worker_limit_file=args.worker_limit_file,
     )
     print(path)
 

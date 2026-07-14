@@ -19,6 +19,19 @@ SEARCH_WORKERS=${SAM_CONTINUOUS_SEARCH_WORKERS:-8}
 M2D_WORKERS=${SAM_CONTINUOUS_M2D_WORKERS:-1}
 ASR_WORKERS=${SAM_CONTINUOUS_ASR_WORKERS:-1}
 UPLOAD_CONCURRENCY=${SAM_CONTINUOUS_UPLOAD_CONCURRENCY:-10}
+AUTOSCALE_ENABLED=${SAM_CONTINUOUS_AUTOSCALE_ENABLED:-true}
+DOWNLOAD_MIN=${SAM_CONTINUOUS_DOWNLOAD_MIN:-2}
+ASR_CONCURRENCY_MIN=${SAM_CONTINUOUS_ASR_CONCURRENCY_MIN:-1}
+ASR_CONCURRENCY_MAX=${SAM_CONTINUOUS_ASR_CONCURRENCY_MAX:-2}
+ASR_CPU_THREADS=${SAM_CONTINUOUS_ASR_CPU_THREADS:-4}
+CPU_LOW=${SAM_CONTINUOUS_CPU_LOW:-55}
+CPU_HIGH=${SAM_CONTINUOUS_CPU_HIGH:-85}
+CPU_EMERGENCY=${SAM_CONTINUOUS_CPU_EMERGENCY:-95}
+M2D_BACKLOG_HIGH=${SAM_CONTINUOUS_M2D_BACKLOG_HIGH:-64}
+ASR_BACKLOG_HIGH=${SAM_CONTINUOUS_ASR_BACKLOG_HIGH:-8}
+GPU_RESERVE_MB=${SAM_CONTINUOUS_GPU_RESERVE_MB:-12000}
+AUTOSCALE_COOLDOWN_SECONDS=${SAM_CONTINUOUS_AUTOSCALE_COOLDOWN_SECONDS:-60}
+AUTOSCALE_INTERVAL_SECONDS=${SAM_CONTINUOUS_AUTOSCALE_INTERVAL_SECONDS:-10}
 
 for value in "$DOWNLOAD_WORKERS" "$SEARCH_WORKERS" "$M2D_WORKERS" "$ASR_WORKERS" "$UPLOAD_CONCURRENCY"; do
   if (( value < 1 )); then
@@ -26,6 +39,14 @@ for value in "$DOWNLOAD_WORKERS" "$SEARCH_WORKERS" "$M2D_WORKERS" "$ASR_WORKERS"
     exit 2
   fi
 done
+if (( DOWNLOAD_MIN < 1 || DOWNLOAD_MIN > DOWNLOAD_WORKERS )); then
+  echo "Download bounds must satisfy 1 <= min <= max" >&2
+  exit 2
+fi
+if (( ASR_CONCURRENCY_MIN < 1 || ASR_CONCURRENCY_MIN > ASR_CONCURRENCY_MAX )); then
+  echo "ASR concurrency bounds must satisfy 1 <= min <= max" >&2
+  exit 2
+fi
 
 export PYTHONPATH="$PIPELINE_ROOT/src"
 export HF_HOME=${HF_HOME:-/home/ubuntu/.cache/huggingface}
@@ -33,12 +54,21 @@ mkdir -p "$RUNS_DIR" "$WORKSPACE/raw-audio" "$WORKSPACE/accepted/audio" \
   "$WORKSPACE/m2d-validation" "$WORKSPACE/asr-validation"
 cd "$PIPELINE_ROOT"
 
-"$PIPELINE_PYTHON" -m sam_audio_pipeline.continuous_dataset configure \
-  --workspace "$WORKSPACE" \
-  --download-workers "$DOWNLOAD_WORKERS" \
-  --m2d-workers "$M2D_WORKERS" \
-  --asr-workers "$ASR_WORKERS" \
+configure_args=(
+  --workspace "$WORKSPACE"
+  --download-workers "$DOWNLOAD_WORKERS"
+  --m2d-workers "$M2D_WORKERS"
+  --asr-workers "$ASR_WORKERS"
   --upload-concurrency "$UPLOAD_CONCURRENCY"
+  --download-min "$DOWNLOAD_MIN"
+  --asr-concurrency-min "$ASR_CONCURRENCY_MIN"
+  --asr-concurrency-max "$ASR_CONCURRENCY_MAX"
+)
+if [[ "$AUTOSCALE_ENABLED" == "true" ]]; then
+  configure_args+=(--autoscaling-enabled)
+fi
+"$PIPELINE_PYTHON" -m sam_audio_pipeline.continuous_dataset configure \
+  "${configure_args[@]}"
 
 for ((index=0; index<M2D_WORKERS; index++)); do
   touch "$WORKSPACE/m2d-validation/worker-$index.jsonl"
@@ -48,8 +78,9 @@ heartbeat_loop() {
   local worker=$1
   while true; do
     "$PIPELINE_PYTHON" -m sam_audio_pipeline.continuous_dataset heartbeat \
-      --workspace "$WORKSPACE" --worker "$worker" >/dev/null 2>&1 || true
-    sleep 10
+      --workspace "$WORKSPACE" --worker "$worker" \
+      --follow --interval-seconds 10 >/dev/null 2>&1 || true
+    sleep 5
   done
 }
 
@@ -71,7 +102,7 @@ download_forever() {
   seed=$(test -s "$seed_file" && tr -dc '0-9' < "$seed_file" || date -u +%Y%m%d)
   while true; do
     local run_dir="$RUNS_DIR/run-$seed"
-    "$PIPELINE_PYTHON" -m sam_audio_pipeline.youtube_random \
+    nice -n 10 "$PIPELINE_PYTHON" -m sam_audio_pipeline.youtube_random \
       --output "$run_dir" \
       --source dailymotion \
       --profile cinematic \
@@ -83,6 +114,7 @@ download_forever() {
       --results-per-query 100 \
       --search-workers "$SEARCH_WORKERS" \
       --download-workers "$DOWNLOAD_WORKERS" \
+      --worker-limit-file "$WORKSPACE/autoscale-control.json" \
       --candidate-multiplier 1.8 \
       --max-attempts 40000 || true
     seed=$((seed + 1))
@@ -130,9 +162,27 @@ for ((index=0; index<ASR_WORKERS; index++)); do
     --require-cinematic-mix \
     --model small \
     --download-root /home/ubuntu/.cache/huggingface/faster-whisper \
+    --max-inference-workers "$ASR_CONCURRENCY_MAX" \
+    --cpu-threads "$ASR_CPU_THREADS" \
+    --autoscale-control "$WORKSPACE/autoscale-control.json" \
     --follow --poll-seconds 2 \
     --shard-index "$index" --shard-count "$ASR_WORKERS" &
 done
+
+if [[ "$AUTOSCALE_ENABLED" == "true" ]]; then
+  restart_worker autoscaler "$PIPELINE_PYTHON" \
+    -m sam_audio_pipeline.continuous_dataset autoscale \
+    --workspace "$WORKSPACE" \
+    --download-min "$DOWNLOAD_MIN" --download-max "$DOWNLOAD_WORKERS" \
+    --asr-min "$ASR_CONCURRENCY_MIN" --asr-max "$ASR_CONCURRENCY_MAX" \
+    --cpu-low "$CPU_LOW" --cpu-high "$CPU_HIGH" \
+    --cpu-emergency "$CPU_EMERGENCY" \
+    --m2d-backlog-high "$M2D_BACKLOG_HIGH" \
+    --asr-backlog-high "$ASR_BACKLOG_HIGH" \
+    --gpu-reserve-mb "$GPU_RESERVE_MB" \
+    --cooldown-seconds "$AUTOSCALE_COOLDOWN_SECONDS" \
+    --interval-seconds "$AUTOSCALE_INTERVAL_SECONDS" --follow &
+fi
 
 heartbeat_loop assembler &
 restart_worker assembler "$PIPELINE_PYTHON" -m sam_audio_pipeline.continuous_dataset \

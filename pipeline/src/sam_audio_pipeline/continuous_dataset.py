@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import subprocess
 import time
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -595,6 +596,10 @@ def progress_snapshot(
         worker_config = json.loads(config_path.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         worker_config = {}
+    try:
+        autoscaler = json.loads((workspace / "autoscaler.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        autoscaler = {"enabled": False, "state": "not_started"}
     payload = {
         "mode": "continuous",
         "updated_at": _now(),
@@ -613,6 +618,7 @@ def progress_snapshot(
         },
         "workers": workers,
         "worker_config": worker_config,
+        "autoscaler": autoscaler,
         "throughput": throughput,
         "goal": {
             "target_audio_hours": target_hours,
@@ -638,6 +644,290 @@ def progress_snapshot(
     }
     connection.close()
     return payload
+
+
+def _cpu_percent(sample_seconds: float = 0.5) -> float:
+    def counters() -> tuple[int, int]:
+        values = [
+            int(value)
+            for value in Path("/proc/stat").read_text().splitlines()[0].split()[1:]
+        ]
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        return sum(values), idle
+
+    total_before, idle_before = counters()
+    time.sleep(sample_seconds)
+    total_after, idle_after = counters()
+    total_delta = max(1, total_after - total_before)
+    busy = total_delta - (idle_after - idle_before)
+    return round(max(0.0, min(100.0, busy * 100.0 / total_delta)), 2)
+
+
+def _gpu_status() -> dict[str, float | None]:
+    try:
+        response = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        utilization, used, free = (
+            float(value.strip()) for value in response.stdout.splitlines()[0].split(",")
+        )
+        return {
+            "utilization_percent": utilization,
+            "memory_used_mb": used,
+            "memory_free_mb": free,
+        }
+    except (OSError, ValueError, subprocess.SubprocessError, IndexError):
+        return {
+            "utilization_percent": None,
+            "memory_used_mb": None,
+            "memory_free_mb": None,
+        }
+
+
+def autoscale_decision(
+    *,
+    download_concurrency: int,
+    asr_concurrency: int,
+    m2d_backlog: int,
+    asr_backlog: int,
+    cpu_percent: float,
+    gpu_free_mb: float | None,
+    download_min: int,
+    download_max: int,
+    asr_min: int,
+    asr_max: int,
+    cpu_low: float,
+    cpu_high: float,
+    m2d_backlog_high: int,
+    asr_backlog_high: int,
+    gpu_reserve_mb: float,
+) -> dict[str, Any]:
+    """Choose one conservative scale step using queues and resource headroom."""
+    download = download_concurrency
+    asr = asr_concurrency
+    actions: list[str] = []
+    if asr_backlog >= asr_backlog_high:
+        bottleneck = "asr"
+    elif m2d_backlog >= m2d_backlog_high:
+        bottleneck = "m2d"
+    elif cpu_percent >= cpu_high:
+        bottleneck = "cpu"
+    elif m2d_backlog == 0 and asr_backlog == 0:
+        bottleneck = "source_yield"
+    else:
+        bottleneck = "balanced"
+
+    if cpu_percent >= cpu_high and download > download_min:
+        download -= 1
+        actions.append("reduce_download_for_cpu")
+    elif asr_backlog >= asr_backlog_high:
+        gpu_has_room = gpu_free_mb is not None and gpu_free_mb >= gpu_reserve_mb
+        if cpu_percent < cpu_high and gpu_has_room and asr < asr_max:
+            asr += 1
+            actions.append("increase_asr")
+        elif download > download_min:
+            download -= 1
+            actions.append("reduce_download_for_asr")
+    elif m2d_backlog >= m2d_backlog_high and download > download_min:
+        download -= 1
+        actions.append("reduce_download_for_m2d")
+    elif asr_backlog == 0 and asr > asr_min:
+        asr -= 1
+        actions.append("decrease_idle_asr")
+    elif (
+        m2d_backlog == 0
+        and asr_backlog == 0
+        and cpu_percent <= cpu_low
+        and download < download_max
+    ):
+        download += 1
+        actions.append("increase_download")
+    return {
+        "download_concurrency": max(download_min, min(download_max, download)),
+        "asr_concurrency": max(asr_min, min(asr_max, asr)),
+        "bottleneck": bottleneck,
+        "actions": actions,
+    }
+
+
+def run_autoscaler_once(args: argparse.Namespace) -> dict[str, Any]:
+    workspace = args.workspace
+    control_path = workspace / "autoscale-control.json"
+    status_path = workspace / "autoscaler.json"
+    control_exists = control_path.is_file()
+    try:
+        control = json.loads(control_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        control = {
+            "download_concurrency": args.download_max,
+            "asr_concurrency": args.asr_min,
+        }
+    connection = connect(workspace)
+    counts = pipeline_counts(connection)
+    cpu = _cpu_percent()
+    gpu = _gpu_status()
+    m2d_backlog = max(0, counts["downloaded"] - counts["m2d_scored"])
+    asr_backlog = max(0, counts["m2d_accepted"] - counts["asr_scored"])
+    decision = autoscale_decision(
+        download_concurrency=int(
+            control.get("download_concurrency", args.download_max)
+        ),
+        asr_concurrency=int(control.get("asr_concurrency", args.asr_min)),
+        m2d_backlog=m2d_backlog,
+        asr_backlog=asr_backlog,
+        cpu_percent=cpu,
+        gpu_free_mb=gpu["memory_free_mb"],
+        download_min=args.download_min,
+        download_max=args.download_max,
+        asr_min=args.asr_min,
+        asr_max=args.asr_max,
+        cpu_low=args.cpu_low,
+        cpu_high=args.cpu_high,
+        m2d_backlog_high=args.m2d_backlog_high,
+        asr_backlog_high=args.asr_backlog_high,
+        gpu_reserve_mb=args.gpu_reserve_mb,
+    )
+    now = datetime.now(UTC)
+    last_changed_at = control.get("changed_at")
+    elapsed = (
+        (now - datetime.fromisoformat(last_changed_at)).total_seconds()
+        if last_changed_at
+        else float("inf")
+    )
+    emergency = cpu >= args.cpu_emergency
+    apply_change = bool(decision["actions"]) and (
+        elapsed >= args.cooldown_seconds or emergency
+    )
+    if apply_change:
+        previous = {
+            "download_concurrency": int(
+                control.get("download_concurrency", args.download_max)
+            ),
+            "asr_concurrency": int(control.get("asr_concurrency", args.asr_min)),
+        }
+        control = {
+            "schema_version": 1,
+            "download_concurrency": decision["download_concurrency"],
+            "asr_concurrency": decision["asr_concurrency"],
+            "changed_at": now.isoformat(),
+            "actions": decision["actions"],
+        }
+        _atomic_json(control_path, control)
+        with (workspace / "autoscaler-events.jsonl").open("a") as events:
+            events.write(
+                json.dumps(
+                    {
+                        "at": now.isoformat(),
+                        "previous": previous,
+                        "current": control,
+                        "cpu_percent": cpu,
+                        "gpu": gpu,
+                        "m2d_backlog": m2d_backlog,
+                        "asr_backlog": asr_backlog,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+    elif not control_exists:
+        control = {
+            "schema_version": 1,
+            "download_concurrency": int(
+                control.get("download_concurrency", args.download_max)
+            ),
+            "asr_concurrency": int(control.get("asr_concurrency", args.asr_min)),
+            "changed_at": now.isoformat(),
+            "actions": ["initialize"],
+        }
+        _atomic_json(control_path, control)
+    throughputs = {
+        "download": _throughput(
+            connection,
+            table="records",
+            timestamp_column="discovered_at",
+            clip_seconds=30.0,
+            window_minutes=15.0,
+        ),
+        "asr": _throughput(
+            connection,
+            table="asr_scores",
+            timestamp_column="scored_at",
+            clip_seconds=30.0,
+            window_minutes=15.0,
+        ),
+        "accepted": _throughput(
+            connection,
+            table="accepted",
+            timestamp_column="accepted_at",
+            clip_seconds=30.0,
+            window_minutes=15.0,
+        ),
+    }
+    status = {
+        "enabled": True,
+        "state": "running",
+        "observed_at": now.isoformat(),
+        "bottleneck": decision["bottleneck"],
+        "cpu_percent": cpu,
+        "gpu": gpu,
+        "queues": {"m2d": m2d_backlog, "asr": asr_backlog},
+        "limits": {
+            "download_concurrency": int(
+                control.get("download_concurrency", args.download_max)
+            ),
+            "asr_concurrency": int(control.get("asr_concurrency", args.asr_min)),
+        },
+        "bounds": {
+            "download": [args.download_min, args.download_max],
+            "asr": [args.asr_min, args.asr_max],
+        },
+        "decision": (
+            decision["actions"]
+            if apply_change
+            else (["cooldown"] if decision["actions"] else ["hold"])
+        ),
+        "cooldown_remaining_seconds": max(
+            0.0, round(args.cooldown_seconds - elapsed, 1)
+        ),
+        "throughput": throughputs,
+    }
+    _atomic_json(status_path, status)
+    _heartbeat(
+        connection,
+        "autoscaler",
+        bottleneck=status["bottleneck"],
+        cpu_percent=cpu,
+        **status["limits"],
+    )
+    connection.close()
+    return status
+
+
+def run_autoscaler(args: argparse.Namespace) -> None:
+    while True:
+        try:
+            status = run_autoscaler_once(args)
+            logger.info(
+                "Autoscaler %s CPU %.1f%% queues=%s limits=%s decision=%s",
+                status["bottleneck"],
+                status["cpu_percent"],
+                status["queues"],
+                status["limits"],
+                status["decision"],
+            )
+        except Exception:
+            logger.exception("Autoscaler iteration failed")
+        if not args.follow:
+            return
+        time.sleep(args.interval_seconds)
 
 
 def verify_snapshot(
@@ -941,12 +1231,33 @@ def main() -> None:
     heartbeat.add_argument("--workspace", type=Path, required=True)
     heartbeat.add_argument("--worker", required=True)
     heartbeat.add_argument("--state", default="running")
+    heartbeat.add_argument("--follow", action="store_true")
+    heartbeat.add_argument("--interval-seconds", type=float, default=10.0)
     configure = commands.add_parser("configure")
     configure.add_argument("--workspace", type=Path, required=True)
     configure.add_argument("--download-workers", type=int, required=True)
     configure.add_argument("--m2d-workers", type=int, required=True)
     configure.add_argument("--asr-workers", type=int, required=True)
     configure.add_argument("--upload-concurrency", type=int, required=True)
+    configure.add_argument("--autoscaling-enabled", action="store_true")
+    configure.add_argument("--download-min", type=int, default=1)
+    configure.add_argument("--asr-concurrency-min", type=int, default=1)
+    configure.add_argument("--asr-concurrency-max", type=int, default=1)
+    autoscale = commands.add_parser("autoscale")
+    autoscale.add_argument("--workspace", type=Path, required=True)
+    autoscale.add_argument("--download-min", type=int, default=2)
+    autoscale.add_argument("--download-max", type=int, default=8)
+    autoscale.add_argument("--asr-min", type=int, default=1)
+    autoscale.add_argument("--asr-max", type=int, default=2)
+    autoscale.add_argument("--cpu-low", type=float, default=55.0)
+    autoscale.add_argument("--cpu-high", type=float, default=85.0)
+    autoscale.add_argument("--cpu-emergency", type=float, default=95.0)
+    autoscale.add_argument("--m2d-backlog-high", type=int, default=64)
+    autoscale.add_argument("--asr-backlog-high", type=int, default=8)
+    autoscale.add_argument("--gpu-reserve-mb", type=float, default=12_000.0)
+    autoscale.add_argument("--cooldown-seconds", type=float, default=60.0)
+    autoscale.add_argument("--interval-seconds", type=float, default=10.0)
+    autoscale.add_argument("--follow", action="store_true")
     verify = commands.add_parser("verify")
     verify.add_argument("--dataset-dir", type=Path, required=True)
     verify.add_argument("--expected-count", type=int)
@@ -992,9 +1303,13 @@ def main() -> None:
     elif args.command == "progress":
         print(json.dumps(progress_snapshot(args.workspace), indent=2))
     elif args.command == "heartbeat":
-        connection = connect(args.workspace)
-        _heartbeat(connection, args.worker, args.state)
-        connection.close()
+        while True:
+            connection = connect(args.workspace)
+            _heartbeat(connection, args.worker, args.state)
+            connection.close()
+            if not args.follow:
+                break
+            time.sleep(max(1.0, args.interval_seconds))
     elif args.command == "configure":
         _atomic_json(
             args.workspace / "config.json",
@@ -1003,6 +1318,15 @@ def main() -> None:
                 "m2d_workers": args.m2d_workers,
                 "asr_workers": args.asr_workers,
                 "upload_concurrency": args.upload_concurrency,
+                "autoscaling_enabled": args.autoscaling_enabled,
+                "download_concurrency_bounds": [
+                    args.download_min,
+                    args.download_workers,
+                ],
+                "asr_inference_concurrency_bounds": [
+                    args.asr_concurrency_min,
+                    args.asr_concurrency_max,
+                ],
                 "coordinator_workers": {
                     "promoter": 1,
                     "assembler": 1,
@@ -1011,6 +1335,16 @@ def main() -> None:
                 "updated_at": _now(),
             },
         )
+    elif args.command == "autoscale":
+        if not 1 <= args.download_min <= args.download_max:
+            parser.error("download bounds must satisfy 1 <= min <= max")
+        if not 1 <= args.asr_min <= args.asr_max:
+            parser.error("ASR bounds must satisfy 1 <= min <= max")
+        if not 0 <= args.cpu_low < args.cpu_high <= args.cpu_emergency <= 100:
+            parser.error(
+                "CPU thresholds must satisfy 0 <= low < high <= emergency <= 100"
+            )
+        run_autoscaler(args)
     elif args.command == "verify":
         result = verify_snapshot(
             args.dataset_dir,

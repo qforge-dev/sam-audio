@@ -15,6 +15,7 @@ import shutil
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -621,6 +622,74 @@ class _M2DAllowlistTail:
         )
 
 
+def _runtime_asr_concurrency(path: Path | None, maximum: int) -> int:
+    if not path:
+        return 1
+    try:
+        payload = json.loads(path.read_text())
+        value = payload.get("asr_concurrency")
+        if value is None:
+            value = payload.get("limits", {}).get("asr_concurrency")
+        return max(1, min(maximum, int(value)))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return 1
+
+
+def _transcribe_asr_file(
+    model: Any,
+    path: Path,
+    args: argparse.Namespace,
+    *,
+    shard_index: int,
+    shard_count: int,
+) -> dict[str, Any]:
+    segments_source, info = model.transcribe(
+        str(path),
+        language=None,
+        beam_size=args.beam_size,
+        vad_filter=True,
+        condition_on_previous_text=False,
+    )
+    segments = list(segments_source)
+    transcript = " ".join(segment.text for segment in segments).strip()
+    best_log_probability = max(
+        (float(segment.avg_logprob) for segment in segments), default=-99.0
+    )
+    lowest_no_speech = min(
+        (float(segment.no_speech_prob) for segment in segments), default=1.0
+    )
+    return {
+        "filename": path.name,
+        "scored_at": _now(),
+        "asr": {
+            "model": args.model,
+            "device": args.device,
+            "compute_type": args.compute_type,
+            "beam_size": args.beam_size,
+            "worker_shard_index": shard_index,
+            "worker_shard_count": shard_count,
+        },
+        **evaluate_asr(
+            transcript=transcript,
+            duration_after_vad=float(info.duration_after_vad),
+            average_log_probability=best_log_probability,
+            no_speech_probability=lowest_no_speech,
+            detected_language=str(info.language),
+            language_probability=float(info.language_probability),
+        ),
+        "segments": [
+            {
+                "start_seconds": round(float(segment.start), 3),
+                "end_seconds": round(float(segment.end), 3),
+                "text": segment.text.strip(),
+                "average_log_probability": round(float(segment.avg_logprob), 8),
+                "no_speech_probability": round(float(segment.no_speech_prob), 8),
+            }
+            for segment in segments
+        ],
+    }
+
+
 def score_asr_directory(args: argparse.Namespace) -> None:
     try:
         from faster_whisper import WhisperModel
@@ -629,10 +698,13 @@ def score_asr_directory(args: argparse.Namespace) -> None:
             "ASR scoring requires faster-whisper in the runtime environment"
         ) from error
 
+    max_inference_workers = max(1, int(getattr(args, "max_inference_workers", 1)))
     model = WhisperModel(
         args.model,
         device=args.device,
         compute_type=args.compute_type,
+        cpu_threads=max(0, int(getattr(args, "cpu_threads", 0))),
+        num_workers=max_inference_workers,
         download_root=(str(args.download_root) if args.download_root else None),
     )
     m2d_results = getattr(args, "m2d_results", None)
@@ -668,7 +740,11 @@ def score_asr_directory(args: argparse.Namespace) -> None:
     shard_count = int(getattr(args, "shard_count", 1))
     processed = 0
     previous_allowed_count = -1
-    with args.output.open(mode, encoding="utf-8") as destination:
+    control_file = getattr(args, "autoscale_control", None)
+    with (
+        args.output.open(mode, encoding="utf-8") as destination,
+        ThreadPoolExecutor(max_workers=max_inference_workers) as executor,
+    ):
         while True:
             files = sorted(args.input_dir.glob(args.glob))
             files = [
@@ -699,61 +775,24 @@ def score_asr_directory(args: argparse.Namespace) -> None:
                     break
                 time.sleep(poll_seconds)
                 continue
-            for path in pending:
-                segments_source, info = model.transcribe(
-                    str(path),
-                    language=None,
-                    beam_size=args.beam_size,
-                    vad_filter=True,
-                    condition_on_previous_text=False,
-                )
-                segments = list(segments_source)
-                transcript = " ".join(segment.text for segment in segments).strip()
-                best_log_probability = max(
-                    (float(segment.avg_logprob) for segment in segments),
-                    default=-99.0,
-                )
-                lowest_no_speech = min(
-                    (float(segment.no_speech_prob) for segment in segments),
-                    default=1.0,
-                )
-                result = {
-                    "filename": path.name,
-                    "scored_at": _now(),
-                    "asr": {
-                        "model": args.model,
-                        "device": args.device,
-                        "compute_type": args.compute_type,
-                        "beam_size": args.beam_size,
-                        "worker_shard_index": shard_index,
-                        "worker_shard_count": shard_count,
-                    },
-                    **evaluate_asr(
-                        transcript=transcript,
-                        duration_after_vad=float(info.duration_after_vad),
-                        average_log_probability=best_log_probability,
-                        no_speech_probability=lowest_no_speech,
-                        detected_language=str(info.language),
-                        language_probability=float(info.language_probability),
-                    ),
-                    "segments": [
-                        {
-                            "start_seconds": round(float(segment.start), 3),
-                            "end_seconds": round(float(segment.end), 3),
-                            "text": segment.text.strip(),
-                            "average_log_probability": round(
-                                float(segment.avg_logprob), 8
-                            ),
-                            "no_speech_probability": round(
-                                float(segment.no_speech_prob), 8
-                            ),
-                        }
-                        for segment in segments
-                    ],
-                }
+            concurrency = _runtime_asr_concurrency(control_file, max_inference_workers)
+            batch = pending[:concurrency]
+            futures = {
+                executor.submit(
+                    _transcribe_asr_file,
+                    model,
+                    path,
+                    args,
+                    shard_index=shard_index,
+                    shard_count=shard_count,
+                ): path
+                for path in batch
+            }
+            for future in as_completed(futures):
+                result = future.result()
                 destination.write(json.dumps(result, separators=(",", ":")) + "\n")
                 destination.flush()
-                existing.add(path.name)
+                existing.add(str(result["filename"]))
                 processed += 1
                 if processed % 25 == 0:
                     completed = sum(path.name in existing for path in files)
@@ -1294,6 +1333,9 @@ def _parser() -> argparse.ArgumentParser:
     asr_score.add_argument("--poll-seconds", type=float, default=2.0)
     asr_score.add_argument("--shard-index", type=int, default=0)
     asr_score.add_argument("--shard-count", type=int, default=1)
+    asr_score.add_argument("--max-inference-workers", type=int, default=1)
+    asr_score.add_argument("--cpu-threads", type=int, default=0)
+    asr_score.add_argument("--autoscale-control", type=Path)
     asr_score.set_defaults(handler=score_asr_directory)
 
     materialize = subparsers.add_parser(

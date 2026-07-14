@@ -11,12 +11,25 @@ from sam_audio_pipeline.m2d_validator import (
     _belongs_to_shard,
     _m2d_asr_allowlist,
     _M2DAllowlistTail,
+    _runtime_asr_concurrency,
     evaluate_asr,
     evaluate_probabilities,
     load_label_families,
     materialize_accepted,
     merge_materialized,
 )
+
+
+def test_runtime_asr_concurrency_is_bounded_and_failure_safe(tmp_path: Path) -> None:
+    control = tmp_path / "autoscale-control.json"
+
+    assert _runtime_asr_concurrency(control, 2) == 1
+    control.write_text(json.dumps({"asr_concurrency": 2}))
+    assert _runtime_asr_concurrency(control, 2) == 2
+    control.write_text(json.dumps({"asr_concurrency": 9}))
+    assert _runtime_asr_concurrency(control, 2) == 2
+    control.write_text("not-json")
+    assert _runtime_asr_concurrency(control, 2) == 1
 
 
 def test_worker_shards_form_a_stable_non_overlapping_partition() -> None:

@@ -13,6 +13,7 @@ from sam_audio_pipeline.youtube_random import (
     _cinematic_candidate_priority,
     _group_candidates_by_video,
     _query_for_source,
+    _runtime_worker_limit,
     _sample_clip_starts,
     _use_full_source_for_group,
     analyze_wav,
@@ -39,6 +40,18 @@ def source_format() -> dict[str, object]:
     return {"sample_rate_hz": 48_000, "channels": 2, "bitrate_kbps": 130.0}
 
 
+def test_runtime_download_limit_is_bounded_and_failure_safe(tmp_path: Path) -> None:
+    control = tmp_path / "autoscale-control.json"
+
+    assert _runtime_worker_limit(control, maximum=8, default=6) == 6
+    control.write_text(json.dumps({"download_concurrency": 3}))
+    assert _runtime_worker_limit(control, maximum=8, default=6) == 3
+    control.write_text(json.dumps({"download_concurrency": 99}))
+    assert _runtime_worker_limit(control, maximum=8, default=6) == 8
+    control.write_text("not-json")
+    assert _runtime_worker_limit(control, maximum=8, default=6) == 6
+
+
 def test_queries_are_reproducible_mix_biased_and_not_audioset() -> None:
     first = build_queries(17, 20)
     second = build_queries(17, 20)
@@ -59,8 +72,7 @@ def test_cinematic_queries_and_metadata_filter_target_raw_scenes() -> None:
     assert all("-reaction" in query and "-Bollywood" in query for query in queries)
     assert all(
         any(
-            hint in query
-            for hint in ("English", "dialogue", "soundtrack", "cinematic")
+            hint in query for hint in ("English", "dialogue", "soundtrack", "cinematic")
         )
         for query in queries
     )
@@ -239,9 +251,7 @@ def test_cached_candidates_are_refiltered_under_current_metadata_policy(
     )
 
     assert [item["video_id"] for item in filtered] == ["good"]
-    assert json.loads((metadata / "search.json").read_text())[
-        "unique_candidates"
-    ] == 1
+    assert json.loads((metadata / "search.json").read_text())["unique_candidates"] == 1
 
 
 def test_accepted_records_follow_current_metadata_policy() -> None:
