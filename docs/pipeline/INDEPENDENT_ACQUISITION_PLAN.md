@@ -183,7 +183,7 @@ alter the continuous catalog or remove already-published clips.
 | 3 | 2026-07-14 20:26–20:44 | passed with cache migration | Resident model stayed loaded; fresh scans were normally 6–7 s end to end and the downloaded queue remained bounded |
 | 4a | 2026-07-14 20:37–20:55 | failed supply gate | Atomic handoff succeeded and duplicate candidate/hash counts stayed zero, but only 6 raw / 3 accepted clips arrived while exhausted caches were drained |
 | 4b | 2026-07-14 20:55–21:10 | passed 15-minute gate | 24.50 raw h/h, 13.80 accepted h/h, 56.1% yield; broader discovery produced 344 unseen sources in 7.6 s |
-| 5 | from 2026-07-14 21:06 | measuring | Final restart-safe build held unchanged for the clean 60-minute comparison |
+| 5 | 2026-07-14 20:37–21:37 | passed sustained gate | Conservative rolling hour: 13.17 raw h/h, 7.12 accepted h/h, 54.0% yield; includes cache cleanup and rollout restarts |
 
 Phase 1 found two issues before production handoff. The first shadow process
 inherited the sampler's 10-second module default; the disposable frontier was
@@ -233,3 +233,29 @@ M2D, ASR, and assembly returned to zero pending items at the gate, and catalog
 queries found zero duplicate candidate IDs, raw hashes, or accepted hashes.
 The final restart-safety change lets stable worker IDs reclaim their leases and
 explicitly expires claims left by an earlier process before autoscaler gating.
+
+The staged path then ran for a full production hour. The conservative rolling
+window (which includes the early cache cleanup and rollout restarts) contained
+1,544 raw and 833 accepted clips: 13.17 raw audio h/h and 7.12 accepted audio
+h/h, with 54.0% end-to-end yield. Accepted throughput improved 74% over the
+4.09 h/h baseline. The last 15-minute cohort was 6.92 h/h; shorter windows
+varied with source yield while queues continued to move.
+
+From the final restart onward, transfer recorded 512 successes, 128 terminal
+rejections, four transient retries, and one exhausted retry (p50 21.91 s, p95
+138.71 s). The resident scan stage recorded 255 passes and 230 terminal
+rejections (p50 7.99 s, p95 42.61 s). Extraction published 1,709 clips with a
+12.79-second p50 and 24.32-second p95. Both SQLite databases passed integrity
+checks, all seven services were active, the acquisition target was enabled for
+boot, and duplicate candidate/raw/accepted hash counts were zero.
+
+### Capacity follow-up
+
+The higher rate exposes storage as the next operational constraint. Staged run
+directories grew to 15 GB during rollout and the host had 121 GB free at the
+final audit. Raw and accepted WAVs are hard-linked into the catalog/review
+directories, so deleting acquisition directories alone is not a safe or
+sufficient retention policy. Before running unattended beyond the remaining
+disk horizon, add snapshot-confirmed S3 retention/pruning or expand the volume.
+This rollout intentionally does not delete dataset artifacts without an
+explicit retention decision.
