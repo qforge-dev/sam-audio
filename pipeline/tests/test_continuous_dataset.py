@@ -189,5 +189,10 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
     assert progress["counts"]["rejected_total"] == 0
     assert progress["next_snapshot"]["remaining"] == 4999
     assert progress["throughput"]["download"]["audio_minutes_per_minute"] > 0
+    assert progress["flow"]["state"] == "balanced"
+    assert progress["flow"]["processed_audio_hours_per_wall_hour"] > 0
+    assert progress["flow"]["accepted_audio_hours_per_wall_hour"] > 0
+    assert progress["flow"]["rolling_yield_percent"] == 100.0
+    assert progress["flow"]["stalled_stages"] == []
     assert progress["goal"]["target_audio_hours"] == 10_000
     assert progress["goal"]["estimated_completion_at"] is not None

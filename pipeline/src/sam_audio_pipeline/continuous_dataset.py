@@ -600,15 +600,63 @@ def progress_snapshot(
         autoscaler = json.loads((workspace / "autoscaler.json").read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         autoscaler = {"enabled": False, "state": "not_started"}
+    queues = {
+        "waiting_for_m2d": max(0, counts["downloaded"] - counts["m2d_scored"]),
+        "waiting_for_asr": max(0, counts["m2d_accepted"] - counts["asr_scored"]),
+        "waiting_for_assembly": max(0, counts["asr_accepted"] - counts["accepted"]),
+    }
+    stalled_stages = [
+        stage
+        for stage, backlog, recent_clips in (
+            ("m2d", queues["waiting_for_m2d"], throughput["m2d"]["clips"]),
+            ("asr", queues["waiting_for_asr"], throughput["asr"]["clips"]),
+            (
+                "assembly",
+                queues["waiting_for_assembly"],
+                throughput["accepted"]["clips"],
+            ),
+        )
+        if backlog > 0 and recent_clips == 0
+    ]
+    unhealthy_workers = [
+        worker["worker"] for worker in workers if worker["state"] != "running"
+    ]
+    constrained_by = str(autoscaler.get("bottleneck") or "")
+    if stalled_stages or unhealthy_workers:
+        flow_state = "stalled"
+        flow_explanation = (
+            "A pending queue has no recent consumer output or a worker is unhealthy."
+        )
+    elif constrained_by in {"cpu", "m2d", "asr"}:
+        flow_state = "constrained"
+        flow_explanation = (
+            f"Work is still flowing, but the autoscaler is managing "
+            f"{constrained_by} pressure. This is constrained, not stalled."
+        )
+    else:
+        flow_state = "balanced"
+        flow_explanation = (
+            "Workers are healthy and every pending queue has recent consumer output. "
+            "The processing/output gap is filtering yield, not stuck work."
+        )
+    processed_rate = float(throughput["download"]["audio_hours_per_hour"])
+    output_rate = float(throughput["accepted"]["audio_hours_per_hour"])
+    rolling_yield = output_rate / processed_rate * 100.0 if processed_rate else 0.0
     payload = {
         "mode": "continuous",
         "updated_at": _now(),
         "clip_seconds": clip_seconds,
         "counts": counts,
-        "queues": {
-            "waiting_for_m2d": max(0, counts["downloaded"] - counts["m2d_scored"]),
-            "waiting_for_asr": max(0, counts["m2d_accepted"] - counts["asr_scored"]),
-            "waiting_for_assembly": max(0, counts["asr_accepted"] - counts["accepted"]),
+        "queues": queues,
+        "flow": {
+            "state": flow_state,
+            "explanation": flow_explanation,
+            "processed_audio_hours_per_wall_hour": processed_rate,
+            "accepted_audio_hours_per_wall_hour": output_rate,
+            "rolling_yield_percent": round(rolling_yield, 2),
+            "window_minutes": throughput_window_minutes,
+            "stalled_stages": stalled_stages,
+            "unhealthy_workers": unhealthy_workers,
         },
         "next_snapshot": {
             "record_count": next_snapshot,

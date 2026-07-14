@@ -42,6 +42,10 @@
     .worker.complete { color:var(--green); }
     .pipeline { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; }
     .pipeline span { padding:6px 9px; border-radius:8px; background:var(--panel2); border:1px solid var(--line); color:#bdcad5; }
+    .flow-note { margin:-4px 0 16px; padding:13px 16px; border:1px solid var(--line); border-radius:11px; background:var(--panel2); color:var(--muted); }
+    .flow-note.balanced { border-color:rgba(86,212,145,.35); color:#bcebd2; }
+    .flow-note.constrained { border-color:rgba(247,199,93,.4); color:#f7dda2; }
+    .flow-note.stalled { border-color:rgba(255,139,139,.45); color:#ffb5b5; }
     .error { color:#ff8b8b; white-space:pre-wrap; }
     @media(max-width:850px){ .hero{grid-template-columns:1fr}.funnel{grid-template-columns:repeat(2,1fr)} }
     @media(max-width:520px){ .funnel{grid-template-columns:1fr}.shell{padding:22px 14px 50px}header{padding:14px} }
@@ -67,6 +71,9 @@
         <p id="goalText"></p>
       </div>
     </section>
+    <div class="section-head" id="flowHeading" hidden><div><h2>Pipeline flow</h2><p>Gross source processing versus final accepted output over the same rolling window.</p></div></div>
+    <section class="funnel" id="flow" hidden></section>
+    <p class="flow-note" id="flowNote" hidden></p>
     <section class="funnel" id="funnel"></section>
     <section class="funnel" id="queues"></section>
     <div class="section-head" id="autoscalerHeading" hidden><div><h2>Adaptive worker control</h2><p>Queue pressure and aggregate host resources determine live concurrency limits.</p></div></div>
@@ -129,6 +136,19 @@
           const eta = goal.estimated_completion_at ? `${number(goal.estimated_days_remaining)} days · ${new Date(goal.estimated_completion_at).toLocaleDateString()}` : 'collecting throughput data';
           $('goalText').innerHTML = `<strong>${Number(goal.current_audio_hours).toFixed(2)} / ${number(goal.target_audio_hours)} audio hours</strong><br><span class="muted">${Number(goal.accepted_audio_hours_per_wall_hour).toFixed(2)} accepted audio h/wall h · ETA ${eta}</span>`;
           $('updated').textContent = `Live · updated ${new Date(data.updated_at).toLocaleTimeString()}`;
+          const flow = data.flow || {};
+          const flowState = flow.state || 'waiting';
+          $('flowHeading').hidden = false;
+          $('flow').hidden = false;
+          $('flow').innerHTML = [
+            ['Flow health', label(flowState), 'Balanced means no unhealthy worker or unconsumed queue'],
+            ['Source processed', `${Number(flow.processed_audio_hours_per_wall_hour || 0).toFixed(2)} h/h`, 'Hours of source audio processed per wall-clock hour'],
+            ['Accepted output', `${Number(flow.accepted_audio_hours_per_wall_hour || 0).toFixed(2)} h/h`, 'Hours surviving every gate per wall-clock hour'],
+            ['Rolling yield', `${Number(flow.rolling_yield_percent || 0).toFixed(2)}%`, `Accepted output ÷ processed input over ${number(flow.window_minutes)} minutes`]
+          ].map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
+          $('flowNote').hidden = false;
+          $('flowNote').className = `flow-note ${flowState}`;
+          $('flowNote').textContent = `${Number(flow.processed_audio_hours_per_wall_hour || 0).toFixed(2)} hours of source audio are being processed per wall-clock hour and ${Number(flow.accepted_audio_hours_per_wall_hour || 0).toFixed(2)} hours are being accepted. ${flow.explanation || ''}`;
           const metrics = [
             ['downloaded','Downloaded','Passed stereo/source quality'], ['m2d_scored','M2D scored','Voice + music + SFX model'],
             ['m2d_accepted','M2D pass','Includes non-vocal music'], ['asr_scored','Speech scored','Foreground speech decoded'],
