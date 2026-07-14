@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audio Clip Review</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1016;
+      --panel: #121a23;
+      --panel-2: #18232f;
+      --line: #293848;
+      --text: #eef5fb;
+      --muted: #90a2b4;
+      --blue: #67b7ff;
+      --green: #56d491;
+      --gold: #f7c75d;
+      --red: #ff7777;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 Inter, ui-sans-serif, system-ui, sans-serif; }
+    button, input, textarea, select { font: inherit; }
+    button { cursor: pointer; }
+    .app { min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+    header { display: flex; align-items: center; gap: 20px; padding: 15px 22px; border-bottom: 1px solid var(--line); background: rgba(11,16,22,.96); position: sticky; top: 0; z-index: 10; }
+    .brand { min-width: 220px; }
+    .brand h1 { margin: 0; font-size: 17px; letter-spacing: .01em; }
+    .brand p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .progress-wrap { flex: 1; max-width: 560px; }
+    .progress-label { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-bottom: 5px; }
+    .progress { height: 7px; background: #24303c; border-radius: 99px; overflow: hidden; }
+    .progress > div { height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); width: 0; transition: width .25s; }
+    .header-actions { margin-left: auto; display: flex; gap: 8px; }
+    .quiet-btn { color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 9px; padding: 8px 11px; text-decoration: none; }
+    .layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); min-height: 0; }
+    aside { border-right: 1px solid var(--line); background: #0e151d; min-height: calc(100vh - 72px); display: flex; flex-direction: column; }
+    .filters { padding: 14px; border-bottom: 1px solid var(--line); }
+    .filter-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    input[type=search], select, textarea { width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 9px; padding: 9px 10px; outline: none; }
+    input[type=search] { margin-bottom: 8px; }
+    input:focus, select:focus, textarea:focus { border-color: var(--blue); }
+    .clip-list { overflow-y: auto; max-height: calc(100vh - 185px); }
+    .clip-row { display: grid; grid-template-columns: 32px 1fr auto; gap: 8px; padding: 11px 13px; border-bottom: 1px solid #1c2834; cursor: pointer; }
+    .clip-row:hover { background: #14202b; }
+    .clip-row.active { background: #1a2b3a; box-shadow: inset 3px 0 var(--blue); }
+    .clip-index { color: #708397; font-variant-numeric: tabular-nums; }
+    .clip-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .clip-file { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .status-dot { width: 9px; height: 9px; margin-top: 5px; border-radius: 50%; background: #405263; }
+    .status-dot.good { background: var(--green); }
+    .status-dot.perfect { background: var(--gold); box-shadow: 0 0 0 3px rgba(247,199,93,.12); }
+    .status-dot.not_ok { background: var(--red); }
+    main { padding: 28px clamp(22px, 4vw, 64px) 60px; overflow-y: auto; }
+    .review-card { max-width: 950px; margin: 0 auto; }
+    .eyebrow { color: var(--blue); text-transform: uppercase; letter-spacing: .12em; font-size: 11px; font-weight: 700; }
+    h2 { font-size: clamp(23px, 3vw, 34px); line-height: 1.15; margin: 8px 0 8px; }
+    .filename { color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .chips { display: flex; flex-wrap: wrap; gap: 7px; margin: 16px 0 22px; }
+    .chip { background: var(--panel-2); border: 1px solid var(--line); color: #b9c7d3; border-radius: 99px; padding: 5px 9px; font-size: 12px; }
+    .player-shell { padding: 18px; border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(140deg, #141e29, #0f171f); }
+    audio { width: 100%; height: 46px; display: block; }
+    .player-meta { display: flex; justify-content: space-between; gap: 12px; margin-top: 12px; color: var(--muted); font-size: 12px; }
+    .metrics { display: flex; gap: 14px; }
+    .decision-title { margin: 26px 0 12px; font-size: 13px; color: var(--muted); font-weight: 600; }
+    .decision-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+    .decision { border: 1px solid var(--line); border-radius: 12px; padding: 16px 12px; background: var(--panel); color: var(--text); font-weight: 750; font-size: 15px; }
+    .decision small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; font-weight: 500; }
+    .decision.good:hover, .decision.good.selected { border-color: var(--green); background: rgba(86,212,145,.10); }
+    .decision.perfect:hover, .decision.perfect.selected { border-color: var(--gold); background: rgba(247,199,93,.10); }
+    .decision.bad:hover, .decision.bad.selected { border-color: var(--red); background: rgba(255,119,119,.10); }
+    .bad-panel { display: none; margin-top: 14px; padding: 18px; border: 1px solid rgba(255,119,119,.4); border-radius: var(--radius); background: rgba(255,119,119,.045); }
+    .bad-panel.open { display: block; }
+    .bad-panel h3 { margin: 0 0 13px; font-size: 14px; }
+    .reason-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    .reason { display: flex; align-items: center; gap: 9px; padding: 9px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; }
+    .reason input { accent-color: var(--red); }
+    textarea { margin-top: 12px; min-height: 78px; resize: vertical; }
+    .bad-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+    .save-bad { background: var(--red); color: #260707; border: 0; border-radius: 9px; padding: 9px 15px; font-weight: 800; }
+    .footer-nav { display: flex; align-items: center; gap: 9px; margin-top: 22px; }
+    .nav-btn { background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 9px; padding: 8px 12px; }
+    .nav-btn:hover { border-color: #5a7187; }
+    .auto { margin-left: auto; color: var(--muted); display: flex; align-items: center; gap: 7px; }
+    .auto input { accent-color: var(--blue); }
+    .shortcut { color: #6f8294; font-size: 11px; margin-top: 14px; }
+    .toast { position: fixed; right: 22px; bottom: 22px; padding: 10px 14px; border-radius: 9px; background: #edf7f1; color: #10251b; font-weight: 700; opacity: 0; transform: translateY(8px); transition: .2s; pointer-events: none; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .empty { color: var(--muted); padding: 25px; text-align: center; }
+    @media (max-width: 800px) {
+      header { flex-wrap: wrap; }
+      .layout { grid-template-columns: 1fr; }
+      aside { min-height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      .clip-list { max-height: 210px; }
+      .decision-grid, .reason-grid { grid-template-columns: 1fr; }
+      main { padding: 22px 16px 40px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand"><h1>Audio Clip Review</h1><p id="datasetName">Loading dataset…</p></div>
+      <div class="progress-wrap">
+        <div class="progress-label"><span id="progressText">0 / 0 reviewed</span><span id="summaryText"></span></div>
+        <div class="progress"><div id="progressBar"></div></div>
+      </div>
+      <div class="header-actions"><a class="quiet-btn" href="/api/export.csv">Export CSV</a></div>
+    </header>
+    <div class="layout">
+      <aside>
+        <div class="filters">
+          <input id="search" type="search" placeholder="Search clips or titles">
+          <div class="filter-row">
+            <select id="statusFilter">
+              <option value="all">All decisions</option>
+              <option value="unreviewed">Unreviewed</option>
+              <option value="good">Good</option>
+              <option value="perfect">Perfect</option>
+              <option value="not_ok">Not OK</option>
+            </select>
+            <select id="bucketFilter"><option value="all">All backgrounds</option></select>
+          </div>
+        </div>
+        <div id="clipList" class="clip-list"></div>
+      </aside>
+      <main>
+        <div class="review-card">
+          <div class="eyebrow" id="counter">Clip</div>
+          <h2 id="clipTitle">Loading…</h2>
+          <div class="filename" id="clipFilename"></div>
+          <div class="chips" id="chips"></div>
+          <div class="player-shell">
+            <audio id="audio" controls preload="metadata"></audio>
+            <div class="player-meta">
+              <span id="bucketText"></span>
+              <div class="metrics" id="metrics"></div>
+            </div>
+          </div>
+          <div class="decision-title">Does this clip fit the dataset?</div>
+          <div class="decision-grid">
+            <button class="decision good" id="goodBtn">✓ Good<small>Usable example · G</small></button>
+            <button class="decision perfect" id="perfectBtn">★ Perfect<small>Ideal reference · P</small></button>
+            <button class="decision bad" id="badBtn">× Not OK<small>Choose why · X</small></button>
+          </div>
+          <div class="bad-panel" id="badPanel">
+            <h3>What disqualifies this clip?</h3>
+            <div class="reason-grid" id="reasonGrid"></div>
+            <textarea id="note" placeholder="Other reason or useful detail for improving the pipeline…"></textarea>
+            <div class="bad-actions">
+              <button class="nav-btn" id="cancelBad">Cancel</button>
+              <button class="save-bad" id="saveBad">Save Not OK</button>
+            </div>
+          </div>
+          <div class="footer-nav">
+            <button class="nav-btn" id="prevBtn">← Previous</button>
+            <button class="nav-btn" id="clearBtn">Clear mark</button>
+            <button class="nav-btn" id="nextBtn">Next →</button>
+            <label class="auto"><input type="checkbox" id="autoPlay" checked> Play next automatically</label>
+          </div>
+          <div class="shortcut">Shortcuts: Space play/pause · G good · P perfect · X not OK · ←/→ navigate</div>
+        </div>
+      </main>
+    </div>
+  </div>
+  <div class="toast" id="toast">Saved</div>
+  <script>
+    const app = { state: null, filtered: [], current: null };
+    const $ = id => document.getElementById(id);
+    const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    const pct = value => value == null ? '—' : `${Math.round(value * 100)}%`;
+
+    async function init() {
+      const response = await fetch('/api/state');
+      app.state = await response.json();
+      $('datasetName').textContent = `${app.state.dataset.name} · ${app.state.summary.total} clips`;
+      for (const [key, label] of Object.entries(app.state.reason_labels)) {
+        $('reasonGrid').insertAdjacentHTML('beforeend', `<label class="reason"><input type="checkbox" value="${key}"><span>${esc(label)}</span></label>`);
+      }
+      const buckets = [...new Set(app.state.clips.map(c => c.background_bucket).filter(Boolean))].sort();
+      for (const bucket of buckets) $('bucketFilter').insertAdjacentHTML('beforeend', `<option value="${esc(bucket)}">${esc(bucket.replaceAll('_', ' '))}</option>`);
+      $('search').addEventListener('input', applyFilters);
+      $('statusFilter').addEventListener('change', applyFilters);
+      $('bucketFilter').addEventListener('change', applyFilters);
+      bindActions();
+      applyFilters();
+      const routeName = location.pathname.startsWith('/clip/') ? decodeURIComponent(location.pathname.slice(6)) : null;
+      const initial = app.state.clips.find(c => c.filename === routeName) || app.filtered.find(c => !c.review) || app.filtered[0];
+      if (initial) selectClip(initial.filename, false);
+    }
+
+    function applyFilters() {
+      const query = $('search').value.trim().toLowerCase();
+      const status = $('statusFilter').value;
+      const bucket = $('bucketFilter').value;
+      app.filtered = app.state.clips.filter(clip => {
+        const decision = clip.review?.decision || 'unreviewed';
+        return (status === 'all' || status === decision)
+          && (bucket === 'all' || bucket === clip.background_bucket)
+          && (!query || `${clip.filename} ${clip.title || ''} ${clip.uploader || ''}`.toLowerCase().includes(query));
+      });
+      renderList();
+      if (app.current && !app.filtered.some(c => c.filename === app.current.filename) && app.filtered[0]) selectClip(app.filtered[0].filename);
+    }
+
+    function renderList() {
+      if (!app.filtered.length) { $('clipList').innerHTML = '<div class="empty">No clips match these filters.</div>'; return; }
+      $('clipList').innerHTML = app.filtered.map(clip => {
+        const index = app.state.clips.indexOf(clip) + 1;
+        const active = app.current?.filename === clip.filename ? ' active' : '';
+        const decision = clip.review?.decision || '';
+        return `<div class="clip-row${active}" data-file="${esc(clip.filename)}">
+          <div class="clip-index">${index}</div><div><div class="clip-title">${esc(clip.title || clip.filename)}</div><div class="clip-file">${esc(clip.background_bucket?.replaceAll('_',' ') || '')}</div></div><span class="status-dot ${decision}"></span>
+        </div>`;
+      }).join('');
+      document.querySelectorAll('.clip-row').forEach(row => row.addEventListener('click', () => selectClip(row.dataset.file)));
+    }
+
+    function selectClip(filename, updateHistory = true) {
+      const clip = app.state.clips.find(item => item.filename === filename);
+      if (!clip) return;
+      app.current = clip;
+      const index = app.state.clips.indexOf(clip) + 1;
+      $('counter').textContent = `Clip ${index} of ${app.state.clips.length}`;
+      $('clipTitle').textContent = clip.title || 'Untitled source clip';
+      $('clipFilename').textContent = clip.filename;
+      $('bucketText').textContent = (clip.background_bucket || '').replaceAll('_', ' ');
+      $('metrics').innerHTML = `<span>speech ${pct(clip.speech_coverage)}</span><span>background ${pct(clip.background_coverage)}</span><span>overlap ${pct(clip.overlap_coverage)}</span>`;
+      $('chips').innerHTML = clip.top_labels.map(label => `<span class="chip">${esc(label)}</span>`).join('');
+      $('audio').src = `/api/audio/${encodeURIComponent(clip.filename)}`;
+      document.querySelectorAll('.decision').forEach(button => button.classList.remove('selected'));
+      if (clip.review?.decision) $(`${clip.review.decision === 'not_ok' ? 'bad' : clip.review.decision}Btn`).classList.add('selected');
+      $('badPanel').classList.toggle('open', clip.review?.decision === 'not_ok');
+      document.querySelectorAll('#reasonGrid input').forEach(box => box.checked = clip.review?.reasons?.includes(box.value) || false);
+      $('note').value = clip.review?.note || '';
+      if (updateHistory) history.pushState({filename}, '', `/clip/${encodeURIComponent(filename)}`);
+      renderList();
+      const row = document.querySelector(`.clip-row[data-file="${CSS.escape(filename)}"]`);
+      row?.scrollIntoView({block: 'nearest'});
+      if ($('autoPlay').checked) $('audio').play().catch(() => {});
+    }
+
+    async function save(decision, reasons = [], note = '') {
+      if (!app.current) return;
+      const reviewedClip = app.current;
+      const reviewedIndex = app.state.clips.indexOf(reviewedClip);
+      const response = await fetch(`/api/reviews/${encodeURIComponent(reviewedClip.filename)}`, {
+        method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({decision, reasons, note})
+      });
+      const payload = await response.json();
+      if (!response.ok) { alert(payload.detail || 'Could not save review'); return; }
+      reviewedClip.review = payload.review;
+      app.state.summary = payload.summary;
+      updateProgress();
+      toast(decision === 'perfect' ? 'Marked perfect' : decision === 'good' ? 'Marked good' : 'Marked not OK');
+      applyFilters();
+      nextUnreviewed(reviewedIndex);
+    }
+
+    function nextUnreviewed(currentIndex) {
+      const ordered = [...app.state.clips.slice(currentIndex + 1), ...app.state.clips.slice(0, currentIndex)];
+      const next = ordered.find(clip => !clip.review);
+      if (next) selectClip(next.filename);
+      else selectRelative(1);
+    }
+
+    function selectRelative(delta) {
+      if (!app.filtered.length) return;
+      const index = Math.max(0, app.filtered.findIndex(c => c.filename === app.current?.filename));
+      selectClip(app.filtered[(index + delta + app.filtered.length) % app.filtered.length].filename);
+    }
+
+    function updateProgress() {
+      const s = app.state.summary;
+      $('progressText').textContent = `${s.reviewed} / ${s.total} reviewed`;
+      $('summaryText').textContent = `${s.perfect} perfect · ${s.good} good · ${s.not_ok} not OK`;
+      $('progressBar').style.width = `${s.total ? s.reviewed / s.total * 100 : 0}%`;
+    }
+
+    function bindActions() {
+      $('goodBtn').onclick = () => save('good');
+      $('perfectBtn').onclick = () => save('perfect');
+      $('badBtn').onclick = () => $('badPanel').classList.add('open');
+      $('cancelBad').onclick = () => $('badPanel').classList.remove('open');
+      $('saveBad').onclick = () => save('not_ok', [...document.querySelectorAll('#reasonGrid input:checked')].map(x => x.value), $('note').value);
+      $('prevBtn').onclick = () => selectRelative(-1);
+      $('nextBtn').onclick = () => selectRelative(1);
+      $('clearBtn').onclick = async () => {
+        if (!app.current) return;
+        const response = await fetch(`/api/reviews/${encodeURIComponent(app.current.filename)}`, {method:'DELETE'});
+        const payload = await response.json();
+        if (!response.ok) return;
+        app.current.review = null; app.state.summary = payload.summary; updateProgress(); applyFilters(); toast('Mark cleared');
+      };
+      window.onpopstate = event => { if (event.state?.filename) selectClip(event.state.filename, false); };
+      document.addEventListener('keydown', event => {
+        if (['INPUT','TEXTAREA','SELECT'].includes(event.target.tagName)) return;
+        if (event.code === 'Space') { event.preventDefault(); $('audio').paused ? $('audio').play() : $('audio').pause(); }
+        if (event.key.toLowerCase() === 'g') save('good');
+        if (event.key.toLowerCase() === 'p') save('perfect');
+        if (event.key.toLowerCase() === 'x') $('badPanel').classList.add('open');
+        if (event.key === 'ArrowLeft') selectRelative(-1);
+        if (event.key === 'ArrowRight') selectRelative(1);
+      });
+      updateProgress();
+    }
+
+    function toast(message) {
+      $('toast').textContent = message; $('toast').classList.add('show');
+      clearTimeout(app.toastTimer); app.toastTimer = setTimeout(() => $('toast').classList.remove('show'), 1300);
+    }
+    init().catch(error => { document.body.innerHTML = `<pre style="padding:20px">${esc(error.stack || error)}</pre>`; });
+  </script>
+</body>
+</html>

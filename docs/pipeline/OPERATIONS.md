@@ -248,6 +248,32 @@ subset with equal music-led and non-music-led counts. Every record keeps the
 per-window scores, ranks, top labels, temporal coverage, rejection reasons,
 exact M2D checkpoint hash, and validator policy version.
 
+### Manual listening review
+
+Start the local review app on the balanced M2D subset:
+
+```bash
+cd pipeline
+uv run sam-pipeline-review \
+  --dataset-dir ~/Downloads/youtube-dialogue-background-m2d-ok-20260714 \
+  --audio-directory balanced-audio \
+  --port 18081
+```
+
+Open `http://127.0.0.1:18081/`. Each clip can be marked **Good**, **Perfect**,
+or **Not OK**. Not OK supports multiple reasons: lacking music, lacking
+background audio/SFX, singing or vocal music, speech that is not dialogue, low
+quality, low volume, distortion/clipping, wrong voice/background balance, or an
+Other reason with a required note. Keyboard shortcuts are shown in the app.
+
+Progress is written atomically after every decision to
+`manual-review.json` inside the dataset directory, so closing or refreshing the
+browser does not lose work. Each clip also has a refreshable `/clip/{filename}`
+URL. `Export CSV` downloads a flat table suitable for analysis and later policy
+tuning. Use `--annotations /some/path.json` to store annotations elsewhere, or
+`--audio-directory audio` to review all M2D-accepted clips instead of the
+balanced subset.
+
 ## AudioSet validation batches
 
 Acquire a reproducible random sample from the official AudioSet segment CSVs.

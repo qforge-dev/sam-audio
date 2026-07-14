@@ -111,6 +111,10 @@ described in `docs/pipeline/OPERATIONS.md` before treating a clip as spoken
 dialogue over an active background. The gate explicitly rejects singing,
 rapping, choir, and other vocal music.
 
+The accepted set can be manually labelled in a local review app. It preserves
+Good, Perfect, and structured Not OK decisions in a resumable JSON file and can
+export them as CSV for pipeline tuning.
+
 Generation, prompt, batching, and TF32 policy are configured with the
 `SAM_AUDIO_*` environment variables demonstrated in
 [`deploy/start-sam-audio-api.sh`](deploy/start-sam-audio-api.sh). A supplied
