@@ -41,7 +41,7 @@ acquire_batch() {
     --search-workers 8 \
     --download-workers 8 \
     --candidate-multiplier 1.8 \
-    --max-attempts 16000 || true
+    --max-attempts 40000 || true
 }
 
 score_batch() {
