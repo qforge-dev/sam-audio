@@ -412,7 +412,103 @@ def _source_file(root: Path) -> Path:
     return matches[0]
 
 
-def acquire_candidate(candidate: dict[str, Any], output_dir: Path) -> dict[str, Any]:
+def _download_section(
+    candidate: dict[str, Any],
+    root: Path,
+    section: str,
+    *,
+    youtube_client: str,
+) -> tuple[subprocess.CompletedProcess[str], Path, str]:
+    clients = (
+        ("default", "android") if youtube_client == "auto" else (youtube_client,)
+    )
+    last_error: Exception | None = None
+    for client in clients:
+        download_root = root / client
+        download_root.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--no-update",
+            "--quiet",
+            "--no-warnings",
+            "--no-playlist",
+            "--socket-timeout",
+            "20",
+            "--retries",
+            "2",
+            "--extractor-retries",
+            "2",
+        ]
+        if client == "android":
+            command.extend(
+                [
+                    "--extractor-args",
+                    "youtube:player_client=android;player_skip=webpage,configs",
+                ]
+            )
+        command.extend(
+            [
+                "--download-sections",
+                section,
+                "--force-keyframes-at-cuts",
+                "-f",
+                (
+                    "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
+                    "bestaudio[acodec!=none]/best[acodec!=none]"
+                ),
+                "--print-json",
+                "-o",
+                str(download_root / "source.%(ext)s"),
+                str(candidate["source_url"]),
+            ]
+        )
+        try:
+            response = _run(command, timeout=150)
+            return response, _source_file(download_root), client
+        except Exception as error:
+            last_error = error
+    assert last_error is not None
+    raise last_error
+
+
+def _source_format(path: Path, info: dict[str, Any], client: str) -> dict[str, Any]:
+    response = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name,sample_rate,channels,bit_rate",
+            "-of",
+            "json",
+            str(path),
+        ],
+        timeout=30,
+    )
+    streams = json.loads(response.stdout).get("streams") or []
+    stream = streams[0] if streams else {}
+    stream_bitrate = float(stream.get("bit_rate") or 0.0) / 1000.0
+    return {
+        "format_id": info.get("format_id"),
+        "codec": info.get("acodec") or stream.get("codec_name"),
+        "container": info.get("ext") or path.suffix.lstrip("."),
+        "sample_rate_hz": int(info.get("asr") or stream.get("sample_rate") or 0),
+        "bitrate_kbps": float(info.get("abr") or stream_bitrate),
+        "channels": int(info.get("audio_channels") or stream.get("channels") or 0),
+        "retrieval_client": client,
+    }
+
+
+def acquire_candidate(
+    candidate: dict[str, Any],
+    output_dir: Path,
+    *,
+    youtube_client: str = "auto",
+) -> dict[str, Any]:
     started = time.perf_counter()
     video_id = str(candidate["video_id"])
     start = float(candidate["clip_start_seconds"])
@@ -423,46 +519,14 @@ def acquire_candidate(candidate: dict[str, Any], output_dir: Path) -> dict[str, 
     try:
         with tempfile.TemporaryDirectory(prefix="sam-youtube-random-") as temporary:
             root = Path(temporary)
-            download = _run(
-                [
-                    sys.executable,
-                    "-m",
-                    "yt_dlp",
-                    "--no-update",
-                    "--quiet",
-                    "--no-warnings",
-                    "--no-playlist",
-                    "--socket-timeout",
-                    "20",
-                    "--retries",
-                    "2",
-                    "--extractor-retries",
-                    "2",
-                    "--download-sections",
-                    f"*{section_start:.3f}-{section_end:.3f}",
-                    "--force-keyframes-at-cuts",
-                    "-f",
-                    (
-                        "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
-                        "bestaudio[acodec!=none]"
-                    ),
-                    "--print-json",
-                    "-o",
-                    str(root / "source.%(ext)s"),
-                    str(candidate["source_url"]),
-                ],
-                timeout=150,
+            download, source, retrieval_client = _download_section(
+                candidate,
+                root,
+                f"*{section_start:.3f}-{section_end:.3f}",
+                youtube_client=youtube_client,
             )
             info = _download_json(download.stdout)
-            source_format = {
-                "format_id": info.get("format_id"),
-                "codec": info.get("acodec"),
-                "container": info.get("ext"),
-                "sample_rate_hz": int(info.get("asr") or 0),
-                "bitrate_kbps": float(info.get("abr") or 0.0),
-                "channels": int(info.get("audio_channels") or 0),
-            }
-            source = _source_file(root)
+            source_format = _source_format(source, info, retrieval_client)
             normalized = root / "clip.wav"
             _run(
                 [
@@ -652,6 +716,7 @@ def acquire_dataset(
     download_workers: int,
     candidate_multiplier: float,
     max_attempts: int,
+    youtube_client: str,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     candidates = discover_candidates(
@@ -681,7 +746,10 @@ def acquire_dataset(
                 batch = pending[offset : offset + download_workers]
                 results = list(
                     executor.map(
-                        lambda item: acquire_candidate(item, output_dir), batch
+                        lambda item: acquire_candidate(
+                            item, output_dir, youtube_client=youtube_client
+                        ),
+                        batch,
                     )
                 )
                 for result in results:
@@ -727,6 +795,11 @@ def main() -> None:
     parser.add_argument("--download-workers", type=int, default=8)
     parser.add_argument("--candidate-multiplier", type=float, default=3.0)
     parser.add_argument("--max-attempts", type=int)
+    parser.add_argument(
+        "--youtube-client",
+        choices=("auto", "default", "android"),
+        default="auto",
+    )
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(
@@ -753,6 +826,7 @@ def main() -> None:
         download_workers=args.download_workers,
         candidate_multiplier=args.candidate_multiplier,
         max_attempts=max_attempts,
+        youtube_client=args.youtube_client,
     )
     print(path)
 
