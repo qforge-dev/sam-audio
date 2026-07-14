@@ -37,7 +37,7 @@ acquire_batch() {
     --query-count 500 \
     --results-per-query 100 \
     --search-workers 8 \
-    --download-workers 16 \
+    --download-workers 8 \
     --candidate-multiplier 2.0 \
     --max-attempts 16000 || true
 }

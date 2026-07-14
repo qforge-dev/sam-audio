@@ -62,10 +62,10 @@ be a mandatory gate, so they remain diagnostic metadata.
 
 The final voice confirmation uses faster-whisper with VAD and confidence
 checks: at least 1.5 seconds of voice activity, two decoded words, best segment
-average log probability of `-0.75` or better, and no-speech probability no
-higher than `0.40`. Applied retrospectively, it rejects 12 of 14
-`lacking_voice` examples and retains 25 of a deterministic 30-clip Good/Perfect
-calibration sample. It is combined with cinematic-source metadata and the
+average log probability of `-0.80` or better, and no-speech probability no
+higher than `0.50`. Applied to all 216 completed reviews with the multilingual
+checkpoint, it rejects 13 of 14 `lacking_voice` examples and retains 86 of 110
+Good/Perfect examples. It is combined with cinematic-source metadata and the
 existing strong-speech gate; it is not treated as a standalone guarantee.
 
 ASR language detection must identify English at probability 0.80 or higher.

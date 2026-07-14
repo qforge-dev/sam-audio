@@ -321,11 +321,11 @@ PYTHONPATH=/app/pipeline/src /models/whisper-venv/bin/python \
 ```
 
 The ASR policy requires at least 1.5 seconds of VAD-positive audio, at least two
-decoded words, best segment average log probability of `-0.75` or better, and
-no-speech probability no higher than `0.40`. Against the completed human-review
-set it rejected 12 of 14 clips explicitly marked `lacking_voice` while retaining
-25 of a deterministic 30-clip Good/Perfect calibration sample. The M2D strong
-speech check remains required as an independent guard.
+decoded words, best segment average log probability of `-0.80` or better, and
+no-speech probability no higher than `0.50`. Against all 216 completed reviews,
+it rejected 13 of 14 clips explicitly marked `lacking_voice` while retaining 86
+of 110 Good/Perfect clips. The M2D strong speech check remains required as an
+independent guard.
 
 The validator detects the spoken language rather than forcing an English
 decode. Final clips must be detected as English with probability at least
