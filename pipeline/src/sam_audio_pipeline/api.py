@@ -367,6 +367,21 @@ def create_app(
     def panel() -> str:
         return (Path(__file__).parent / "web" / "index.html").read_text()
 
+    @app.get("/review", response_class=HTMLResponse)
+    @app.get("/data", response_class=HTMLResponse)
+    @app.get("/data/{dataset_id}", response_class=HTMLResponse)
+    @app.get("/data/{dataset_id}/jobs/{job_id}", response_class=HTMLResponse)
+    @app.get(
+        "/data/{dataset_id}/jobs/{job_id}/sources/{source_id}",
+        response_class=HTMLResponse,
+    )
+    def panel_route(
+        dataset_id: str | None = None,
+        job_id: str | None = None,
+        source_id: str | None = None,
+    ) -> str:
+        return (Path(__file__).parent / "web" / "index.html").read_text()
+
     @app.get("/v1/overview")
     def overview(request: Request) -> dict[str, Any]:
         store = backend(request)

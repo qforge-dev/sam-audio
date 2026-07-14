@@ -79,7 +79,9 @@ rule are persisted under `adaptive_routing`.
    displays its channel layout, codec/container, sample rate, bit depth when
    available, bitrate, and lossless/lossy quality tier. The explorer plays the
    full joined result beside its original, retains each chunk join and its
-   diagnostics, and graphs the dataset-wide source-score distribution.
+   diagnostics, and graphs the dataset-wide source-score distribution. Pipeline,
+   review, dataset, job, and source selections use durable browser URLs so a
+   refresh, copied link, or back/forward navigation restores the same context.
 
 ## AWS resources
 

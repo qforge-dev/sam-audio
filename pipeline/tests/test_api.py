@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from sam_audio_pipeline.api import create_app
@@ -129,6 +130,27 @@ def settings() -> Settings:
         gate_rms_dbfs=-60,
         presign_seconds=3600,
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/",
+        "/review",
+        "/data",
+        "/data/dataset-1",
+        "/data/dataset-1/jobs/job-1",
+        "/data/dataset-1/jobs/job-1/sources/source-1",
+    ],
+)
+def test_dashboard_routes_support_direct_load_and_refresh(path: str) -> None:
+    config = settings()
+    with TestClient(create_app(config, FakeAWS(config))) as client:
+        response = client.get(path)
+
+    assert response.status_code == 200
+    assert "SAM Audio Pipeline" in response.text
+    assert "routeState" in response.text
 
 
 def test_persistent_dataset_accepts_successive_unbounded_jobs() -> None:

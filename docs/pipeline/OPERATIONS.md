@@ -150,6 +150,22 @@ ssh ubuntu@ec2-44-211-31-38.compute-1.amazonaws.com \
 The command is idempotent; pass one or more `--job-id JOB_ID` arguments instead
 of `--all`, or use `--force` to refresh already-profiled sources.
 
+## Dashboard URLs
+
+Dashboard state is encoded in clean paths and is safe to refresh or share:
+
+```text
+/                                      pipeline and upload overview
+/review                                manual review queue
+/data/{dataset_id}                     dataset explorer
+/data/{dataset_id}/jobs/{job_id}       job within a dataset
+/data/{dataset_id}/jobs/{job_id}/sources/{source_id}
+                                       exact sound detail
+```
+
+Selecting a tab, job, dataset, or sound updates browser history. Back and
+forward navigation restore the corresponding view and selected record.
+
 ## AudioSet validation batches
 
 Acquire a reproducible random sample from the official AudioSet segment CSVs.

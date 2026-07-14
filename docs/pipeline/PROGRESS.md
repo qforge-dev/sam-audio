@@ -36,6 +36,8 @@ was an example batch size, not a workflow limit.
   metrics, and graph the dataset-wide reconstruction score distribution.
 - [x] Persist and display each original's mono/stereo layout and encoding quality
   facts, with an idempotent historical backfill.
+- [x] Give pipeline, review, dataset, job, and source dashboard states durable
+  URLs with refresh and browser-history restoration.
 - [x] Require stereo input, gate SAM targets with source-scene presence, support
   single-stage inference, and use identity pass-through for pure SFX sources.
 - [x] Add persistent datasets, successive upload jobs, and reconciliation of
