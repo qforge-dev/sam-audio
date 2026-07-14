@@ -68,6 +68,10 @@ higher than `0.40`. Applied retrospectively, it rejects 12 of 14
 calibration sample. It is combined with cinematic-source metadata and the
 existing strong-speech gate; it is not treated as a standalone guarantee.
 
+ASR language detection must identify English at probability 0.80 or higher.
+This supplements explicit India/Indian and Indian-language source metadata
+exclusions without inferring nationality or ethnicity from vocal traits.
+
 The reviewed clip annotated `ai voice` exposed a separate, high-confidence
 signal: M2D Speech Synthesizer scored 0.24–0.72 in all nine windows. The current
 policy therefore rejects clips with Speech Synthesizer probability of at least

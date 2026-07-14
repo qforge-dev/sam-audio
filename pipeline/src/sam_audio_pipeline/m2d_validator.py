@@ -65,6 +65,8 @@ MIN_ASR_VAD_SECONDS = 1.5
 MIN_ASR_WORDS = 2
 MIN_ASR_AVG_LOGPROB = -0.75
 MAX_ASR_NO_SPEECH_PROBABILITY = 0.40
+REQUIRED_ASR_LANGUAGE = "en"
+MIN_ASR_LANGUAGE_PROBABILITY = 0.80
 MIN_CINEMATIC_MUSIC_PROBABILITY = 0.01
 MAX_CINEMATIC_MUSIC_RANK = 15
 MIN_CINEMATIC_MUSIC_WINDOWS = 4
@@ -77,7 +79,7 @@ MAX_VOCAL_MUSIC_WINDOWS = 1
 TOP_LABELS = 8
 POLICY_VERSION = "spoken_dialogue_instrumental_background_m2d_v5"
 CINEMATIC_POLICY_VERSION = "cinematic_dialogue_music_sfx_m2d_v3"
-ASR_POLICY_VERSION = "foreground_voice_faster_whisper_v1"
+ASR_POLICY_VERSION = "foreground_voice_faster_whisper_v2"
 
 
 def _now() -> str:
@@ -481,6 +483,8 @@ def evaluate_asr(
     duration_after_vad: float,
     average_log_probability: float,
     no_speech_probability: float,
+    detected_language: str = REQUIRED_ASR_LANGUAGE,
+    language_probability: float = 1.0,
 ) -> dict[str, Any]:
     """Require decodable foreground speech rather than generic chatter labels."""
     word_count = len(re.findall(r"[A-Za-z]+", transcript))
@@ -493,6 +497,10 @@ def evaluate_asr(
         reasons.append("low_transcription_confidence")
     if no_speech_probability > MAX_ASR_NO_SPEECH_PROBABILITY:
         reasons.append("high_no_speech_probability")
+    if detected_language != REQUIRED_ASR_LANGUAGE:
+        reasons.append("non_english_speech")
+    if language_probability < MIN_ASR_LANGUAGE_PROBABILITY:
+        reasons.append("low_language_confidence")
     return {
         "accepted": not reasons,
         "policy": ASR_POLICY_VERSION,
@@ -502,6 +510,8 @@ def evaluate_asr(
         "duration_after_vad_seconds": round(duration_after_vad, 6),
         "best_average_log_probability": round(average_log_probability, 8),
         "lowest_no_speech_probability": round(no_speech_probability, 8),
+        "detected_language": detected_language,
+        "language_probability": round(language_probability, 8),
     }
 
 
@@ -524,11 +534,16 @@ def score_asr_directory(args: argparse.Namespace) -> None:
         files = files[: args.limit]
     existing: set[str] = set()
     if args.output.exists() and not args.overwrite:
-        existing = {
-            str(json.loads(line)["filename"])
-            for line in args.output.read_text().splitlines()
-            if line.strip()
-        }
+        for line in args.output.read_text().splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if (
+                item.get("policy") == ASR_POLICY_VERSION
+                and item.get("detected_language") is not None
+                and item.get("asr", {}).get("model") == args.model
+            ):
+                existing.add(str(item["filename"]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     mode = "w" if args.overwrite else "a"
     processed = 0
@@ -538,7 +553,7 @@ def score_asr_directory(args: argparse.Namespace) -> None:
                 continue
             segments_source, info = model.transcribe(
                 str(path),
-                language="en",
+                language=None,
                 beam_size=args.beam_size,
                 vad_filter=True,
                 condition_on_previous_text=False,
@@ -567,6 +582,8 @@ def score_asr_directory(args: argparse.Namespace) -> None:
                     duration_after_vad=float(info.duration_after_vad),
                     average_log_probability=best_log_probability,
                     no_speech_probability=lowest_no_speech,
+                    detected_language=str(info.language),
+                    language_probability=float(info.language_probability),
                 ),
                 "segments": [
                     {
@@ -1107,7 +1124,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     asr_score.add_argument("--input-dir", type=Path, required=True)
     asr_score.add_argument("--output", type=Path, required=True)
-    asr_score.add_argument("--model", default="small.en")
+    asr_score.add_argument("--model", default="small")
     asr_score.add_argument("--device", default="cuda")
     asr_score.add_argument("--compute-type", default="float16")
     asr_score.add_argument("--download-root", type=Path)

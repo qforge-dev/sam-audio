@@ -316,7 +316,7 @@ PYTHONPATH=/app/pipeline/src /models/whisper-venv/bin/python \
   -m sam_audio_pipeline.m2d_validator asr-score \
   --input-dir /data/cinematic-raw-20260715/audio \
   --output /data/cinematic-raw-20260715/asr-validation.jsonl \
-  --model small.en \
+  --model small \
   --download-root /models/faster-whisper
 ```
 
@@ -326,6 +326,11 @@ no-speech probability no higher than `0.40`. Against the completed human-review
 set it rejected 12 of 14 clips explicitly marked `lacking_voice` while retaining
 25 of a deterministic 30-clip Good/Perfect calibration sample. The M2D strong
 speech check remains required as an independent guard.
+
+The validator detects the spoken language rather than forcing an English
+decode. Final clips must be detected as English with probability at least
+`0.80`. This is a language-content filter; it does not infer a speaker's
+nationality or ethnicity from their voice.
 
 The same M2D pass rejects synthetic narration when Speech Synthesizer scores at
 least `0.20` within the top five labels in two or more windows. This threshold

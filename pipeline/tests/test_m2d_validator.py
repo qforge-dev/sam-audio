@@ -34,6 +34,17 @@ def test_asr_gate_requires_decodable_foreground_voice() -> None:
     assert chatter_hallucination["accepted"] is False
     assert "low_transcription_confidence" in chatter_hallucination["rejection_reasons"]
 
+    non_english = evaluate_asr(
+        transcript="Namaste dosto",
+        duration_after_vad=4.0,
+        average_log_probability=-0.2,
+        no_speech_probability=0.1,
+        detected_language="hi",
+        language_probability=0.98,
+    )
+    assert non_english["accepted"] is False
+    assert "non_english_speech" in non_english["rejection_reasons"]
+
 
 def test_m2d_gate_rejects_repeated_confident_synthetic_speech() -> None:
     labels = [
