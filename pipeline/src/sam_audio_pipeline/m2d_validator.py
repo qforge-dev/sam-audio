@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -79,8 +80,33 @@ MIN_OVERLAP_WINDOWS = 3
 MAX_VOCAL_MUSIC_WINDOWS = 1
 TOP_LABELS = 8
 POLICY_VERSION = "spoken_dialogue_instrumental_background_m2d_v5"
-CINEMATIC_POLICY_VERSION = "cinematic_dialogue_music_sfx_m2d_v3"
+CINEMATIC_POLICY_VERSION = "cinematic_dialogue_music_sfx_duration_aware_m2d_v4"
 ASR_POLICY_VERSION = "foreground_voice_faster_whisper_v3"
+
+
+def _duration_requirements(window_count: int) -> dict[str, int]:
+    """Scale the nine-window calibration to the evaluated clip duration."""
+    if window_count < 1:
+        raise ValueError("At least one audio window is required")
+    baseline_windows = 9
+
+    def minimum(value: int) -> int:
+        return max(1, math.ceil(value * window_count / baseline_windows))
+
+    def maximum(value: int) -> int:
+        return max(0, math.floor(value * window_count / baseline_windows))
+
+    return {
+        "speech": minimum(MIN_SPEECH_WINDOWS),
+        "strong_speech": minimum(MIN_STRONG_SPEECH_WINDOWS),
+        "foreground_speech": minimum(MIN_FOREGROUND_SPEECH_WINDOWS),
+        "cinematic_music": minimum(MIN_CINEMATIC_MUSIC_WINDOWS),
+        "cinematic_sfx": minimum(MIN_CINEMATIC_SFX_WINDOWS),
+        "background": minimum(MIN_BACKGROUND_WINDOWS),
+        "overlap": minimum(MIN_OVERLAP_WINDOWS),
+        "synthetic_speech_max": maximum(MAX_SYNTHETIC_SPEECH_WINDOWS),
+        "vocal_music_max": maximum(MAX_VOCAL_MUSIC_WINDOWS),
+    }
 
 
 def _now() -> str:
@@ -93,6 +119,13 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _belongs_to_shard(filename: str, shard_index: int, shard_count: int) -> bool:
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("Shard index must be within the positive shard count")
+    value = int.from_bytes(hashlib.sha256(filename.encode("utf-8")).digest()[:8], "big")
+    return value % shard_count == shard_index
 
 
 def _descendants(root: str, children: dict[str, list[str]]) -> set[str]:
@@ -288,25 +321,30 @@ def evaluate_probabilities(
     else:
         background_bucket = "mixed_music_and_effects"
 
+    window_count = len(windows)
+    # Preserve the policy calibrated on nine windows while scaling its required
+    # temporal coverage to clips of any duration (notably the new 30 s clips).
+    required = _duration_requirements(window_count)
     rejections: list[str] = []
-    if speech_windows < MIN_SPEECH_WINDOWS:
+    if speech_windows < required["speech"]:
         rejections.append("insufficient_speech")
-    if strong_speech_windows < MIN_STRONG_SPEECH_WINDOWS:
+    if strong_speech_windows < required["strong_speech"]:
         rejections.append("insufficient_strong_speech")
-    if synthetic_speech_windows > MAX_SYNTHETIC_SPEECH_WINDOWS:
+    if foreground_speech_windows < required["foreground_speech"]:
+        rejections.append("insufficient_foreground_speech")
+    if synthetic_speech_windows > required["synthetic_speech_max"]:
         rejections.append("synthetic_speech_present")
     if require_cinematic_mix:
-        if cinematic_music_windows < MIN_CINEMATIC_MUSIC_WINDOWS:
+        if cinematic_music_windows < required["cinematic_music"]:
             rejections.append("insufficient_cinematic_music")
-        if cinematic_sfx_windows < MIN_CINEMATIC_SFX_WINDOWS:
+        if cinematic_sfx_windows < required["cinematic_sfx"]:
             rejections.append("insufficient_cinematic_sfx")
-    if background_windows < MIN_BACKGROUND_WINDOWS:
+    if background_windows < required["background"]:
         rejections.append("insufficient_background")
-    if overlap_windows < MIN_OVERLAP_WINDOWS:
+    if overlap_windows < required["overlap"]:
         rejections.append("insufficient_dialogue_background_overlap")
-    if vocal_music_windows > MAX_VOCAL_MUSIC_WINDOWS:
+    if vocal_music_windows > required["vocal_music_max"]:
         rejections.append("vocal_music_present")
-    window_count = len(windows)
     return {
         "accepted": not rejections,
         "policy": (
@@ -315,6 +353,7 @@ def evaluate_probabilities(
         "rejection_reasons": rejections,
         "background_bucket": background_bucket,
         "window_count": window_count,
+        "duration_scaled_window_requirements": required,
         "speech_active_windows": speech_windows,
         "strong_speech_active_windows": strong_speech_windows,
         "foreground_speech_active_windows": foreground_speech_windows,
@@ -334,8 +373,8 @@ def evaluate_probabilities(
         "cinematic_sfx_coverage": round(cinematic_sfx_windows / window_count, 6),
         "cinematic_mix_required": require_cinematic_mix,
         "cinematic_mix_pass": (
-            cinematic_music_windows >= MIN_CINEMATIC_MUSIC_WINDOWS
-            and cinematic_sfx_windows >= MIN_CINEMATIC_SFX_WINDOWS
+            cinematic_music_windows >= required["cinematic_music"]
+            and cinematic_sfx_windows >= required["cinematic_sfx"]
         ),
         "background_coverage": round(background_windows / window_count, 6),
         "overlap_coverage": round(overlap_windows / window_count, 6),
@@ -347,12 +386,13 @@ def evaluate_probabilities(
 def _audio_windows(
     waveform: np.ndarray, sample_rate: int
 ) -> tuple[np.ndarray, list[float]]:
-    wanted = int(round(10.0 * sample_rate))
-    waveform = waveform[:wanted]
-    if len(waveform) < wanted:
+    duration = len(waveform) / sample_rate
+    if duration < WINDOW_SECONDS:
+        wanted = int(round(WINDOW_SECONDS * sample_rate))
         waveform = np.pad(waveform, (0, wanted - len(waveform)))
+        duration = WINDOW_SECONDS
     length = int(round(WINDOW_SECONDS * sample_rate))
-    starts = list(np.arange(0.0, 10.0 - WINDOW_SECONDS + 1e-6, WINDOW_HOP_SECONDS))
+    starts = list(np.arange(0.0, duration - WINDOW_SECONDS + 1e-6, WINDOW_HOP_SECONDS))
     windows = [
         waveform[round(start * sample_rate) : round(start * sample_rate) + length]
         for start in starts
@@ -390,8 +430,8 @@ def score_directory(args: argparse.Namespace) -> None:
     follow = bool(getattr(args, "follow", False))
     producer_done = getattr(args, "producer_done", None)
     poll_seconds = max(0.1, float(getattr(args, "poll_seconds", 2.0)))
-    if follow and not producer_done:
-        raise ValueError("--follow requires --producer-done")
+    shard_index = int(getattr(args, "shard_index", 0))
+    shard_count = int(getattr(args, "shard_count", 1))
     metadata = {
         "model": "nttcslab/m2d",
         "checkpoint": args.checkpoint.parent.name,
@@ -423,16 +463,23 @@ def score_directory(args: argparse.Namespace) -> None:
         "minimum_background_windows": MIN_BACKGROUND_WINDOWS,
         "minimum_overlap_windows": MIN_OVERLAP_WINDOWS,
         "maximum_vocal_music_windows": MAX_VOCAL_MUSIC_WINDOWS,
+        "worker_shard_index": shard_index,
+        "worker_shard_count": shard_count,
     }
     processed = 0
     with args.output.open(mode, encoding="utf-8") as destination:
         while True:
             files = sorted(args.input_dir.glob(args.glob))
+            files = [
+                path
+                for path in files
+                if _belongs_to_shard(path.name, shard_index, shard_count)
+            ]
             if args.limit:
                 files = files[: args.limit]
             pending = [path for path in files if path.name not in existing]
             if not pending:
-                if not follow or producer_done.is_file():
+                if not follow or (producer_done and producer_done.is_file()):
                     break
                 time.sleep(poll_seconds)
                 continue
@@ -589,14 +636,17 @@ def score_asr_directory(args: argparse.Namespace) -> None:
         download_root=(str(args.download_root) if args.download_root else None),
     )
     m2d_results = getattr(args, "m2d_results", None)
-    allowlist_tail = (
+    m2d_results_dir = getattr(args, "m2d_results_dir", None)
+    m2d_paths = ([m2d_results] if m2d_results else []) + (
+        sorted(m2d_results_dir.glob("*.jsonl")) if m2d_results_dir else []
+    )
+    allowlist_tails = [
         _M2DAllowlistTail(
-            m2d_results,
+            path,
             require_cinematic_mix=bool(getattr(args, "require_cinematic_mix", False)),
         )
-        if m2d_results
-        else None
-    )
+        for path in m2d_paths
+    ]
     existing: set[str] = set()
     if args.output.exists() and not args.overwrite:
         for line in args.output.read_text().splitlines():
@@ -614,15 +664,25 @@ def score_asr_directory(args: argparse.Namespace) -> None:
     follow = bool(getattr(args, "follow", False))
     producer_done = getattr(args, "producer_done", None)
     poll_seconds = max(0.1, float(getattr(args, "poll_seconds", 2.0)))
-    if follow and not producer_done:
-        raise ValueError("--follow requires --producer-done")
+    shard_index = int(getattr(args, "shard_index", 0))
+    shard_count = int(getattr(args, "shard_count", 1))
     processed = 0
     previous_allowed_count = -1
     with args.output.open(mode, encoding="utf-8") as destination:
         while True:
             files = sorted(args.input_dir.glob(args.glob))
-            if allowlist_tail:
-                allowed, scored_count = allowlist_tail.refresh()
+            files = [
+                path
+                for path in files
+                if _belongs_to_shard(path.name, shard_index, shard_count)
+            ]
+            if allowlist_tails:
+                allowed: set[str] = set()
+                scored_count = 0
+                for tail in allowlist_tails:
+                    tail_allowed, tail_scored = tail.refresh()
+                    allowed.update(tail_allowed)
+                    scored_count += tail_scored
                 files = [path for path in files if path.name in allowed]
                 if len(allowed) != previous_allowed_count:
                     logger.info(
@@ -635,7 +695,7 @@ def score_asr_directory(args: argparse.Namespace) -> None:
                 files = files[: args.limit]
             pending = [path for path in files if path.name not in existing]
             if not pending:
-                if not follow or producer_done.is_file():
+                if not follow or (producer_done and producer_done.is_file()):
                     break
                 time.sleep(poll_seconds)
                 continue
@@ -665,6 +725,8 @@ def score_asr_directory(args: argparse.Namespace) -> None:
                         "device": args.device,
                         "compute_type": args.compute_type,
                         "beam_size": args.beam_size,
+                        "worker_shard_index": shard_index,
+                        "worker_shard_count": shard_count,
                     },
                     **evaluate_asr(
                         transcript=transcript,
@@ -773,7 +835,6 @@ def _enforce_current_voice_gate(
     strong_speech_windows = sum(
         bool(window["strong_speech_active"]) for window in windows
     )
-    strong_voice_present = strong_speech_windows >= MIN_STRONG_SPEECH_WINDOWS
     foreground_speech_windows = sum(
         bool(window["foreground_speech_active"]) for window in windows
     )
@@ -786,26 +847,35 @@ def _enforce_current_voice_gate(
     cinematic_sfx_windows = sum(
         bool(window["cinematic_sfx_active"]) for window in windows
     )
+    # Legacy rejected rows may not carry window evidence; keep them rejected
+    # while allowing append-only consumers to continue past the row.
+    required = _duration_requirements(len(windows) or 9)
     cinematic_mix_present = (
-        cinematic_music_windows >= MIN_CINEMATIC_MUSIC_WINDOWS
-        and cinematic_sfx_windows >= MIN_CINEMATIC_SFX_WINDOWS
+        cinematic_music_windows >= required["cinematic_music"]
+        and cinematic_sfx_windows >= required["cinematic_sfx"]
     )
     reasons = list(dict.fromkeys(result.get("rejection_reasons", [])))
+    strong_voice_present = strong_speech_windows >= required["strong_speech"]
+    foreground_voice_present = (
+        foreground_speech_windows >= required["foreground_speech"]
+    )
     if not strong_voice_present and "insufficient_strong_speech" not in reasons:
         reasons.append("insufficient_strong_speech")
+    if not foreground_voice_present and "insufficient_foreground_speech" not in reasons:
+        reasons.append("insufficient_foreground_speech")
     if (
-        synthetic_speech_windows > MAX_SYNTHETIC_SPEECH_WINDOWS
+        synthetic_speech_windows > required["synthetic_speech_max"]
         and "synthetic_speech_present" not in reasons
     ):
         reasons.append("synthetic_speech_present")
     if require_cinematic_mix:
         if (
-            cinematic_music_windows < MIN_CINEMATIC_MUSIC_WINDOWS
+            cinematic_music_windows < required["cinematic_music"]
             and "insufficient_cinematic_music" not in reasons
         ):
             reasons.append("insufficient_cinematic_music")
         if (
-            cinematic_sfx_windows < MIN_CINEMATIC_SFX_WINDOWS
+            cinematic_sfx_windows < required["cinematic_sfx"]
             and "insufficient_cinematic_sfx" not in reasons
         ):
             reasons.append("insufficient_cinematic_sfx")
@@ -816,11 +886,13 @@ def _enforce_current_voice_gate(
             "accepted": (
                 bool(result.get("accepted"))
                 and strong_voice_present
-                and synthetic_speech_windows <= MAX_SYNTHETIC_SPEECH_WINDOWS
+                and foreground_voice_present
+                and synthetic_speech_windows <= required["synthetic_speech_max"]
                 and (not require_cinematic_mix or cinematic_mix_present)
             ),
             "policy": policy,
             "rejection_reasons": reasons,
+            "duration_scaled_window_requirements": required,
             "strong_speech_active_windows": strong_speech_windows,
             "strong_speech_coverage": round(
                 strong_speech_windows / max(1, len(windows)), 6
@@ -1197,6 +1269,8 @@ def _parser() -> argparse.ArgumentParser:
     score.add_argument("--follow", action="store_true")
     score.add_argument("--producer-done", type=Path)
     score.add_argument("--poll-seconds", type=float, default=2.0)
+    score.add_argument("--shard-index", type=int, default=0)
+    score.add_argument("--shard-count", type=int, default=1)
     score.set_defaults(handler=score_directory)
 
     asr_score = subparsers.add_parser(
@@ -1209,6 +1283,7 @@ def _parser() -> argparse.ArgumentParser:
     asr_score.add_argument("--compute-type", default="float16")
     asr_score.add_argument("--download-root", type=Path)
     asr_score.add_argument("--m2d-results", type=Path)
+    asr_score.add_argument("--m2d-results-dir", type=Path)
     asr_score.add_argument("--require-cinematic-mix", action="store_true")
     asr_score.add_argument("--beam-size", type=int, default=5)
     asr_score.add_argument("--glob", default="*.wav")
@@ -1217,6 +1292,8 @@ def _parser() -> argparse.ArgumentParser:
     asr_score.add_argument("--follow", action="store_true")
     asr_score.add_argument("--producer-done", type=Path)
     asr_score.add_argument("--poll-seconds", type=float, default=2.0)
+    asr_score.add_argument("--shard-index", type=int, default=0)
+    asr_score.add_argument("--shard-count", type=int, default=1)
     asr_score.set_defaults(handler=score_asr_directory)
 
     materialize = subparsers.add_parser(

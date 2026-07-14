@@ -8,6 +8,7 @@ import io
 import json
 import os
 import secrets
+import sqlite3
 import threading
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -324,6 +325,19 @@ class PipelineProgressStore:
             }
 
 
+class ContinuousProgressStore:
+    """Expose the permanent SQLite-backed pipeline without batch semantics."""
+
+    def __init__(self, workspace: Path, *, snapshot_size: int = 5000):
+        self.workspace = workspace.resolve()
+        self.snapshot_size = snapshot_size
+
+    def snapshot(self) -> dict[str, Any]:
+        from .continuous_dataset import progress_snapshot
+
+        return progress_snapshot(self.workspace, self.snapshot_size)
+
+
 class ReviewStore:
     def __init__(
         self,
@@ -337,6 +351,9 @@ class ReviewStore:
         self.audio_directory = audio_directory
         self.audio_dir = (self.dataset_dir / audio_directory).resolve()
         self.manifest_path = self.dataset_dir / "manifest.json"
+        self.catalog_path = self.dataset_dir.parent / "catalog.sqlite3"
+        self.catalog_record_count: int | None = None
+        self.review_window_records = 5000
         self.annotations_path = (
             annotations_path.resolve()
             if annotations_path
@@ -346,13 +363,12 @@ class ReviewStore:
             raise FileNotFoundError(f"Manifest not found: {self.manifest_path}")
         if not self.audio_dir.is_dir():
             raise FileNotFoundError(f"Audio directory not found: {self.audio_dir}")
-        self.manifest = json.loads(self.manifest_path.read_text())
-        self.records_by_name = {
-            Path(record["local_path"]).name: record
-            for record in self.manifest.get("records", [])
-        }
-        self.filenames = self._selected_filenames()
-        self.filename_set = set(self.filenames)
+        self.manifest: dict[str, Any] = {}
+        self.records_by_name: dict[str, dict[str, Any]] = {}
+        self.filenames: list[str] = []
+        self.filename_set: set[str] = set()
+        self.manifest_signature: tuple[int, int, int] | None = None
+        self._refresh_manifest()
         self.lock = threading.Lock()
         self.claim_seconds = max(30, claim_seconds)
         self.reviews, self.claims = self._load_annotations()
@@ -368,9 +384,72 @@ class ReviewStore:
             for name in candidates
             if Path(name).name == name and (self.audio_dir / name).is_file()
         ]
-        if not filenames:
-            raise ValueError(f"No WAV files found in {self.audio_dir}")
         return filenames
+
+    def _refresh_manifest_file(self) -> bool:
+        """Atomically discover newly accepted clips without restarting the app."""
+        try:
+            stat = self.manifest_path.stat()
+        except FileNotFoundError:
+            return False
+        signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        if signature == self.manifest_signature:
+            return False
+        try:
+            manifest = json.loads(self.manifest_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return False
+        self.manifest = manifest
+        self.records_by_name = {
+            Path(record["local_path"]).name: record
+            for record in manifest.get("records", [])
+            if record.get("local_path")
+        }
+        self.filenames = self._selected_filenames()
+        self.filename_set = set(self.filenames)
+        self.manifest_signature = signature
+        return True
+
+    def _refresh_catalog(self) -> bool:
+        if not self.catalog_path.is_file():
+            return False
+        try:
+            connection = sqlite3.connect(
+                f"file:{self.catalog_path}?mode=ro", uri=True, timeout=5
+            )
+            connection.row_factory = sqlite3.Row
+            count = int(
+                connection.execute("SELECT COUNT(*) FROM accepted").fetchone()[0]
+            )
+            if count == self.catalog_record_count:
+                connection.close()
+                return False
+            from .continuous_dataset import catalog_records
+
+            records = catalog_records(
+                connection,
+                limit=self.review_window_records,
+                newest_first=True,
+            )
+            connection.close()
+        except (OSError, sqlite3.Error):
+            return False
+        self.records_by_name = {
+            Path(record["local_path"]).name: record for record in records
+        }
+        self.filenames = [
+            Path(record["local_path"]).name
+            for record in records
+            if (self.audio_dir / Path(record["local_path"]).name).is_file()
+        ]
+        self.filename_set = set(self.filenames)
+        self.catalog_record_count = count
+        return True
+
+    def _refresh_manifest(self) -> bool:
+        manifest_changed = self._refresh_manifest_file()
+        catalog_changed = self._refresh_catalog()
+        return manifest_changed or catalog_changed
 
     def _load_annotations(
         self,
@@ -387,7 +466,8 @@ class ReviewStore:
         selected_reviews = {
             filename: review
             for filename, review in reviews.items()
-            if filename in self.filename_set and isinstance(review, dict)
+            if (self.catalog_path.is_file() or filename in self.filename_set)
+            and isinstance(review, dict)
         }
         selected_claims = {
             filename: claim
@@ -463,6 +543,7 @@ class ReviewStore:
 
     def state(self) -> dict[str, Any]:
         with self.lock:
+            self._refresh_manifest()
             if self._prune_claims():
                 self._save()
             clips = [self._record_summary(filename) for filename in self.filenames]
@@ -473,22 +554,30 @@ class ReviewStore:
             active_reviewers = sorted(
                 {claim["reviewer_name"] for claim in self.claims.values()}
             )
+            total = self.catalog_record_count or len(self.filenames)
+            reviewed_in_window = sum(
+                filename in self.reviews for filename in self.filenames
+            )
             return {
                 "dataset": {
                     "name": self.manifest.get("name"),
                     "dataset_dir": str(self.dataset_dir),
                     "audio_directory": self.audio_directory,
                     "annotations_path": str(self.annotations_path),
+                    "loaded_review_window": len(self.filenames),
                 },
                 "summary": {
-                    "total": len(self.filenames),
+                    "total": total,
                     "reviewed": reviewed,
-                    "unreviewed": len(self.filenames) - reviewed,
+                    "unreviewed": max(0, total - reviewed),
                     "good": decisions["good"],
                     "perfect": decisions["perfect"],
                     "not_ok": decisions["not_ok"],
                     "active_claims": len(self.claims),
-                    "available": len(self.filenames) - reviewed - len(self.claims),
+                    "available": max(
+                        0, len(self.filenames) - reviewed_in_window - len(self.claims)
+                    ),
+                    "loaded_for_review": len(self.filenames),
                     "active_reviewers": active_reviewers,
                 },
                 "reason_labels": {
@@ -507,6 +596,8 @@ class ReviewStore:
             }
 
     def audio_path(self, filename: str) -> Path:
+        with self.lock:
+            self._refresh_manifest()
         if Path(filename).name != filename or filename not in self.filename_set:
             raise KeyError(filename)
         path = self.audio_dir / filename
@@ -516,6 +607,7 @@ class ReviewStore:
 
     def claim_next(self, request: ClaimNextRequest) -> str | None:
         with self.lock:
+            self._refresh_manifest()
             changed = self._prune_claims()
             if request.release_filename:
                 current = self.claims.get(request.release_filename)
@@ -549,9 +641,10 @@ class ReviewStore:
             return filename
 
     def claim(self, filename: str, identity: ReviewerIdentity) -> bool:
-        if filename not in self.filename_set:
-            raise KeyError(filename)
         with self.lock:
+            self._refresh_manifest()
+            if filename not in self.filename_set:
+                raise KeyError(filename)
             self._prune_claims()
             if filename in self.reviews:
                 return False
@@ -571,9 +664,10 @@ class ReviewStore:
             return True
 
     def heartbeat(self, filename: str, identity: ReviewerIdentity) -> dict[str, Any]:
-        if filename not in self.filename_set:
-            raise KeyError(filename)
         with self.lock:
+            self._refresh_manifest()
+            if filename not in self.filename_set:
+                raise KeyError(filename)
             self._prune_claims()
             claim = self.claims.get(filename)
             if not claim or claim.get("reviewer_id") != identity.reviewer_id:
@@ -584,9 +678,10 @@ class ReviewStore:
             return claim
 
     def release(self, filename: str, identity: ReviewerIdentity) -> None:
-        if filename not in self.filename_set:
-            raise KeyError(filename)
         with self.lock:
+            self._refresh_manifest()
+            if filename not in self.filename_set:
+                raise KeyError(filename)
             self._prune_claims()
             claim = self.claims.get(filename)
             if claim and claim.get("reviewer_id") == identity.reviewer_id:
@@ -594,8 +689,6 @@ class ReviewStore:
                 self._save()
 
     def update(self, filename: str, update: ReviewUpdate) -> dict[str, Any]:
-        if filename not in self.filename_set:
-            raise KeyError(filename)
         if update.decision == "not_ok" and not (update.reasons or update.note.strip()):
             raise ValueError("Not OK requires at least one reason or a note")
         if "other" in update.reasons and not update.note.strip():
@@ -613,6 +706,9 @@ class ReviewStore:
             "reviewer_name": update.reviewer_name.strip(),
         }
         with self.lock:
+            self._refresh_manifest()
+            if filename not in self.filename_set:
+                raise KeyError(filename)
             self._prune_claims()
             claim = self.claims.get(filename)
             if not claim or claim.get("reviewer_id") != update.reviewer_id:
@@ -625,9 +721,10 @@ class ReviewStore:
         return review
 
     def clear(self, filename: str, identity: ReviewerIdentity) -> None:
-        if filename not in self.filename_set:
-            raise KeyError(filename)
         with self.lock:
+            self._refresh_manifest()
+            if filename not in self.filename_set:
+                raise KeyError(filename)
             existing = self.reviews.get(filename)
             if existing and existing.get("reviewer_id") not in {
                 None,
@@ -641,6 +738,8 @@ class ReviewStore:
             self._save()
 
     def export_csv(self) -> str:
+        with self.lock:
+            self._refresh_manifest()
         destination = io.StringIO()
         fields = [
             "filename",
@@ -677,7 +776,8 @@ class ReviewStore:
 
 
 def create_review_app(
-    store: ReviewStore, progress_store: PipelineProgressStore | None = None
+    store: ReviewStore,
+    progress_store: PipelineProgressStore | ContinuousProgressStore | None = None,
 ) -> FastAPI:
     app = FastAPI(title="SAM Audio Manual Review", version="2.0.0")
     html_path = Path(__file__).parent / "web" / "manual_review.html"
@@ -713,8 +813,9 @@ def create_review_app(
         if not progress_store:
             raise HTTPException(status_code=404, detail="Progress dashboard disabled")
         payload = progress_store.snapshot()
+        store.state()
         payload["review_snapshot"] = {
-            "materialized": len(store.filenames),
+            "materialized": store.catalog_record_count or len(store.filenames),
             "path": str(store.dataset_dir),
         }
         return payload
@@ -816,6 +917,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--progress-batch-dir", type=Path, action="append", default=[])
     parser.add_argument("--progress-final-dir", type=Path)
     parser.add_argument("--progress-target", type=int, default=1000)
+    parser.add_argument("--continuous-workspace", type=Path)
+    parser.add_argument("--snapshot-size", type=int, default=5000)
     return parser
 
 
@@ -828,7 +931,11 @@ def main() -> None:
         claim_seconds=args.claim_seconds,
     )
     progress_store = None
-    if args.progress_batch_dir:
+    if args.continuous_workspace:
+        progress_store = ContinuousProgressStore(
+            args.continuous_workspace, snapshot_size=args.snapshot_size
+        )
+    elif args.progress_batch_dir:
         progress_store = PipelineProgressStore(
             args.progress_batch_dir,
             final_dir=args.progress_final_dir,

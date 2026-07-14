@@ -256,8 +256,6 @@
         const shortcut = index === 9 ? '0' : String(index + 1);
         $('reasonGrid').insertAdjacentHTML('beforeend', `<label class="reason"><input type="checkbox" value="${key}"><span>${esc(label)}</span><kbd>${shortcut}</kbd></label>`);
       });
-      const buckets = [...new Set(app.state.clips.map(c => c.background_bucket).filter(Boolean))].sort();
-      for (const bucket of buckets) $('bucketFilter').insertAdjacentHTML('beforeend', `<option value="${esc(bucket)}">${esc(bucket.replaceAll('_', ' '))}</option>`);
       $('search').addEventListener('input', applyFilters);
       $('statusFilter').addEventListener('change', applyFilters);
       $('bucketFilter').addEventListener('change', applyFilters);
@@ -273,13 +271,27 @@
         await claimNext(false);
       }
       setInterval(heartbeat, 30000);
+      setInterval(liveRefresh, 5000);
     }
 
     async function refreshState() {
       app.state = await fetchJson('/api/state');
+      $('datasetName').textContent = `${app.state.dataset.name} · ${app.state.summary.total} clips`;
+      const knownBuckets = new Set([...$('bucketFilter').options].map(option => option.value));
+      const newBuckets = [...new Set(app.state.clips.map(c => c.background_bucket).filter(Boolean))].sort();
+      for (const bucket of newBuckets) {
+        if (!knownBuckets.has(bucket)) $('bucketFilter').insertAdjacentHTML('beforeend', `<option value="${esc(bucket)}">${esc(bucket.replaceAll('_', ' '))}</option>`);
+      }
       if (app.current) app.current = app.state.clips.find(clip => clip.filename === app.current.filename) || null;
       updateProgress();
       applyFilters();
+    }
+
+    async function liveRefresh() {
+      try {
+        await refreshState();
+        if (!app.current && app.state.summary.available > 0) await claimNext(false);
+      } catch (_) {}
     }
 
     function applyFilters() {

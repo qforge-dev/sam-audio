@@ -7,6 +7,7 @@
   <style>
     :root { color-scheme: dark; --bg:#0b1016; --panel:#121a23; --panel2:#18232f; --line:#293848; --text:#eef5fb; --muted:#90a2b4; --blue:#67b7ff; --green:#56d491; --gold:#f7c75d; }
     * { box-sizing: border-box; }
+    [hidden] { display:none !important; }
     body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 Inter,ui-sans-serif,system-ui,sans-serif; }
     header { display:flex; align-items:center; gap:16px; padding:16px 24px; border-bottom:1px solid var(--line); background:rgba(11,16,22,.96); position:sticky; top:0; z-index:2; }
     h1 { margin:0; font-size:18px; } h2 { margin:0 0 5px; font-size:22px; }
@@ -54,8 +55,8 @@
   <main class="shell">
     <section class="hero">
       <div class="card">
-        <div class="eyebrow">Final verified dataset</div>
-        <div class="big"><span id="finalCount">0</span> <span class="muted">/ <span id="target">1000</span></span></div>
+        <div class="eyebrow" id="heroLabel">Final verified dataset</div>
+        <div class="big"><span id="finalCount">0</span> <span class="muted" id="targetWrap">/ <span id="target">1000</span></span></div>
         <div class="muted" id="finalText">Waiting for enough clips to survive every gate.</div>
         <div class="bar"><div id="finalBar"></div></div>
       </div>
@@ -63,11 +64,19 @@
         <div class="eyebrow">Current worker stage</div>
         <div class="stage" id="stage">Waiting</div>
         <p class="muted" id="stageHelp"></p>
+        <p id="goalText"></p>
       </div>
     </section>
     <section class="funnel" id="funnel"></section>
-    <div class="section-head"><div><h2>Acquisition batches</h2><p>Counts update every five seconds.</p></div></div>
+    <section class="funnel" id="queues"></section>
+    <div class="section-head" id="throughputHeading" hidden><div><h2>Rolling throughput</h2><p>Audio duration processed per wall-clock minute; use queue growth to locate bottlenecks.</p></div></div>
+    <div class="table-wrap" id="throughputWrap" hidden><table><thead><tr><th>Stage</th><th>Clips in window</th><th>Clips/min</th><th>Audio min/min</th><th>Equivalent audio hours/hour</th></tr></thead><tbody id="throughput"></tbody></table></div>
+    <div class="section-head" id="batchHeading"><div><h2>Acquisition batches</h2><p>Counts update every five seconds.</p></div></div>
     <div class="table-wrap"><table><thead><tr><th>Batch</th><th>Status</th><th>Attempts</th><th>Downloaded</th><th>M2D scored</th><th>M2D pass</th><th>Speech scored</th><th>Speech pass</th><th>Combined</th></tr></thead><tbody id="batches"></tbody></table></div>
+    <div class="section-head" id="workerHeading" hidden><div><h2>Independent workers</h2><p>Each producer and consumer advances at its own rate.</p></div></div>
+    <div class="table-wrap" id="workerWrap" hidden><table><thead><tr><th>Worker</th><th>Health</th><th>Last heartbeat</th><th>Details</th></tr></thead><tbody id="workers"></tbody></table></div>
+    <div class="section-head" id="snapshotHeading" hidden><div><h2>Immutable S3 snapshots</h2><p>A READY marker is published only after the exhaustive audit passes.</p></div></div>
+    <div class="table-wrap" id="snapshotWrap" hidden><table><thead><tr><th>Snapshot</th><th>Clips</th><th>Published</th><th>S3 location</th></tr></thead><tbody id="snapshots"></tbody></table></div>
     <div class="section-head"><div><h2>What “prepared” means</h2><p>The final count only moves after every required gate and final audit.</p></div></div>
     <div class="card">
       <div class="pipeline"><span>Stereo source</span><span>Audio quality</span><span>Movie-like source metadata</span><span>M2D voice + music + SFX</span><span>English foreground speech</span><span>Explicit source exclusions</span><span>Deduplication</span><span>≤24 clips/source</span><span>Final file/hash audit</span></div>
@@ -103,6 +112,47 @@
         const response = await fetch(`${BASE}/api/progress`, {cache:'no-store'});
         if (!response.ok) throw new Error(`Progress API returned ${response.status}`);
         const data = await response.json();
+        if (data.mode === 'continuous') {
+          const accepted = data.counts.accepted || 0;
+          const next = data.next_snapshot;
+          $('heroLabel').textContent = 'Current accepted clips · 30 seconds each';
+          $('targetWrap').hidden = true;
+          $('finalCount').textContent = number(accepted);
+          $('finalBar').style.width = `${Math.min(100, next.progress / next.size * 100)}%`;
+          $('finalText').textContent = `${number(next.remaining)} clips until immutable ${number(next.record_count)}-clip S3 snapshot.`;
+          const healthy = data.workers.filter(worker => worker.state === 'running').length;
+          $('stage').textContent = `continuous · ${healthy}/${data.workers.length} workers healthy`;
+          $('stageHelp').textContent = 'Downloading, M2D, speech validation, assembly, review, and publishing run independently with persistent queues.';
+          const goal = data.goal;
+          const eta = goal.estimated_completion_at ? `${number(goal.estimated_days_remaining)} days · ${new Date(goal.estimated_completion_at).toLocaleDateString()}` : 'collecting throughput data';
+          $('goalText').innerHTML = `<strong>${Number(goal.current_audio_hours).toFixed(2)} / ${number(goal.target_audio_hours)} audio hours</strong><br><span class="muted">${Number(goal.accepted_audio_hours_per_wall_hour).toFixed(2)} accepted audio h/wall h · ETA ${eta}</span>`;
+          $('updated').textContent = `Live · updated ${new Date(data.updated_at).toLocaleTimeString()}`;
+          const metrics = [
+            ['downloaded','Downloaded','Passed stereo/source quality'], ['m2d_scored','M2D scored','Voice + music + SFX model'],
+            ['m2d_accepted','M2D pass','Includes non-vocal music'], ['asr_scored','Speech scored','Foreground speech decoded'],
+            ['asr_accepted','Speech pass','Confident English dialogue'], ['accepted','Accepted','All automated gates passed'],
+            ['rejected_total','Rejected','Failed M2D, ASR, dedupe, or source diversity'], ['snapshots','Snapshots','Immutable S3 releases']
+          ];
+          $('funnel').innerHTML = metrics.map(([key,title,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${number(data.counts[key])}</strong><small>${help}</small></div>`).join('');
+          const queueMetrics = [
+            ['waiting_for_m2d','M2D queue','Downloaded clips waiting for acoustic scoring'],
+            ['waiting_for_asr','Speech queue','M2D passes waiting for ASR'],
+            ['waiting_for_assembly','Assembly queue','Full passes waiting for catalog materialization']
+          ];
+          $('queues').innerHTML = queueMetrics.map(([key,title,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${number(data.queues[key])}</strong><small>${help}</small></div>`).join('');
+          $('throughputHeading').hidden = false; $('throughputWrap').hidden = false;
+          $('throughput').innerHTML = Object.entries(data.throughput).map(([stage,rate]) => `<tr><td><strong>${label(stage)}</strong><br><small class="muted">${Number(rate.observed_minutes).toFixed(1)} of ${number(rate.rolling_window_minutes)} min observed</small></td><td>${number(rate.clips)}</td><td>${Number(rate.clips_per_minute).toFixed(2)}</td><td>${Number(rate.audio_minutes_per_minute).toFixed(2)}</td><td>${Number(rate.audio_hours_per_hour).toFixed(2)}</td></tr>`).join('');
+          $('batchHeading').hidden = true;
+          $('batches').closest('.table-wrap').hidden = true;
+          $('workerHeading').hidden = false; $('workerWrap').hidden = false;
+          const configured = data.worker_config || {};
+          $('workers').innerHTML = data.workers.map(worker => `<tr><td><strong>${label(worker.worker)}</strong></td><td><span class="status ${worker.state}">${label(worker.state)}</span></td><td>${new Date(worker.updated_at).toLocaleTimeString()}</td><td>${Object.entries(worker.details || {}).map(([key,value]) => `${label(key)} ${number(value)}`).join(' · ')}</td></tr>`).join('') + `<tr><td><strong>Configured pools</strong></td><td><span class="status running">scalable</span></td><td>service environment</td><td>download ${number(configured.download_workers)} · M2D ${number(configured.m2d_workers)} · ASR ${number(configured.asr_workers)} · S3 concurrency ${number(configured.upload_concurrency)}</td></tr>`;
+          $('snapshotHeading').hidden = false; $('snapshotWrap').hidden = false;
+          $('snapshots').innerHTML = data.published_snapshots.length ? data.published_snapshots.map(snapshot => `<tr><td><strong>${snapshot.snapshot_id}</strong></td><td>${number(snapshot.record_count)}</td><td>${new Date(snapshot.published_at).toLocaleString()}</td><td>${snapshot.s3_prefix}</td></tr>`).join('') : '<tr><td colspan="4" class="muted">The first snapshot will publish automatically at 5,000 accepted clips.</td></tr>';
+          $('combinedNote').textContent = 'Every accepted clip passes stereo/source quality, metadata exclusions, duration-scaled M2D voice + instrumental music + SFX overlap, English foreground speech, deduplication, and source diversity. Manual review is diagnostic only.';
+          $('error').textContent = '';
+          return;
+        }
         $('target').textContent = number(data.target); $('finalCount').textContent = number(data.final.materialized);
         $('finalBar').style.width = `${Math.min(100, data.final.materialized / data.target * 100)}%`;
         $('finalText').textContent = data.final.verified ? `Verified at ${data.final.path}` : 'Waiting for enough clips to survive every gate.';

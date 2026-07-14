@@ -6,7 +6,10 @@ cd "${deploy_root}/pipeline"
 export PYTHONPATH="${deploy_root}/pipeline/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 progress_args=()
-if [[ -n "${SAM_REVIEW_PROGRESS_BATCH_DIRS:-}" ]]; then
+if [[ -n "${SAM_REVIEW_CONTINUOUS_WORKSPACE:-}" ]]; then
+  progress_args+=(--continuous-workspace "${SAM_REVIEW_CONTINUOUS_WORKSPACE}")
+  progress_args+=(--snapshot-size "${SAM_REVIEW_SNAPSHOT_SIZE:-5000}")
+elif [[ -n "${SAM_REVIEW_PROGRESS_BATCH_DIRS:-}" ]]; then
   IFS=',' read -r -a progress_dirs <<< "${SAM_REVIEW_PROGRESS_BATCH_DIRS}"
   for progress_dir in "${progress_dirs[@]}"; do
     progress_args+=(--progress-batch-dir "${progress_dir}")

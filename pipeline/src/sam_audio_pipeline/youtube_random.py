@@ -50,10 +50,8 @@ HIGH_QUALITY_AUDIO_SELECTOR = (
     "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
     "bestaudio[acodec!=none]/best[acodec!=none]"
 )
-DAILYMOTION_EFFICIENT_SELECTOR = (
-    "best[height>=720][height<=720][acodec!=none]/"
-    "best[height>=720][acodec!=none]/best[acodec!=none]"
-)
+# Audio-only downloads avoid transferring and decoding an unused 720p video stream.
+DAILYMOTION_EFFICIENT_SELECTOR = HIGH_QUALITY_AUDIO_SELECTOR
 
 SCENES = (
     "street market",
@@ -717,7 +715,10 @@ def analyze_wav(path: Path) -> dict[str, Any]:
 
 
 def quality_rejections(
-    metrics: dict[str, Any], source_format: dict[str, Any]
+    metrics: dict[str, Any],
+    source_format: dict[str, Any],
+    *,
+    clip_seconds: float | None = None,
 ) -> list[str]:
     reasons: list[str] = []
     if int(source_format.get("sample_rate_hz") or 0) < MIN_SOURCE_SAMPLE_RATE:
@@ -726,7 +727,8 @@ def quality_rejections(
         reasons.append("source_not_stereo")
     if float(source_format.get("bitrate_kbps") or 0.0) < MIN_SOURCE_BITRATE_KBPS:
         reasons.append("source_bitrate")
-    if abs(float(metrics["duration_seconds"]) - CLIP_SECONDS) > 0.02:
+    expected_duration = CLIP_SECONDS if clip_seconds is None else clip_seconds
+    if abs(float(metrics["duration_seconds"]) - expected_duration) > 0.02:
         reasons.append("duration")
     if float(metrics["rms_dbfs"]) < MIN_RMS_DBFS:
         reasons.append("low_rms")
@@ -1453,9 +1455,11 @@ def acquire_dataset(
 
 
 def main() -> None:
+    global CLIP_SECONDS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--total", type=int, default=1000)
+    parser.add_argument("--clip-seconds", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=20260714)
     parser.add_argument("--query-count", type=int)
     parser.add_argument("--results-per-query", type=int, default=12)
@@ -1487,6 +1491,9 @@ def main() -> None:
     )
     if args.total < 1:
         parser.error("--total must be positive")
+    if args.clip_seconds <= 0:
+        parser.error("--clip-seconds must be positive")
+    CLIP_SECONDS = float(args.clip_seconds)
     clips_per_video = args.clips_per_video or (
         3 if args.profile == "cinematic" else 1
     )

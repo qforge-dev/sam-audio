@@ -209,6 +209,32 @@ def test_progress_dashboard_is_optional(tmp_path: Path):
     assert client.get("/api/progress").status_code == 404
 
 
+def test_review_store_discovers_new_manifest_records_without_restart(
+    tmp_path: Path,
+) -> None:
+    dataset = _dataset(tmp_path)
+    store = ReviewStore(dataset, audio_directory="balanced-audio")
+    assert store.state()["summary"]["total"] == 2
+
+    _wav(dataset / "balanced-audio" / "three.wav")
+    manifest = json.loads((dataset / "manifest.json").read_text())
+    manifest.pop("balanced_listening_subset")
+    manifest["records"].append(
+        {
+            "local_path": "balanced-audio/three.wav",
+            "title": "New streamed clip",
+            "m2d_validation": {},
+        }
+    )
+    temporary = dataset / "manifest.json.tmp"
+    temporary.write_text(json.dumps(manifest))
+    temporary.replace(dataset / "manifest.json")
+
+    state = store.state()
+    assert state["summary"]["total"] == 3
+    assert any(clip["filename"] == "three.wav" for clip in state["clips"])
+
+
 def test_not_ok_requires_reason_and_other_requires_note(tmp_path: Path):
     client = TestClient(
         create_review_app(

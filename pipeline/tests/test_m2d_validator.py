@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from sam_audio_pipeline.m2d_validator import (
+    _belongs_to_shard,
     _m2d_asr_allowlist,
     _M2DAllowlistTail,
     evaluate_asr,
@@ -16,6 +17,20 @@ from sam_audio_pipeline.m2d_validator import (
     materialize_accepted,
     merge_materialized,
 )
+
+
+def test_worker_shards_form_a_stable_non_overlapping_partition() -> None:
+    filenames = [f"clip-{index}.wav" for index in range(100)]
+    assignments = [
+        [index for index in range(4) if _belongs_to_shard(name, index, 4)]
+        for name in filenames
+    ]
+
+    assert all(len(indices) == 1 for indices in assignments)
+    assert assignments == [
+        [index for index in range(4) if _belongs_to_shard(name, index, 4)]
+        for name in filenames
+    ]
 
 
 def test_asr_gate_requires_decodable_foreground_voice() -> None:

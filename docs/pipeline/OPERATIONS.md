@@ -188,6 +188,57 @@ uv run sam-pipeline-youtube-random \
   --max-attempts 2500
 ```
 
+## Continuous 30-second cinematic dataset
+
+`sam-cinematic-continuous.service` runs a permanent producer/consumer graph.
+Acquisition publishes quality-gated files atomically; resident M2D and ASR
+workers consume independent deterministic shards; the assembler writes the
+append-only accepted catalog; and the publisher releases an exhaustive,
+immutable S3 snapshot at every 5,000 accepted clips. Manual review is diagnostic
+feedback and never blocks acceptance.
+
+The SQLite/WAL catalog is authoritative; the live JSON manifest is intentionally
+constant-size. Review queries the newest 5,000 accepted records directly from
+the catalog so the page stays responsive while the global count grows into the
+millions. Each S3 snapshot contains only its new 5,000-record sequence range
+(for example `v2-00000001-00005000`), avoiding quadratic cumulative manifests.
+
+The live dataset is under `/home/ubuntu/cinematic-continuous-30s`. Review it at
+`http://127.0.0.1:18081/` and inspect queues, worker health, rolling throughput,
+the 10,000-hour ETA, and S3 releases at
+`http://127.0.0.1:18081/progress`.
+
+Pool sizes are independent settings in `/etc/sam-cinematic-continuous.env`:
+
+```text
+SAM_CONTINUOUS_SEARCH_WORKERS=8
+SAM_CONTINUOUS_DOWNLOAD_WORKERS=8
+SAM_CONTINUOUS_M2D_WORKERS=1
+SAM_CONTINUOUS_ASR_WORKERS=1
+SAM_CONTINUOUS_UPLOAD_CONCURRENCY=10
+```
+
+Restart `sam-cinematic-continuous.service` after changing a count. Filename hash
+sharding prevents two M2D or ASR processes from claiming the same clip, and the
+SQLite/WAL catalog makes replay and worker-count changes idempotent. Promoter,
+assembler, and snapshot publisher remain single lightweight coordinators.
+
+Throughput uses a rolling 60-minute window. `audio min/min` is clip duration
+processed per wall-clock minute and has the same numeric value as audio
+hours/wall-clock hour. The 10,000-hour estimate uses accepted throughput, not
+download or model throughput, and is intentionally unavailable until at least
+one clip has passed every gate.
+
+The frozen 10-second baseline is published at:
+
+```text
+s3://sam-audio-pipeline-artifactbucket-ndb3jfc3asyk/cinematic-dialogue-dataset/snapshots/v1-00001000/
+```
+
+Audio is content-addressed under `cinematic-dialogue-dataset/audio/{sha256}.wav`.
+Snapshot metadata is published first and `READY.json` last; consumers must
+require the ready marker and validate `manifest.sha256`.
+
 Acquisition is resumable. `attempts.jsonl` records every accepted, rejected, or
 unavailable candidate; `metadata/candidates.json` and `metadata/search.json`
 preserve search provenance; `manifest.json` contains only accepted records and
