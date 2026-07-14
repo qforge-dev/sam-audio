@@ -133,6 +133,17 @@ def test_cinematic_segment_sampling_is_reproducible_and_non_overlapping() -> Non
     )
 
 
+def test_long_cinematic_sources_can_supply_many_distinct_excerpts() -> None:
+    starts = _sample_clip_starts(
+        seed=42, video_id="feature-length-source", duration=1800, clips_per_video=48
+    )
+
+    assert len(starts) == 48
+    assert all(
+        right - left >= 12 for left, right in zip(starts, starts[1:], strict=False)
+    )
+
+
 def test_dailymotion_work_is_grouped_by_video_without_reordering_clips() -> None:
     candidates = [
         {"video_id": "a", "candidate_id": "a:1"},

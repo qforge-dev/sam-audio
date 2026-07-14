@@ -27,13 +27,15 @@ wait_for_initial_batch() {
 acquire_batch() {
   local seed=$1
   local batch_dir="/home/ubuntu/cinematic-dm-raw-$seed"
+  # Download each source once, then inspect many non-overlapping ten-second
+  # positions. This improves useful-clip yield without duplicate transfers.
   "$PIPELINE_PYTHON" -m sam_audio_pipeline.youtube_random \
     --output "$batch_dir" \
     --source dailymotion \
     --profile cinematic \
     --total 7000 \
     --seed "$seed" \
-    --clips-per-video 12 \
+    --clips-per-video 48 \
     --query-count 500 \
     --results-per-query 100 \
     --search-workers 8 \
@@ -76,7 +78,7 @@ try_materialize() {
     "${args[@]}" \
     --output-dir "$FINAL_DIR" \
     --accepted-limit 1000 \
-    --max-clips-per-video 3 \
+    --max-clips-per-video 24 \
     --seed 20260715 \
     --require-cinematic-mix
 }
