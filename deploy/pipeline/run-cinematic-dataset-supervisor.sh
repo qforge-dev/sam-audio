@@ -46,7 +46,9 @@ acquire_batch() {
     --profile cinematic \
     --total "$target" \
     --seed "$seed" \
-    --clips-per-video 48 \
+    --clips-per-video 16 \
+    --source-content-minutes-per-hour 10 \
+    --max-clips-per-video 60 \
     --query-count 500 \
     --results-per-query 100 \
     --search-workers 8 \
@@ -103,7 +105,9 @@ try_materialize() {
     "${args[@]}" \
     --output-dir "$FINAL_DIR" \
     --accepted-limit 1000 \
-    --max-clips-per-video 24 \
+    --max-clips-per-video 16 \
+    --source-content-minutes-per-hour 10 \
+    --max-duration-scaled-clips-per-video 60 \
     --seed 20260715 \
     --require-cinematic-mix
 }

@@ -526,6 +526,8 @@ def test_merge_materialized_is_exact_diverse_and_deduplicated(tmp_path: Path) ->
             output_dir=output,
             accepted_limit=3,
             max_clips_per_video=1,
+            source_content_minutes_per_hour=10,
+            max_duration_scaled_clips_per_video=60,
             seed=7,
             require_cinematic_mix=False,
         )
@@ -534,6 +536,7 @@ def test_merge_materialized_is_exact_diverse_and_deduplicated(tmp_path: Path) ->
     manifest = json.loads((output / "manifest.json").read_text())
     audit = json.loads((output / "audit.json").read_text())
     assert manifest["accepted_record_count"] == 3
+    assert manifest["source_diversity"]["content_minutes_per_source_hour"] == 10
     assert len({record["video_id"] for record in manifest["records"]}) == 3
     assert audit["record_count"] == 3
     assert audit["unique_sha256_count"] == 3

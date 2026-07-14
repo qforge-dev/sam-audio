@@ -20,12 +20,12 @@ from sam_audio_pipeline.continuous_dataset import (
 from sam_audio_pipeline.review_app import ReviewStore
 
 
-def _wav(path: Path) -> None:
+def _wav(path: Path, *, frequency: float = 440.0) -> None:
     sample_rate = 48_000
     timeline = np.arange(sample_rate) / sample_rate
     samples = np.column_stack(
         (
-            0.2 * np.sin(2 * math.pi * 440 * timeline),
+            0.2 * np.sin(2 * math.pi * frequency * timeline),
             0.2 * np.sin(2 * math.pi * 554 * timeline),
         )
     )
@@ -34,6 +34,69 @@ def _wav(path: Path) -> None:
         destination.setsampwidth(2)
         destination.setframerate(sample_rate)
         destination.writeframes(np.rint(samples * 32767).astype("<i2").tobytes())
+
+
+def test_assembler_accepts_more_than_24_clips_from_a_long_source(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    raw_audio = workspace / "raw-audio"
+    raw_audio.mkdir(parents=True)
+    connection = connect(workspace)
+    timestamp = "2026-07-14T00:00:00+00:00"
+    with connection:
+        for index in range(61):
+            temporary = raw_audio / f"source-{index}.wav"
+            _wav(temporary, frequency=440.0 + index)
+            digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+            filename = f"{digest}.wav"
+            temporary.rename(raw_audio / filename)
+            record = {
+                "candidate_id": f"long-game:{index}",
+                "video_id": "long-game",
+                "source_platform": "dailymotion",
+                "title": "English Game Cutscenes and Dialogue",
+                "duration_seconds": 3 * 3600,
+                "clip_start_seconds": float(index * 60),
+                "sha256": digest,
+                "local_path": f"raw-audio/{filename}",
+            }
+            connection.execute(
+                "INSERT INTO records VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    digest,
+                    record["candidate_id"],
+                    filename,
+                    "dailymotion",
+                    "long-game",
+                    record["clip_start_seconds"],
+                    json.dumps(record),
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO m2d_scores VALUES(?,?,?,?)",
+                (filename, 1, json.dumps({"accepted": True}), timestamp),
+            )
+            connection.execute(
+                "INSERT INTO asr_scores VALUES(?,?,?,?)",
+                (filename, 1, json.dumps({"accepted": True}), timestamp),
+            )
+    connection.close()
+
+    assert assemble_once(workspace) == 60
+    connection = connect(workspace)
+    assert connection.execute("SELECT COUNT(*) FROM accepted").fetchone()[0] == 60
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM rejected WHERE reason='source_video_cap'"
+        ).fetchone()[0]
+        == 1
+    )
+    connection.close()
+    manifest = json.loads((workspace / "accepted" / "manifest.json").read_text())
+    assert manifest["source_diversity"]["content_minutes_per_source_hour"] == 10
+    assert manifest["source_diversity"]["maximum_clips_per_source"] == 60
 
 
 def _autoscale(**overrides: object) -> dict[str, object]:

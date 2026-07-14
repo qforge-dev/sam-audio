@@ -32,6 +32,12 @@ from typing import Any
 import numpy as np
 
 from .audio import sha256_file
+from .source_diversity import (
+    DEFAULT_MAX_CLIPS_PER_SOURCE,
+    record_source_clip_budget,
+    source_clip_budget,
+    source_diversity_policy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,9 @@ CLIP_SECONDS = 10.0
 OUTPUT_SAMPLE_RATE = 48_000
 MIN_SOURCE_SAMPLE_RATE = 44_100
 MIN_SOURCE_BITRATE_KBPS = 120.0
+MIN_SOURCE_DURATION_SECONDS = 30.0
+MAX_SOURCE_DURATION_SECONDS = 12 * 3600.0
+CANDIDATE_DURATION_POLICY = "source_duration_up_to_12h_v1"
 SILENCE_THRESHOLD_DBFS = -55.0
 MIN_RMS_DBFS = -35.0
 MIN_PEAK_DBFS = -20.0
@@ -399,7 +408,7 @@ def _candidate_allowed(item: dict[str, Any], *, profile: str = "general") -> boo
     )
     return (
         bool(item.get("id") or item.get("video_id"))
-        and 30.0 <= duration <= 3600.0
+        and MIN_SOURCE_DURATION_SECONDS <= duration <= MAX_SOURCE_DURATION_SECONDS
         and item.get("live_status") not in {"is_live", "is_upcoming"}
         and not any(
             term in text
@@ -484,15 +493,30 @@ def _search(
 
 
 def _sample_clip_starts(
-    *, seed: int, video_id: str, duration: float, clips_per_video: int
+    *,
+    seed: int,
+    video_id: str,
+    duration: float,
+    clips_per_video: int,
+    source_content_minutes_per_hour: float | None = None,
+    max_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
 ) -> list[float]:
-    """Pick deterministic, non-overlapping ten-second excerpts from one source."""
+    """Pick deterministic, non-overlapping excerpts from one source."""
     lower = 5.0
     upper = duration - CLIP_SECONDS - 5.0
     if upper <= lower:
         return []
     maximum = max(1, math.floor((upper - lower) / (CLIP_SECONDS + 2.0)) + 1)
-    wanted = min(clips_per_video, maximum)
+    clip_budget = clips_per_video
+    if source_content_minutes_per_hour is not None:
+        clip_budget = source_clip_budget(
+            duration,
+            clip_seconds=CLIP_SECONDS,
+            base_clips=clips_per_video,
+            content_minutes_per_hour=source_content_minutes_per_hour,
+            max_clips=max_clips_per_video,
+        )
+    wanted = min(clip_budget, maximum)
     generator = random.Random(f"{seed}:{video_id}")
     starts: list[float] = []
     for _ in range(200):
@@ -516,6 +540,8 @@ def discover_candidates(
     minimum_candidates: int,
     profile: str = "general",
     clips_per_video: int = 1,
+    source_content_minutes_per_hour: float | None = None,
+    max_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
     source: str = "youtube",
 ) -> list[dict[str, Any]]:
     metadata_dir = output_dir / "metadata"
@@ -528,7 +554,15 @@ def discover_candidates(
         compatible = (
             search_metadata.get("profile", "general") == profile
             and int(search_metadata.get("clips_per_video", 1)) == clips_per_video
+            and search_metadata.get("source_content_minutes_per_hour")
+            == source_content_minutes_per_hour
+            and int(
+                search_metadata.get("max_clips_per_video", DEFAULT_MAX_CLIPS_PER_SOURCE)
+            )
+            == max_clips_per_video
             and search_metadata.get("source", "youtube") == source
+            and search_metadata.get("candidate_duration_policy")
+            == CANDIDATE_DURATION_POLICY
         )
         if compatible:
             filtered = [
@@ -577,6 +611,19 @@ def discover_candidates(
                     video_id=video_id,
                     duration=duration,
                     clips_per_video=clips_per_video,
+                    source_content_minutes_per_hour=(source_content_minutes_per_hour),
+                    max_clips_per_video=max_clips_per_video,
+                )
+                source_budget = (
+                    source_clip_budget(
+                        duration,
+                        clip_seconds=CLIP_SECONDS,
+                        base_clips=clips_per_video,
+                        content_minutes_per_hour=source_content_minutes_per_hour,
+                        max_clips=max_clips_per_video,
+                    )
+                    if source_content_minutes_per_hour is not None
+                    else clips_per_video
                 )
                 for segment_index, start in enumerate(starts):
                     candidate_id = f"{video_id}:{round(start * 1000)}"
@@ -601,6 +648,7 @@ def discover_candidates(
                         "clip_start_seconds": round(start, 3),
                         "clip_end_seconds": round(start + CLIP_SECONDS, 3),
                         "segment_index": segment_index,
+                        "source_clip_budget": source_budget,
                         "selection": f"seeded_{profile}_{source}_search",
                         "selection_seed": seed,
                         "mixture_bias": [
@@ -629,6 +677,9 @@ def discover_candidates(
                 "source": source,
                 "profile": profile,
                 "clips_per_video": clips_per_video,
+                "source_content_minutes_per_hour": (source_content_minutes_per_hour),
+                "max_clips_per_video": max_clips_per_video,
+                "candidate_duration_policy": CANDIDATE_DURATION_POLICY,
                 "seed": seed,
                 "queries": queries,
                 "results_per_query": results_per_query,
@@ -1200,9 +1251,14 @@ def _accepted(
 
 
 def _criteria(
-    *, profile: str = "general", clips_per_video: int = 1, source: str = "youtube"
+    *,
+    profile: str = "general",
+    clips_per_video: int = 1,
+    source_content_minutes_per_hour: float | None = None,
+    max_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
+    source: str = "youtube",
 ) -> dict[str, Any]:
-    return {
+    criteria = {
         "clip_seconds": CLIP_SECONDS,
         "output": "stereo PCM16 WAV at 48 kHz",
         "minimum_source_sample_rate_hz": MIN_SOURCE_SAMPLE_RATE,
@@ -1222,6 +1278,14 @@ def _criteria(
             list(CINEMATIC_EXCLUDED_TERMS) if profile == "cinematic" else []
         ),
     }
+    if source_content_minutes_per_hour is not None:
+        criteria["source_diversity"] = source_diversity_policy(
+            clip_seconds=CLIP_SECONDS,
+            base_clips=clips_per_video,
+            content_minutes_per_hour=source_content_minutes_per_hour,
+            max_clips=max_clips_per_video,
+        )
+    return criteria
 
 
 def write_manifest(
@@ -1232,6 +1296,8 @@ def write_manifest(
     seed: int,
     profile: str = "general",
     clips_per_video: int = 1,
+    source_content_minutes_per_hour: float | None = None,
+    max_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
     source: str = "youtube",
 ) -> Path:
     records = _accepted(attempts, profile=profile)[:target]
@@ -1251,7 +1317,11 @@ def write_manifest(
         "selection": f"seeded_{profile}_{source}_search",
         "mixture_preference": ["dialogue", "music", "environmental_sfx"],
         "acceptance_criteria": _criteria(
-            profile=profile, clips_per_video=clips_per_video, source=source
+            profile=profile,
+            clips_per_video=clips_per_video,
+            source_content_minutes_per_hour=source_content_minutes_per_hour,
+            max_clips_per_video=max_clips_per_video,
+            source=source,
         ),
         "attempt_statuses": status_counts,
         "metadata_excluded_success_count": sum(
@@ -1278,6 +1348,7 @@ def verify_dataset(output_dir: Path, *, target: int) -> dict[str, Any]:
     clip_ids: set[str] = set()
     criteria = manifest.get("acceptance_criteria", {})
     clips_per_video = int(criteria.get("maximum_clips_per_video", 1))
+    diversity = criteria.get("source_diversity") or {}
     total_bytes = 0
     for record in records:
         path = output_dir / str(record["local_path"])
@@ -1296,7 +1367,18 @@ def verify_dataset(output_dir: Path, *, target: int) -> dict[str, Any]:
             reasons.append("duplicate_clip")
         clip_ids.add(clip_id)
         video_counts[video_id] = video_counts.get(video_id, 0) + 1
-        if video_counts[video_id] > clips_per_video:
+        source_budget = clips_per_video
+        if diversity.get("policy") == "duration_scaled_source_budget_v1":
+            source_budget = record_source_clip_budget(
+                record,
+                clip_seconds=float(diversity.get("clip_seconds") or CLIP_SECONDS),
+                base_clips=int(diversity["base_clips_per_source"]),
+                content_minutes_per_hour=float(
+                    diversity["content_minutes_per_source_hour"]
+                ),
+                max_clips=int(diversity["maximum_clips_per_source"]),
+            )
+        if video_counts[video_id] > source_budget:
             reasons.append("too_many_clips_from_video")
         if reasons:
             failures.append({"video_id": video_id, "reasons": reasons})
@@ -1332,6 +1414,8 @@ def acquire_dataset(
     youtube_client: str,
     profile: str = "general",
     clips_per_video: int = 1,
+    source_content_minutes_per_hour: float | None = None,
+    max_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
     source: str = "youtube",
     worker_limit_file: Path | None = None,
 ) -> Path:
@@ -1345,6 +1429,8 @@ def acquire_dataset(
         minimum_candidates=math.ceil(total * candidate_multiplier),
         profile=profile,
         clips_per_video=clips_per_video,
+        source_content_minutes_per_hour=source_content_minutes_per_hour,
+        max_clips_per_video=max_clips_per_video,
         source=source,
     )
     attempts_path = output_dir / "attempts.jsonl"
@@ -1432,6 +1518,10 @@ def acquire_dataset(
                         seed=seed,
                         profile=profile,
                         clips_per_video=clips_per_video,
+                        source_content_minutes_per_hour=(
+                            source_content_minutes_per_hour
+                        ),
+                        max_clips_per_video=max_clips_per_video,
                         source=source,
                     )
                     logger.info(
@@ -1448,6 +1538,8 @@ def acquire_dataset(
         seed=seed,
         profile=profile,
         clips_per_video=clips_per_video,
+        source_content_minutes_per_hour=source_content_minutes_per_hour,
+        max_clips_per_video=max_clips_per_video,
         source=source,
     )
     if accepted_count < total:
@@ -1486,6 +1578,13 @@ def main() -> None:
         type=int,
         help="Defaults to 3 for cinematic and 1 for general acquisition",
     )
+    parser.add_argument("--source-content-minutes-per-hour", type=float)
+    parser.add_argument(
+        "--max-clips-per-video",
+        type=int,
+        default=DEFAULT_MAX_CLIPS_PER_SOURCE,
+        help="Absolute guardrail for duration-scaled source budgets",
+    )
     parser.add_argument(
         "--youtube-client",
         choices=("auto", "default", "mweb", "android"),
@@ -1505,6 +1604,13 @@ def main() -> None:
     clips_per_video = args.clips_per_video or (3 if args.profile == "cinematic" else 1)
     if clips_per_video < 1:
         parser.error("--clips-per-video must be positive")
+    if (
+        args.source_content_minutes_per_hour is not None
+        and args.source_content_minutes_per_hour <= 0
+    ):
+        parser.error("--source-content-minutes-per-hour must be positive")
+    if args.max_clips_per_video < clips_per_video:
+        parser.error("--max-clips-per-video must be at least --clips-per-video")
     if args.verify_only:
         result = verify_dataset(args.output, target=args.total)
         print(json.dumps(result, indent=2))
@@ -1526,6 +1632,8 @@ def main() -> None:
         youtube_client=args.youtube_client,
         profile=args.profile,
         clips_per_video=clips_per_video,
+        source_content_minutes_per_hour=args.source_content_minutes_per_hour,
+        max_clips_per_video=args.max_clips_per_video,
         source=args.source,
         worker_limit_file=args.worker_limit_file,
     )

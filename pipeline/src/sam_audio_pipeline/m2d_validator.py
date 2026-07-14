@@ -22,6 +22,12 @@ from typing import Any
 
 import numpy as np
 
+from .source_diversity import (
+    DEFAULT_MAX_CLIPS_PER_SOURCE,
+    record_source_clip_budget,
+    source_diversity_policy,
+)
+
 logger = logging.getLogger(__name__)
 
 SPEECH_ROOT = "/m/09x0r"
@@ -1171,6 +1177,7 @@ def merge_materialized(args: argparse.Namespace) -> None:
     candidate_ids: set[str] = set()
     starts_by_video: dict[tuple[str, str], list[float]] = {}
     video_counts: Counter[tuple[str, str]] = Counter()
+    video_budgets: dict[tuple[str, str], int] = {}
     skip_counts: Counter[str] = Counter()
     for item in candidates:
         source_record = item["source_record"]
@@ -1195,7 +1202,24 @@ def merge_materialized(args: argparse.Namespace) -> None:
         ):
             skip_counts["overlapping_source_interval"] += 1
             continue
-        if video_counts[video_key] >= args.max_clips_per_video:
+        source_content_minutes_per_hour = getattr(
+            args, "source_content_minutes_per_hour", None
+        )
+        source_budget = args.max_clips_per_video
+        if source_content_minutes_per_hour is not None:
+            source_budget = record_source_clip_budget(
+                source_record,
+                clip_seconds=30.0,
+                base_clips=args.max_clips_per_video,
+                content_minutes_per_hour=source_content_minutes_per_hour,
+                max_clips=getattr(
+                    args,
+                    "max_duration_scaled_clips_per_video",
+                    DEFAULT_MAX_CLIPS_PER_SOURCE,
+                ),
+            )
+        video_budgets[video_key] = source_budget
+        if video_counts[video_key] >= source_budget:
             skip_counts["source_video_cap"] += 1
             continue
         item["sha256"] = digest
@@ -1262,6 +1286,13 @@ def merge_materialized(args: argparse.Namespace) -> None:
         "explicit_metadata_policy": "cinematic_source_exclusions_v1",
         "records": records,
     }
+    if getattr(args, "source_content_minutes_per_hour", None) is not None:
+        final_manifest["source_diversity"] = source_diversity_policy(
+            clip_seconds=30.0,
+            base_clips=args.max_clips_per_video,
+            content_minutes_per_hour=args.source_content_minutes_per_hour,
+            max_clips=args.max_duration_scaled_clips_per_video,
+        )
     temporary_manifest = args.output_dir / "manifest.json.tmp"
     temporary_manifest.write_text(json.dumps(final_manifest, indent=2) + "\n")
     os.replace(temporary_manifest, args.output_dir / "manifest.json")
@@ -1277,7 +1308,9 @@ def merge_materialized(args: argparse.Namespace) -> None:
             len(records) == args.accepted_limit
             and len(list(audio_dir.glob("*.wav"))) == args.accepted_limit
             and len(hashes) == args.accepted_limit
-            and max(video_counts.values()) <= args.max_clips_per_video
+            and all(
+                count <= video_budgets[video] for video, count in video_counts.items()
+            )
             and all(record["m2d_validation"]["accepted"] for record in records)
             and all(record["asr_validation"]["accepted"] for record in records)
         ),
@@ -1358,6 +1391,12 @@ def _parser() -> argparse.ArgumentParser:
     merge.add_argument("--output-dir", type=Path, required=True)
     merge.add_argument("--accepted-limit", type=int, default=1000)
     merge.add_argument("--max-clips-per-video", type=int, default=3)
+    merge.add_argument("--source-content-minutes-per-hour", type=float)
+    merge.add_argument(
+        "--max-duration-scaled-clips-per-video",
+        type=int,
+        default=DEFAULT_MAX_CLIPS_PER_SOURCE,
+    )
     merge.add_argument("--seed", type=int, default=20260715)
     merge.add_argument("--require-cinematic-mix", action="store_true")
     merge.set_defaults(handler=merge_materialized)

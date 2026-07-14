@@ -21,6 +21,13 @@ from .m2d_validator import (
     CINEMATIC_POLICY_VERSION,
     _enforce_current_voice_gate,
 )
+from .source_diversity import (
+    DEFAULT_BASE_CLIPS_PER_SOURCE,
+    DEFAULT_MAX_CLIPS_PER_SOURCE,
+    DEFAULT_SOURCE_CONTENT_MINUTES_PER_HOUR,
+    record_source_clip_budget,
+    source_diversity_policy,
+)
 from .youtube_random import _candidate_allowed, analyze_wav, quality_rejections
 
 logger = logging.getLogger(__name__)
@@ -362,7 +369,12 @@ def catalog_records(
 
 
 def write_live_manifest(
-    workspace: Path, connection: sqlite3.Connection
+    workspace: Path,
+    connection: sqlite3.Connection,
+    *,
+    base_clips_per_video: int = DEFAULT_BASE_CLIPS_PER_SOURCE,
+    source_content_minutes_per_hour: float = (DEFAULT_SOURCE_CONTENT_MINUTES_PER_HOUR),
+    max_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
 ) -> dict[str, Any]:
     accepted_count = connection.execute("SELECT COUNT(*) FROM accepted").fetchone()[0]
     unique_source_count = connection.execute(
@@ -381,7 +393,13 @@ def write_live_manifest(
         "continuous": True,
         "clip_seconds": 30.0,
         "accepted_record_count": accepted_count,
-        "maximum_clips_per_source_video": 24,
+        "maximum_clips_per_source_video": max_clips_per_video,
+        "source_diversity": source_diversity_policy(
+            clip_seconds=30.0,
+            base_clips=base_clips_per_video,
+            content_minutes_per_hour=source_content_minutes_per_hour,
+            max_clips=max_clips_per_video,
+        ),
         "unique_source_video_count": unique_source_count,
         "m2d_policy": CINEMATIC_POLICY_VERSION,
         "foreground_voice_policy": ASR_POLICY_VERSION,
@@ -396,7 +414,12 @@ def write_live_manifest(
     return manifest
 
 
-def assemble_once(workspace: Path, max_clips_per_video: int = 24) -> int:
+def assemble_once(
+    workspace: Path,
+    max_clips_per_video: int = DEFAULT_BASE_CLIPS_PER_SOURCE,
+    source_content_minutes_per_hour: float = (DEFAULT_SOURCE_CONTENT_MINUTES_PER_HOUR),
+    max_duration_scaled_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
+) -> int:
     connection = connect(workspace)
     with connection:
         m2d_paths = [workspace / "m2d-validation.jsonl"] + sorted(
@@ -435,8 +458,16 @@ def assemble_once(workspace: Path, max_clips_per_video: int = 24) -> int:
             WHERE r.platform=? AND r.video_id=? AND ABS(r.clip_start-?)<30 LIMIT 1""",
             (row["platform"], row["video_id"], row["clip_start"]),
         ).fetchone()
-        if count >= max_clips_per_video or overlap:
-            reason = "source_video_cap" if count >= max_clips_per_video else "overlap"
+        source_record = json.loads(row["record_json"])
+        source_budget = record_source_clip_budget(
+            source_record,
+            clip_seconds=30.0,
+            base_clips=max_clips_per_video,
+            content_minutes_per_hour=source_content_minutes_per_hour,
+            max_clips=max_duration_scaled_clips_per_video,
+        )
+        if count >= source_budget or overlap:
+            reason = "source_video_cap" if count >= source_budget else "overlap"
             with connection:
                 connection.execute(
                     "INSERT OR IGNORE INTO rejected VALUES(?,?,?)",
@@ -454,8 +485,22 @@ def assemble_once(workspace: Path, max_clips_per_video: int = 24) -> int:
                 (row["sha256"], _now()),
             )
         added += 1
-    if added or not (workspace / "accepted" / MANIFEST_FILENAME).exists():
-        write_live_manifest(workspace, connection)
+    current_manifest = _safe_manifest(workspace / "accepted" / MANIFEST_FILENAME)
+    current_diversity = (current_manifest or {}).get("source_diversity", {})
+    expected_diversity = source_diversity_policy(
+        clip_seconds=30.0,
+        base_clips=max_clips_per_video,
+        content_minutes_per_hour=source_content_minutes_per_hour,
+        max_clips=max_duration_scaled_clips_per_video,
+    )
+    if added or current_diversity != expected_diversity:
+        write_live_manifest(
+            workspace,
+            connection,
+            base_clips_per_video=max_clips_per_video,
+            source_content_minutes_per_hour=source_content_minutes_per_hour,
+            max_clips_per_video=max_duration_scaled_clips_per_video,
+        )
     counts = pipeline_counts(connection)
     _heartbeat(connection, "assembler", **counts)
     connection.close()
@@ -983,7 +1028,9 @@ def verify_snapshot(
     *,
     expected_count: int | None = None,
     clip_seconds: float | None = None,
-    max_clips_per_video: int = 24,
+    max_clips_per_video: int = DEFAULT_BASE_CLIPS_PER_SOURCE,
+    source_content_minutes_per_hour: float = (DEFAULT_SOURCE_CONTENT_MINUTES_PER_HOUR),
+    max_duration_scaled_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
 ) -> dict[str, Any]:
     manifest = json.loads((dataset_dir / MANIFEST_FILENAME).read_text())
     records = manifest.get("records", [])
@@ -993,6 +1040,13 @@ def verify_snapshot(
     candidates: set[str] = set()
     source_counts: Counter[tuple[str, str]] = Counter()
     duration = float(clip_seconds or manifest.get("clip_seconds") or 10.0)
+    diversity = manifest.get("source_diversity") or {}
+    if diversity.get("policy") == "duration_scaled_source_budget_v1":
+        max_clips_per_video = int(diversity["base_clips_per_source"])
+        source_content_minutes_per_hour = float(
+            diversity["content_minutes_per_source_hour"]
+        )
+        max_duration_scaled_clips_per_video = int(diversity["maximum_clips_per_source"])
     for index, record in enumerate(records):
         reasons: list[str] = []
         path = dataset_dir / str(record.get("local_path", ""))
@@ -1024,7 +1078,14 @@ def verify_snapshot(
             str(record.get("video_id") or "unknown"),
         )
         source_counts[key] += 1
-        if source_counts[key] > max_clips_per_video:
+        source_budget = record_source_clip_budget(
+            record,
+            clip_seconds=duration,
+            base_clips=max_clips_per_video,
+            content_minutes_per_hour=source_content_minutes_per_hour,
+            max_clips=max_duration_scaled_clips_per_video,
+        )
+        if source_counts[key] > source_budget:
             reasons.append("source_video_cap")
         if not _candidate_allowed(record, profile="cinematic"):
             reasons.append("metadata_policy")
@@ -1270,7 +1331,22 @@ def main() -> None:
     promote.add_argument("--poll-seconds", type=float, default=2.0)
     assemble = commands.add_parser("assemble")
     assemble.add_argument("--workspace", type=Path, required=True)
-    assemble.add_argument("--max-clips-per-video", type=int, default=24)
+    assemble.add_argument(
+        "--max-clips-per-video",
+        type=int,
+        default=DEFAULT_BASE_CLIPS_PER_SOURCE,
+        help="Baseline source allowance retained for migration compatibility",
+    )
+    assemble.add_argument(
+        "--source-content-minutes-per-hour",
+        type=float,
+        default=DEFAULT_SOURCE_CONTENT_MINUTES_PER_HOUR,
+    )
+    assemble.add_argument(
+        "--max-duration-scaled-clips-per-video",
+        type=int,
+        default=DEFAULT_MAX_CLIPS_PER_SOURCE,
+    )
     assemble.add_argument("--follow", action="store_true")
     assemble.add_argument("--poll-seconds", type=float, default=2.0)
     progress = commands.add_parser("progress")
@@ -1291,6 +1367,21 @@ def main() -> None:
     configure.add_argument("--download-min", type=int, default=1)
     configure.add_argument("--asr-concurrency-min", type=int, default=1)
     configure.add_argument("--asr-concurrency-max", type=int, default=1)
+    configure.add_argument(
+        "--base-clips-per-video",
+        type=int,
+        default=DEFAULT_BASE_CLIPS_PER_SOURCE,
+    )
+    configure.add_argument(
+        "--source-content-minutes-per-hour",
+        type=float,
+        default=DEFAULT_SOURCE_CONTENT_MINUTES_PER_HOUR,
+    )
+    configure.add_argument(
+        "--max-duration-scaled-clips-per-video",
+        type=int,
+        default=DEFAULT_MAX_CLIPS_PER_SOURCE,
+    )
     autoscale = commands.add_parser("autoscale")
     autoscale.add_argument("--workspace", type=Path, required=True)
     autoscale.add_argument("--download-min", type=int, default=2)
@@ -1340,9 +1431,23 @@ def main() -> None:
         else:
             print(action())
     elif args.command == "assemble":
+        if args.max_clips_per_video < 1:
+            parser.error("--max-clips-per-video must be positive")
+        if args.source_content_minutes_per_hour <= 0:
+            parser.error("--source-content-minutes-per-hour must be positive")
+        if args.max_duration_scaled_clips_per_video < args.max_clips_per_video:
+            parser.error(
+                "--max-duration-scaled-clips-per-video must be at least "
+                "--max-clips-per-video"
+            )
 
         def action() -> int:
-            return assemble_once(args.workspace, args.max_clips_per_video)
+            return assemble_once(
+                args.workspace,
+                args.max_clips_per_video,
+                args.source_content_minutes_per_hour,
+                args.max_duration_scaled_clips_per_video,
+            )
 
         if args.follow:
             _loop(action, args.poll_seconds, "assembler")
@@ -1359,6 +1464,18 @@ def main() -> None:
                 break
             time.sleep(max(1.0, args.interval_seconds))
     elif args.command == "configure":
+        if args.base_clips_per_video < 1:
+            parser.error("--base-clips-per-video must be positive")
+        if args.source_content_minutes_per_hour <= 0:
+            parser.error("--source-content-minutes-per-hour must be positive")
+        if (
+            args.max_duration_scaled_clips_per_video
+            < args.base_clips_per_video
+        ):
+            parser.error(
+                "--max-duration-scaled-clips-per-video must be at least "
+                "--base-clips-per-video"
+            )
         _atomic_json(
             args.workspace / "config.json",
             {
@@ -1375,6 +1492,12 @@ def main() -> None:
                     args.asr_concurrency_min,
                     args.asr_concurrency_max,
                 ],
+                "source_diversity": source_diversity_policy(
+                    clip_seconds=30.0,
+                    base_clips=args.base_clips_per_video,
+                    content_minutes_per_hour=(args.source_content_minutes_per_hour),
+                    max_clips=args.max_duration_scaled_clips_per_video,
+                ),
                 "coordinator_workers": {
                     "promoter": 1,
                     "assembler": 1,

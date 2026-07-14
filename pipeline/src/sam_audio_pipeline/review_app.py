@@ -319,7 +319,7 @@ class PipelineProgressStore:
                     "selection": (
                         "Stereo, source-quality, cinematic metadata, M2D "
                         "voice+music+SFX, English speech, deduplication, and "
-                        "maximum 24 clips per source video"
+                        "a duration-scaled per-source diversity budget"
                     ),
                 },
             }

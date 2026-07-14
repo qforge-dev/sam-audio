@@ -32,6 +32,9 @@ ASR_BACKLOG_HIGH=${SAM_CONTINUOUS_ASR_BACKLOG_HIGH:-8}
 GPU_RESERVE_MB=${SAM_CONTINUOUS_GPU_RESERVE_MB:-12000}
 AUTOSCALE_COOLDOWN_SECONDS=${SAM_CONTINUOUS_AUTOSCALE_COOLDOWN_SECONDS:-60}
 AUTOSCALE_INTERVAL_SECONDS=${SAM_CONTINUOUS_AUTOSCALE_INTERVAL_SECONDS:-10}
+BASE_CLIPS_PER_VIDEO=${SAM_CONTINUOUS_BASE_CLIPS_PER_VIDEO:-16}
+SOURCE_CONTENT_MINUTES_PER_HOUR=${SAM_CONTINUOUS_SOURCE_CONTENT_MINUTES_PER_HOUR:-10}
+MAX_DURATION_SCALED_CLIPS_PER_VIDEO=${SAM_CONTINUOUS_MAX_DURATION_SCALED_CLIPS_PER_VIDEO:-60}
 
 for value in "$DOWNLOAD_WORKERS" "$SEARCH_WORKERS" "$M2D_WORKERS" "$ASR_WORKERS" "$UPLOAD_CONCURRENCY"; do
   if (( value < 1 )); then
@@ -63,6 +66,9 @@ configure_args=(
   --download-min "$DOWNLOAD_MIN"
   --asr-concurrency-min "$ASR_CONCURRENCY_MIN"
   --asr-concurrency-max "$ASR_CONCURRENCY_MAX"
+  --base-clips-per-video "$BASE_CLIPS_PER_VIDEO"
+  --source-content-minutes-per-hour "$SOURCE_CONTENT_MINUTES_PER_HOUR"
+  --max-duration-scaled-clips-per-video "$MAX_DURATION_SCALED_CLIPS_PER_VIDEO"
 )
 if [[ "$AUTOSCALE_ENABLED" == "true" ]]; then
   configure_args+=(--autoscaling-enabled)
@@ -109,7 +115,9 @@ download_forever() {
       --clip-seconds 30 \
       --total 2000 \
       --seed "$seed" \
-      --clips-per-video 24 \
+      --clips-per-video "$BASE_CLIPS_PER_VIDEO" \
+      --source-content-minutes-per-hour "$SOURCE_CONTENT_MINUTES_PER_HOUR" \
+      --max-clips-per-video "$MAX_DURATION_SCALED_CLIPS_PER_VIDEO" \
       --query-count 500 \
       --results-per-query 100 \
       --search-workers "$SEARCH_WORKERS" \
@@ -186,7 +194,11 @@ fi
 
 heartbeat_loop assembler &
 restart_worker assembler "$PIPELINE_PYTHON" -m sam_audio_pipeline.continuous_dataset \
-  assemble --workspace "$WORKSPACE" --max-clips-per-video 24 --follow &
+  assemble --workspace "$WORKSPACE" \
+  --max-clips-per-video "$BASE_CLIPS_PER_VIDEO" \
+  --source-content-minutes-per-hour "$SOURCE_CONTENT_MINUTES_PER_HOUR" \
+  --max-duration-scaled-clips-per-video "$MAX_DURATION_SCALED_CLIPS_PER_VIDEO" \
+  --follow &
 
 heartbeat_loop snapshot_publisher &
 restart_worker snapshot_publisher "$PIPELINE_PYTHON" \
