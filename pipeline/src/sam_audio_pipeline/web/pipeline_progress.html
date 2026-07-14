@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dataset Pipeline Progress</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1016; --panel:#121a23; --panel2:#18232f; --line:#293848; --text:#eef5fb; --muted:#90a2b4; --blue:#67b7ff; --green:#56d491; --gold:#f7c75d; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 Inter,ui-sans-serif,system-ui,sans-serif; }
+    header { display:flex; align-items:center; gap:16px; padding:16px 24px; border-bottom:1px solid var(--line); background:rgba(11,16,22,.96); position:sticky; top:0; z-index:2; }
+    h1 { margin:0; font-size:18px; } h2 { margin:0 0 5px; font-size:22px; }
+    header p { margin:2px 0 0; color:var(--muted); font-size:12px; }
+    .back { margin-left:auto; color:var(--text); border:1px solid var(--line); border-radius:9px; padding:8px 11px; text-decoration:none; }
+    .shell { max-width:1180px; margin:0 auto; padding:32px 22px 70px; }
+    .hero { display:grid; grid-template-columns:minmax(0,2fr) minmax(240px,1fr); gap:16px; margin-bottom:16px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:20px; }
+    .eyebrow { color:var(--blue); text-transform:uppercase; letter-spacing:.12em; font-size:11px; font-weight:800; }
+    .big { font-size:clamp(36px,7vw,70px); line-height:1; font-weight:850; margin:10px 0 8px; font-variant-numeric:tabular-nums; }
+    .muted { color:var(--muted); }
+    .bar { height:11px; overflow:hidden; border-radius:99px; background:#253240; margin-top:18px; }
+    .bar > div { height:100%; width:0; background:linear-gradient(90deg,var(--blue),var(--green)); transition:width .35s; }
+    .stage { display:inline-flex; padding:6px 10px; border:1px solid rgba(103,183,255,.4); border-radius:99px; color:var(--blue); background:rgba(103,183,255,.08); font-weight:750; margin-top:12px; }
+    .funnel { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:16px 0; }
+    .metric { min-height:130px; }
+    .metric strong { display:block; font-size:30px; margin:12px 0 3px; font-variant-numeric:tabular-nums; }
+    .metric small { color:var(--muted); }
+    .section-head { display:flex; justify-content:space-between; align-items:end; gap:15px; margin:30px 0 10px; }
+    .section-head p { margin:0; color:var(--muted); }
+    .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:14px; }
+    table { width:100%; border-collapse:collapse; background:var(--panel); min-width:900px; }
+    th,td { padding:12px 13px; border-bottom:1px solid var(--line); text-align:right; font-variant-numeric:tabular-nums; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+    th:first-child,td:first-child { text-align:left; } tr:last-child td { border-bottom:0; }
+    .status { display:inline-block; padding:4px 8px; border-radius:99px; background:var(--panel2); color:var(--muted); font-size:11px; font-weight:750; }
+    .status.downloading,.status.m2d_scoring,.status.speech_validation { color:var(--gold); }
+    .status.validated,.status.complete { color:var(--green); }
+    .pipeline { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; }
+    .pipeline span { padding:6px 9px; border-radius:8px; background:var(--panel2); border:1px solid var(--line); color:#bdcad5; }
+    .error { color:#ff8b8b; white-space:pre-wrap; }
+    @media(max-width:850px){ .hero{grid-template-columns:1fr}.funnel{grid-template-columns:repeat(2,1fr)} }
+    @media(max-width:520px){ .funnel{grid-template-columns:1fr}.shell{padding:22px 14px 50px}header{padding:14px} }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>Dataset Pipeline Progress</h1><p id="updated">Connecting to the live worker…</p></div>
+    <a class="back" id="reviewLink" href="/">Review clips</a>
+  </header>
+  <main class="shell">
+    <section class="hero">
+      <div class="card">
+        <div class="eyebrow">Final verified dataset</div>
+        <div class="big"><span id="finalCount">0</span> <span class="muted">/ <span id="target">1000</span></span></div>
+        <div class="muted" id="finalText">Waiting for enough clips to survive every gate.</div>
+        <div class="bar"><div id="finalBar"></div></div>
+      </div>
+      <div class="card">
+        <div class="eyebrow">Current worker stage</div>
+        <div class="stage" id="stage">Waiting</div>
+        <p class="muted" id="stageHelp"></p>
+      </div>
+    </section>
+    <section class="funnel" id="funnel"></section>
+    <div class="section-head"><div><h2>Acquisition batches</h2><p>Counts update every five seconds.</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Batch</th><th>Status</th><th>Attempts</th><th>Downloaded</th><th>M2D scored</th><th>M2D pass</th><th>Speech scored</th><th>Speech pass</th><th>Combined</th></tr></thead><tbody id="batches"></tbody></table></div>
+    <div class="section-head"><div><h2>What “prepared” means</h2><p>The final count only moves after every required gate and final audit.</p></div></div>
+    <div class="card">
+      <div class="pipeline"><span>Stereo source</span><span>Audio quality</span><span>Movie-like source metadata</span><span>M2D voice + music + SFX</span><span>English foreground speech</span><span>Explicit source exclusions</span><span>Deduplication</span><span>≤24 clips/source</span><span>Final file/hash audit</span></div>
+      <p class="muted" id="combinedNote"></p>
+    </div>
+    <p id="error" class="error"></p>
+  </main>
+  <script>
+    const marker = '/progress';
+    const markerIndex = location.pathname.indexOf(marker);
+    const BASE = markerIndex >= 0 ? location.pathname.slice(0, markerIndex) : '';
+    const $ = id => document.getElementById(id);
+    const number = value => new Intl.NumberFormat().format(value || 0);
+    const label = value => String(value || 'waiting').replaceAll('_',' ');
+    $('reviewLink').href = `${BASE}/`;
+    const metricDefinitions = [
+      ['review_snapshot','Review snapshot','Already materialized and listenable'],
+      ['attempts','Download attempts','Sources/positions tried'],
+      ['downloaded','Downloaded','Stereo and source-quality pass'],
+      ['m2d_scored','M2D scored','AudioSet model evaluated'],
+      ['m2d_accepted','M2D pass','Voice + music + SFX detected'],
+      ['asr_scored','Speech scored','Foreground voice decoded'],
+      ['asr_accepted','Speech pass','Confident English dialogue'],
+      ['combined_eligible','Combined eligible','Before final dedupe/source cap'],
+    ];
+    const stageHelp = {
+      waiting:'Waiting for the next acquisition batch.', downloading:'Downloading and applying stereo/source-quality checks.',
+      m2d_scoring:'Running the M2D acoustic-content validator.', speech_validation:'Running foreground speech and language validation.',
+      validated:'This batch is validated; assembling or expanding the final pool.', complete:'The exact final dataset passed its audit.'
+    };
+    async function refresh(){
+      try {
+        const response = await fetch(`${BASE}/api/progress`, {cache:'no-store'});
+        if (!response.ok) throw new Error(`Progress API returned ${response.status}`);
+        const data = await response.json();
+        $('target').textContent = number(data.target); $('finalCount').textContent = number(data.final.materialized);
+        $('finalBar').style.width = `${Math.min(100, data.final.materialized / data.target * 100)}%`;
+        $('finalText').textContent = data.final.verified ? `Verified at ${data.final.path}` : 'Waiting for enough clips to survive every gate.';
+        $('stage').className = `stage ${data.stage}`; $('stage').textContent = label(data.stage); $('stageHelp').textContent = stageHelp[data.stage] || '';
+        $('updated').textContent = `Live · updated ${new Date(data.updated_at).toLocaleTimeString()}`;
+        const metrics = {...data.totals, review_snapshot:data.review_snapshot.materialized};
+        $('funnel').innerHTML = metricDefinitions.map(([key,title,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${number(metrics[key])}</strong><small>${help}</small></div>`).join('');
+        $('batches').innerHTML = data.batches.map(batch => `<tr><td><strong>${batch.name}</strong></td><td><span class="status ${batch.status}">${label(batch.status)}</span></td><td>${number(batch.attempts)}</td><td>${number(batch.downloaded)}${batch.raw_target ? ` / ${number(batch.raw_target)}` : ''}</td><td>${number(batch.m2d_scored)}</td><td>${number(batch.m2d_accepted)}</td><td>${number(batch.asr_scored)}</td><td>${number(batch.asr_accepted)}</td><td>${number(batch.combined_eligible)}</td></tr>`).join('');
+        $('combinedNote').textContent = data.notes.combined_eligible; $('error').textContent = '';
+      } catch(error) { $('error').textContent = error.message; }
+    }
+    refresh(); setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

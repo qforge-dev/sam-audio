@@ -7,7 +7,11 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from sam_audio_pipeline.review_app import ReviewStore, create_review_app
+from sam_audio_pipeline.review_app import (
+    PipelineProgressStore,
+    ReviewStore,
+    create_review_app,
+)
 
 ALICE = {"reviewer_id": "reviewer-alice", "reviewer_name": "Alice"}
 BOB = {"reviewer_id": "reviewer-bob", "reviewer_name": "Bob"}
@@ -109,6 +113,87 @@ def test_review_app_persists_decisions_and_serves_audio(tmp_path: Path):
         "too_low_quality",
     ]
     assert "two.wav,perfect" in client.get("/api/export.csv").text
+
+
+def test_progress_dashboard_reports_live_pipeline_funnel(tmp_path: Path):
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    dataset = _dataset(review_dir)
+    batch = tmp_path / "cinematic-dm-raw-20260715"
+    batch.mkdir()
+    (batch / "attempts.jsonl").write_text("{}\n{}\n{}\n")
+    (batch / "manifest.json").write_text(
+        json.dumps(
+            {
+                "target_records": 10,
+                "accepted_records": 3,
+                "records": [
+                    {"local_path": f"audio/{name}"}
+                    for name in ("one.wav", "two.wav", "bad.wav")
+                ],
+            }
+        )
+    )
+    (batch / "m2d-validation.jsonl").write_text(
+        "".join(
+            json.dumps({"filename": name, "accepted": accepted}) + "\n"
+            for name, accepted in (
+                ("one.wav", True),
+                ("two.wav", True),
+                ("bad.wav", False),
+            )
+        )
+    )
+    (batch / "asr-validation.jsonl").write_text(
+        json.dumps({"filename": "one.wav", "accepted": True}) + "\n"
+    )
+    final_dir = tmp_path / "final"
+    final_dir.mkdir()
+    (final_dir / "audit.json").write_text(
+        json.dumps({"record_count": 1, "all_requirements_pass": False})
+    )
+    progress = PipelineProgressStore([batch], final_dir=final_dir, target=1000)
+    client = TestClient(
+        create_review_app(
+            ReviewStore(dataset, audio_directory="balanced-audio"), progress
+        )
+    )
+
+    assert client.get("/progress").status_code == 200
+    assert "Dataset Pipeline Progress" in client.get("/progress").text
+    payload = client.get("/api/progress").json()
+    assert payload["stage"] == "downloading"
+    assert payload["totals"] == {
+        "attempts": 3,
+        "downloaded": 3,
+        "m2d_scored": 3,
+        "m2d_accepted": 2,
+        "asr_scored": 1,
+        "asr_accepted": 1,
+        "combined_eligible": 1,
+    }
+    assert payload["final"]["materialized"] == 1
+    assert payload["review_snapshot"]["materialized"] == 2
+
+    with (batch / "attempts.jsonl").open("a") as destination:
+        destination.write("{}\n")
+    assert client.get("/api/progress").json()["totals"]["attempts"] == 4
+
+    empty_future_batch = tmp_path / "cinematic-dm-raw-20260716"
+    empty_future_batch.mkdir()
+    future_progress = PipelineProgressStore([batch, empty_future_batch])
+    assert future_progress.snapshot()["batches"][1]["status"] == "waiting"
+    assert future_progress.snapshot()["stage"] == "downloading"
+
+
+def test_progress_dashboard_is_optional(tmp_path: Path):
+    client = TestClient(
+        create_review_app(
+            ReviewStore(_dataset(tmp_path), audio_directory="balanced-audio")
+        )
+    )
+    assert client.get("/progress").status_code == 404
+    assert client.get("/api/progress").status_code == 404
 
 
 def test_not_ok_requires_reason_and_other_requires_note(tmp_path: Path):

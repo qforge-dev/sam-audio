@@ -65,6 +65,237 @@ class ClaimConflict(RuntimeError):
     """Raised when another reviewer owns a live clip lease."""
 
 
+class _AppendOnlyLineCounter:
+    """Count lines without rereading a growing acquisition log on every poll."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.identity: tuple[int, int] | None = None
+        self.offset = 0
+        self.count = 0
+
+    def refresh(self) -> int:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return 0
+        identity = (stat.st_dev, stat.st_ino)
+        if self.identity != identity or stat.st_size < self.offset:
+            self.identity = identity
+            self.offset = 0
+            self.count = 0
+        with self.path.open("rb") as source:
+            source.seek(self.offset)
+            while chunk := source.read(1024 * 1024):
+                self.count += chunk.count(b"\n")
+            self.offset = source.tell()
+        return self.count
+
+
+class _AppendOnlyJsonlSummary:
+    """Maintain latest per-filename acceptance state for an appended JSONL file."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.identity: tuple[int, int] | None = None
+        self.offset = 0
+        self.records: dict[str, bool] = {}
+
+    def refresh(self) -> tuple[int, set[str], set[str]]:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return 0, set(), set()
+        identity = (stat.st_dev, stat.st_ino)
+        if self.identity != identity or stat.st_size < self.offset:
+            self.identity = identity
+            self.offset = 0
+            self.records = {}
+        with self.path.open("rb") as source:
+            source.seek(self.offset)
+            while True:
+                line_start = source.tell()
+                line = source.readline()
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    source.seek(line_start)
+                    break
+                try:
+                    item = json.loads(line)
+                    filename = str(item["filename"])
+                except (json.JSONDecodeError, KeyError, TypeError, UnicodeError):
+                    continue
+                self.records[filename] = bool(item.get("accepted"))
+            self.offset = source.tell()
+        accepted = {name for name, passed in self.records.items() if passed}
+        return len(self.records), accepted, set(self.records)
+
+
+class _ManifestSummary:
+    """Cache the current-policy filenames from an atomically rewritten manifest."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.signature: tuple[int, int, int] | None = None
+        self.target = 0
+        self.filenames: set[str] = set()
+
+    def refresh(self) -> tuple[int, int, set[str]]:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return 0, 0, set()
+        signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        if self.signature != signature:
+            try:
+                manifest = json.loads(self.path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                return self.target, len(self.filenames), set(self.filenames)
+            self.target = int(manifest.get("target_records") or 0)
+            self.filenames = {
+                Path(str(record["local_path"])).name
+                for record in manifest.get("records", [])
+                if record.get("local_path")
+            }
+            self.signature = signature
+        return self.target, len(self.filenames), set(self.filenames)
+
+
+class PipelineProgressStore:
+    """Read live acquisition/validation counters without touching worker state."""
+
+    def __init__(
+        self,
+        batch_dirs: list[Path],
+        *,
+        final_dir: Path | None = None,
+        target: int = 1000,
+    ):
+        self.batch_dirs = [path.resolve() for path in batch_dirs]
+        self.final_dir = final_dir.resolve() if final_dir else None
+        self.target = target
+        self.lock = threading.Lock()
+        self.attempt_trackers = {
+            path: _AppendOnlyLineCounter(path / "attempts.jsonl")
+            for path in self.batch_dirs
+        }
+        self.manifest_trackers = {
+            path: _ManifestSummary(path / "manifest.json") for path in self.batch_dirs
+        }
+        self.m2d_trackers = {
+            path: _AppendOnlyJsonlSummary(path / "m2d-validation.jsonl")
+            for path in self.batch_dirs
+        }
+        self.asr_trackers = {
+            path: _AppendOnlyJsonlSummary(path / "asr-validation.jsonl")
+            for path in self.batch_dirs
+        }
+
+    def _final_counts(self) -> tuple[int, bool, str | None]:
+        if not self.final_dir:
+            return 0, False, None
+        audit_path = self.final_dir / "audit.json"
+        try:
+            audit = json.loads(audit_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return 0, False, str(self.final_dir)
+        count = int(audit.get("record_count") or 0)
+        return count, bool(audit.get("all_requirements_pass")), str(self.final_dir)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            batches: list[dict[str, Any]] = []
+            for index, path in enumerate(self.batch_dirs, start=1):
+                raw_target, downloaded, current_filenames = self.manifest_trackers[
+                    path
+                ].refresh()
+                attempts = self.attempt_trackers[path].refresh()
+                _, m2d_accepted, m2d_filenames = self.m2d_trackers[path].refresh()
+                m2d_scored = len(m2d_filenames & current_filenames)
+                m2d_accepted &= current_filenames
+                _, asr_accepted, asr_filenames = self.asr_trackers[path].refresh()
+                asr_scored = len(asr_filenames & m2d_accepted)
+                asr_accepted &= m2d_accepted
+                combined = len(m2d_accepted & asr_accepted)
+                exists = path.exists()
+                if not any((attempts, raw_target, downloaded, m2d_scored, asr_scored)):
+                    status = "waiting"
+                elif raw_target and downloaded < raw_target:
+                    status = "downloading"
+                elif m2d_scored < downloaded:
+                    status = "m2d_scoring"
+                elif asr_scored < len(m2d_accepted):
+                    status = "speech_validation"
+                else:
+                    status = "validated"
+                batches.append(
+                    {
+                        "batch": index,
+                        "name": path.name,
+                        "path": str(path),
+                        "exists": exists,
+                        "status": status,
+                        "attempts": attempts,
+                        "raw_target": raw_target,
+                        "downloaded": downloaded,
+                        "m2d_scored": m2d_scored,
+                        "m2d_accepted": len(m2d_accepted),
+                        "asr_scored": asr_scored,
+                        "asr_accepted": len(asr_accepted),
+                        "combined_eligible": combined,
+                    }
+                )
+            final_count, final_verified, final_path = self._final_counts()
+            totals = {
+                key: sum(int(batch[key]) for batch in batches)
+                for key in (
+                    "attempts",
+                    "downloaded",
+                    "m2d_scored",
+                    "m2d_accepted",
+                    "asr_scored",
+                    "asr_accepted",
+                    "combined_eligible",
+                )
+            }
+            active = next(
+                (batch for batch in batches if batch["status"] != "waiting"),
+                None,
+            )
+            non_waiting = [batch for batch in batches if batch["status"] != "waiting"]
+            if non_waiting:
+                active = non_waiting[-1]
+            stage = (
+                "complete"
+                if final_verified and final_count == self.target
+                else (active["status"] if active else "waiting")
+            )
+            return {
+                "updated_at": _now(),
+                "target": self.target,
+                "stage": stage,
+                "final": {
+                    "materialized": final_count,
+                    "verified": final_verified,
+                    "path": final_path,
+                },
+                "totals": totals,
+                "batches": batches,
+                "notes": {
+                    "combined_eligible": (
+                        "M2D and speech-validation intersection before final "
+                        "deduplication and the per-source cap"
+                    ),
+                    "selection": (
+                        "Stereo, source-quality, cinematic metadata, M2D "
+                        "voice+music+SFX, English speech, deduplication, and "
+                        "maximum 24 clips per source video"
+                    ),
+                },
+            }
+
+
 class ReviewStore:
     def __init__(
         self,
@@ -417,9 +648,12 @@ class ReviewStore:
         return destination.getvalue()
 
 
-def create_review_app(store: ReviewStore) -> FastAPI:
+def create_review_app(
+    store: ReviewStore, progress_store: PipelineProgressStore | None = None
+) -> FastAPI:
     app = FastAPI(title="SAM Audio Manual Review", version="2.0.0")
     html_path = Path(__file__).parent / "web" / "manual_review.html"
+    progress_html_path = Path(__file__).parent / "web" / "pipeline_progress.html"
 
     def page() -> HTMLResponse:
         return HTMLResponse(html_path.read_text())
@@ -436,9 +670,26 @@ def create_review_app(store: ReviewStore) -> FastAPI:
             raise HTTPException(status_code=404, detail="Clip not found") from error
         return page()
 
+    @app.get("/progress")
+    def progress_page() -> HTMLResponse:
+        if not progress_store:
+            raise HTTPException(status_code=404, detail="Progress dashboard disabled")
+        return HTMLResponse(progress_html_path.read_text())
+
     @app.get("/api/state")
     def state() -> dict[str, Any]:
         return store.state()
+
+    @app.get("/api/progress")
+    def progress() -> dict[str, Any]:
+        if not progress_store:
+            raise HTTPException(status_code=404, detail="Progress dashboard disabled")
+        payload = progress_store.snapshot()
+        payload["review_snapshot"] = {
+            "materialized": len(store.filenames),
+            "path": str(store.dataset_dir),
+        }
+        return payload
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:
@@ -534,6 +785,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18081)
     parser.add_argument("--claim-seconds", type=int, default=600)
+    parser.add_argument("--progress-batch-dir", type=Path, action="append", default=[])
+    parser.add_argument("--progress-final-dir", type=Path)
+    parser.add_argument("--progress-target", type=int, default=1000)
     return parser
 
 
@@ -545,7 +799,16 @@ def main() -> None:
         annotations_path=args.annotations,
         claim_seconds=args.claim_seconds,
     )
-    uvicorn.run(create_review_app(store), host=args.host, port=args.port)
+    progress_store = None
+    if args.progress_batch_dir:
+        progress_store = PipelineProgressStore(
+            args.progress_batch_dir,
+            final_dir=args.progress_final_dir,
+            target=args.progress_target,
+        )
+    uvicorn.run(
+        create_review_app(store, progress_store), host=args.host, port=args.port
+    )
 
 
 if __name__ == "__main__":

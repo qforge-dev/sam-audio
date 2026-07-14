@@ -121,6 +121,7 @@
         <div class="progress"><div id="progressBar"></div></div>
       </div>
       <div class="header-actions">
+        <a class="quiet-btn" id="progressLink" href="/progress">Pipeline progress</a>
         <span class="reviewer-pill" id="activeReviewers"></span>
         <button class="reviewer-pill" id="reviewerButton">Reviewer: <strong id="reviewerName"></strong></button>
         <a class="quiet-btn" id="exportLink" href="/api/export.csv">Export CSV</a>
@@ -248,6 +249,7 @@
       if (!app.identity) await requestIdentity();
       $('reviewerName').textContent = app.identity.name;
       $('exportLink').href = api('/api/export.csv');
+      $('progressLink').href = api('/progress');
       await refreshState();
       $('datasetName').textContent = `${app.state.dataset.name} · ${app.state.summary.total} clips`;
       Object.entries(app.state.reason_labels).forEach(([key, label], index) => {
