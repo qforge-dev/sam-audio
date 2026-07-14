@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import logging
@@ -10,6 +11,7 @@ import math
 import os
 import random
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -47,9 +49,10 @@ OUTPUT_SAMPLE_RATE = 48_000
 MIN_SOURCE_SAMPLE_RATE = 44_100
 MIN_SOURCE_BITRATE_KBPS = 120.0
 MIN_SOURCE_DURATION_SECONDS = 30.0
+MIN_DISCOVERY_SOURCE_DURATION_SECONDS = 2 * 60.0
 MAX_SOURCE_DURATION_SECONDS = 12 * 3600.0
-CANDIDATE_DURATION_POLICY = "source_duration_up_to_12h_v1"
-DAILYMOTION_SEARCH_POLICY = "seeded_relevance_pages_1_to_6_v1"
+CANDIDATE_DURATION_POLICY = "source_duration_2m_to_12h_v3"
+DAILYMOTION_SEARCH_POLICY = "seeded_relevance_pages_1_to_10_hd_v3"
 YTDLP_PYTHON = sys.executable
 SILENCE_THRESHOLD_DBFS = -55.0
 MIN_RMS_DBFS = -35.0
@@ -59,6 +62,8 @@ MAX_SILENT_RUN_SECONDS = 0.75
 MIN_SIDE_TO_TOTAL_DB = -45.0
 MAX_CLIPPED_FRACTION = 0.01
 MAX_SCAN_REGIONS_PER_ACQUISITION = 8
+SOURCE_ASR_PROBE_POLICY = "source_proxy_asr_top3_beam1_v1"
+MAX_SOURCE_ASR_PROBES = 3
 HIGH_QUALITY_AUDIO_SELECTOR = (
     "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
     "bestaudio[acodec!=none]/best[acodec!=none]"
@@ -372,6 +377,20 @@ def _run(command: list[str], *, timeout: float) -> subprocess.CompletedProcess[s
     )
 
 
+def _permanent_media_error(error: subprocess.CalledProcessError) -> bool:
+    message = f"{error.stdout or ''}\n{error.stderr or ''}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "not found",
+            "video has been deleted",
+            "private video",
+            "no longer available",
+            "this video is unavailable",
+        )
+    )
+
+
 def build_queries(seed: int, count: int, *, profile: str = "general") -> list[str]:
     """Create reproducible YouTube queries for a general or cinematic mix."""
     generator = random.Random(seed)
@@ -440,6 +459,15 @@ def _candidate_allowed(item: dict[str, Any], *, profile: str = "general") -> boo
     )
 
 
+def _discovery_candidate_allowed(
+    item: dict[str, Any], *, profile: str, source: str
+) -> bool:
+    duration = float(item.get("duration") or item.get("duration_seconds") or 0.0)
+    return _candidate_allowed(item, profile=profile) and (
+        source != "dailymotion" or duration >= MIN_DISCOVERY_SOURCE_DURATION_SECONDS
+    )
+
+
 def _cinematic_candidate_priority(item: dict[str, Any]) -> int:
     """Rank explicit cinematic source markers without inspecting the speaker."""
     title = f" {str(item.get('title') or '').lower()} "
@@ -465,20 +493,28 @@ def _search_youtube(query: str, results: int, profile: str) -> list[dict[str, An
     return [
         item
         for item in payload.get("entries", [])
-        if _candidate_allowed(item, profile=profile)
+        if _discovery_candidate_allowed(item, profile=profile, source="youtube")
     ]
 
 
-def _dailymotion_search_page(seed: int, query: str, *, pages: int = 6) -> int:
+def _dailymotion_search_page(seed: int, query: str, *, pages: int = 10) -> int:
     """Spread repeated query combinations across Dailymotion result pages."""
     return random.Random(f"{seed}:{query}:dailymotion-page").randrange(1, pages + 1)
+
+
+def _dailymotion_has_high_quality_format(item: dict[str, Any]) -> bool:
+    return any(
+        str(value).lower().startswith(("hd", "uhd", "4k"))
+        for value in (item.get("available_formats") or [])
+    )
 
 
 def _search_dailymotion(
     query: str, results: int, profile: str, *, page: int = 1
 ) -> list[dict[str, Any]]:
     fields = (
-        "id,title,description,duration,owner.screenname,url,language,tags,created_time"
+        "id,title,description,duration,owner.screenname,url,language,tags,"
+        "created_time,available_formats"
     )
     parameters = urllib.parse.urlencode(
         {
@@ -505,7 +541,9 @@ def _search_dailymotion(
         }
         if str(item.get("language") or "").lower() not in {"", "en"}:
             continue
-        if _candidate_allowed(item, profile=profile):
+        if not _dailymotion_has_high_quality_format(item):
+            continue
+        if _discovery_candidate_allowed(item, profile=profile, source="dailymotion"):
             items.append(item)
     return items
 
@@ -602,7 +640,9 @@ def discover_candidates(
         )
         if compatible:
             filtered = [
-                item for item in existing if _candidate_allowed(item, profile=profile)
+                item
+                for item in existing
+                if _discovery_candidate_allowed(item, profile=profile, source=source)
             ]
             if len(filtered) >= minimum_candidates:
                 if len(filtered) != len(existing):
@@ -1259,8 +1299,11 @@ def load_catalog_source_guidance(
     rows = connection.execute(
         """SELECT r.video_id,r.clip_start,r.record_json,
         COALESCE(m.accepted,0) AS m2d_accepted,
+        CASE WHEN s.filename IS NULL THEN 0 ELSE 1 END AS asr_scored,
+        COALESCE(s.accepted,0) AS asr_accepted,
         CASE WHEN a.sha256 IS NULL THEN 0 ELSE 1 END AS final_accepted
         FROM records r LEFT JOIN m2d_scores m USING(filename)
+        LEFT JOIN asr_scores s USING(filename)
         LEFT JOIN accepted a USING(sha256) WHERE r.platform=?""",
         (platform,),
     )
@@ -1272,6 +1315,8 @@ def load_catalog_source_guidance(
                 "record": json.loads(row["record_json"]),
                 "scored": 0,
                 "m2d_accepted": 0,
+                "asr_scored": 0,
+                "asr_accepted": 0,
                 "accepted": 0,
                 "attempted_starts": [],
                 "accepted_starts": [],
@@ -1279,6 +1324,8 @@ def load_catalog_source_guidance(
         )
         item["scored"] += 1
         item["m2d_accepted"] += int(row["m2d_accepted"])
+        item["asr_scored"] += int(row["asr_scored"])
+        item["asr_accepted"] += int(row["asr_accepted"])
         item["accepted"] += int(row["final_accepted"])
         item["attempted_starts"].append(float(row["clip_start"]))
         if row["final_accepted"]:
@@ -1327,8 +1374,7 @@ def _load_catalog_content_priors(
     prior_strength = 10.0
     result = {
         family: {
-            key: (accepted + prior_strength * global_rate)
-            / (count + prior_strength)
+            key: (accepted + prior_strength * global_rate) / (count + prior_strength)
             for key, (count, accepted) in values.items()
         }
         for family, values in aggregates.items()
@@ -1402,9 +1448,14 @@ def _inject_cached_scan_sources(
         except (json.JSONDecodeError, OSError):
             continue
         video_id = str(scan.get("video_id") or "")
-        if not video_id or video_id in known or not any(
-            region_passes_confidence_gate(region)
-            for region in (scan.get("regions") or [])
+        if (
+            not video_id
+            or video_id in known
+            or _proxy_asr_blocks_extraction(scan)
+            or not any(
+                region_passes_confidence_gate(region)
+                for region in (scan.get("regions") or [])
+            )
         ):
             continue
         metadata = scan.get("source_metadata") or {}
@@ -1572,6 +1623,166 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _current_proxy_asr(scan: dict[str, Any]) -> dict[str, Any] | None:
+    probe = scan.get("proxy_asr") or {}
+    if probe.get("policy") != SOURCE_ASR_PROBE_POLICY:
+        return None
+    return probe
+
+
+def _proxy_asr_blocks_extraction(scan: dict[str, Any]) -> bool:
+    probe = _current_proxy_asr(scan)
+    return bool(probe and probe.get("enforced") and probe.get("accepted") is False)
+
+
+def _proxy_asr_from_guidance(stats: dict[str, Any]) -> dict[str, Any] | None:
+    """Reuse downstream evidence when a source already has final ASR outcomes."""
+    asr_scored = int(stats.get("asr_scored", 0))
+    asr_accepted = int(stats.get("asr_accepted", 0))
+    if asr_accepted > 0:
+        return {
+            "policy": SOURCE_ASR_PROBE_POLICY,
+            "status": "derived_from_catalog",
+            "accepted": True,
+            "catalog_asr_scored": asr_scored,
+            "catalog_asr_accepted": asr_accepted,
+            "checked_regions": [],
+        }
+    if asr_scored >= 2:
+        return {
+            "policy": SOURCE_ASR_PROBE_POLICY,
+            "status": "derived_from_catalog",
+            "accepted": False,
+            "catalog_asr_scored": asr_scored,
+            "catalog_asr_accepted": 0,
+            "checked_regions": [],
+        }
+    return None
+
+
+def _request_proxy_asr(
+    audio_path: Path,
+    *,
+    video_id: str,
+    start_seconds: float,
+    request_dir: Path,
+    result_dir: Path,
+    deadline: float,
+) -> dict[str, Any]:
+    request_id = secrets.token_hex(16)
+    request_path = request_dir / f"{request_id}.json"
+    result_path = result_dir / f"{request_id}.json"
+    _atomic_json(
+        request_path,
+        {
+            "schema_version": 1,
+            "request_id": request_id,
+            "policy": SOURCE_ASR_PROBE_POLICY,
+            "audio_path": str(audio_path),
+            "video_id": video_id,
+            "start_seconds": start_seconds,
+            "requested_at": _now(),
+        },
+    )
+    try:
+        while time.monotonic() < deadline:
+            try:
+                result = json.loads(result_path.read_text())
+                result_path.unlink(missing_ok=True)
+                return result
+            except FileNotFoundError:
+                time.sleep(0.1)
+            except json.JSONDecodeError:
+                time.sleep(0.05)
+        raise TimeoutError(f"Proxy ASR request {request_id} timed out")
+    finally:
+        request_path.unlink(missing_ok=True)
+
+
+def _probe_source_proxy_asr(
+    proxy: Path,
+    regions: list[dict[str, Any]],
+    root: Path,
+    *,
+    video_id: str,
+    request_dir: Path,
+    result_dir: Path,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Probe top M2D regions until confident English dialogue is confirmed."""
+    started = time.perf_counter()
+    request_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_seconds
+    checked: list[dict[str, Any]] = []
+    for index, region in enumerate(regions[:MAX_SOURCE_ASR_PROBES]):
+        region_started = time.perf_counter()
+        start = float(region["start_seconds"])
+        probe_audio = root / f"asr-probe-{index}.wav"
+        _run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-ss",
+                f"{start:.3f}",
+                "-t",
+                f"{CLIP_SECONDS:.3f}",
+                "-i",
+                str(proxy),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(probe_audio),
+            ],
+            timeout=30,
+        )
+        result = _request_proxy_asr(
+            probe_audio,
+            video_id=video_id,
+            start_seconds=start,
+            request_dir=request_dir,
+            result_dir=result_dir,
+            deadline=deadline,
+        )
+        checked.append(
+            {
+                "start_seconds": start,
+                "accepted": bool(result.get("accepted")),
+                "detected_language": result.get("detected_language"),
+                "language_probability": result.get("language_probability"),
+                "duration_after_vad_seconds": result.get("duration_after_vad_seconds"),
+                "word_count": result.get("word_count"),
+                "rejection_reasons": result.get("rejection_reasons", []),
+                "error": result.get("error"),
+                "processing_seconds": round(time.perf_counter() - region_started, 3),
+            }
+        )
+        if result.get("accepted"):
+            return {
+                "policy": SOURCE_ASR_PROBE_POLICY,
+                "status": "completed",
+                "accepted": True,
+                "checked_regions": checked,
+                "processing_seconds": round(time.perf_counter() - started, 3),
+                "completed_at": _now(),
+            }
+    return {
+        "policy": SOURCE_ASR_PROBE_POLICY,
+        "status": "completed",
+        "accepted": False,
+        "checked_regions": checked,
+        "processing_seconds": round(time.perf_counter() - started, 3),
+        "completed_at": _now(),
+    }
+
+
 def _scan_cache_path(cache_dir: Path, candidate: dict[str, Any]) -> Path:
     platform = re.sub(r"[^a-z0-9_-]+", "-", str(candidate.get("source_platform")))
     video_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(candidate["video_id"]))
@@ -1599,9 +1810,13 @@ def _load_source_scan_priors(
         except (json.JSONDecodeError, OSError):
             continue
         video_id = str(scan.get("video_id") or "")
-        passing_regions = sum(
-            region_passes_confidence_gate(region)
-            for region in (scan.get("regions") or [])
+        passing_regions = (
+            0
+            if _proxy_asr_blocks_extraction(scan)
+            else sum(
+                region_passes_confidence_gate(region)
+                for region in (scan.get("regions") or [])
+            )
         )
         if video_id:
             video_regions[video_id] = float(passing_regions)
@@ -1672,24 +1887,42 @@ def _download_full_source_for_scan(
 
 def _preflight_source_for_scan(candidate: dict[str, Any]) -> dict[str, Any]:
     """Require a high-quality extraction variant before downloading a proxy."""
-    response = _run(
-        [
-            YTDLP_PYTHON,
-            "-m",
-            "yt_dlp",
-            "--no-update",
-            "--quiet",
-            "--no-warnings",
-            "--no-playlist",
-            "--skip-download",
-            "-f",
-            DAILYMOTION_SOURCE_SCAN_SELECTOR,
-            "--print-json",
-            str(candidate["source_url"]),
-        ],
-        timeout=90,
-    )
-    return _download_json(response.stdout)
+    base_command = [
+        YTDLP_PYTHON,
+        "-m",
+        "yt_dlp",
+        "--no-update",
+        "--quiet",
+        "--no-warnings",
+        "--no-playlist",
+        "--skip-download",
+        "-f",
+    ]
+    try:
+        response = _run(
+            [
+                *base_command,
+                DAILYMOTION_SOURCE_SCAN_SELECTOR,
+                "--print-json",
+                str(candidate["source_url"]),
+            ],
+            timeout=90,
+        )
+        return {**_download_json(response.stdout), "quality_format_available": True}
+    except subprocess.CalledProcessError:
+        # Distinguish a live source that only exposes the low-bitrate 380p
+        # variant from a transient extraction/network failure. The former can
+        # be cached permanently and skipped before proxy transfer on every run.
+        response = _run(
+            [
+                *base_command,
+                DAILYMOTION_SCAN_PROXY_SELECTOR,
+                "--print-json",
+                str(candidate["source_url"]),
+            ],
+            timeout=90,
+        )
+        return {**_download_json(response.stdout), "quality_format_available": False}
 
 
 def _download_scanned_sections(
@@ -1801,9 +2034,9 @@ def _scan_group_has_remaining_work(
     )
     if cached is None:
         return accepted_count < source_budget
-    claimed_starts = [
-        float(value) for value in cached.get("claimed_starts", [])
-    ]
+    if _proxy_asr_blocks_extraction(cached):
+        return False
+    claimed_starts = [float(value) for value in cached.get("claimed_starts", [])]
     if (
         _remaining_scan_source_budget(
             source_budget,
@@ -1833,6 +2066,43 @@ def acquire_scanned_source_group(
     scanner: Any,
     cache_dir: Path,
     guidance: dict[str, dict[str, Any]],
+    proxy_asr_mode: str = "off",
+    proxy_asr_request_dir: Path | None = None,
+    proxy_asr_result_dir: Path | None = None,
+    proxy_asr_timeout_seconds: float = 120.0,
+) -> list[dict[str, Any]]:
+    """Serialize scan/claim mutations for one source across producer processes."""
+    lock_path = _scan_cache_path(cache_dir, candidates[0]).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return []
+        return _acquire_scanned_source_group_locked(
+            candidates,
+            output_dir,
+            scanner=scanner,
+            cache_dir=cache_dir,
+            guidance=guidance,
+            proxy_asr_mode=proxy_asr_mode,
+            proxy_asr_request_dir=proxy_asr_request_dir,
+            proxy_asr_result_dir=proxy_asr_result_dir,
+            proxy_asr_timeout_seconds=proxy_asr_timeout_seconds,
+        )
+
+
+def _acquire_scanned_source_group_locked(
+    candidates: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    scanner: Any,
+    cache_dir: Path,
+    guidance: dict[str, dict[str, Any]],
+    proxy_asr_mode: str = "off",
+    proxy_asr_request_dir: Path | None = None,
+    proxy_asr_result_dir: Path | None = None,
+    proxy_asr_timeout_seconds: float = 120.0,
 ) -> list[dict[str, Any]]:
     """Scan one full source first, then extract only passing stereo regions."""
     from .source_scanner import (
@@ -1851,9 +2121,7 @@ def acquire_scanned_source_group(
     cache_path = _scan_cache_path(cache_dir, base)
     cached = load_cached_scan(cache_path, clip_seconds=CLIP_SECONDS)
     reused_cache = cached is not None
-    cached_claims = [
-        float(value) for value in (cached or {}).get("claimed_starts", [])
-    ]
+    cached_claims = [float(value) for value in (cached or {}).get("claimed_starts", [])]
     remaining_budget = _remaining_scan_source_budget(
         source_budget,
         accepted_count=accepted_count,
@@ -1880,10 +2148,58 @@ def acquire_scanned_source_group(
         with tempfile.TemporaryDirectory(prefix="sam-source-scan-") as temporary:
             root = Path(temporary)
             source: Path | None = None
+            proxy: Path | None = None
             info: dict[str, Any] | None = None
             source_format: dict[str, Any] | None = None
             if cached is None:
-                target_info = _preflight_source_for_scan(base)
+                try:
+                    target_info = _preflight_source_for_scan(base)
+                except subprocess.CalledProcessError as error:
+                    if not _permanent_media_error(error):
+                        raise
+                    cached = {
+                        "policy": SCAN_POLICY_VERSION,
+                        "clip_seconds": CLIP_SECONDS,
+                        "video_id": video_id,
+                        "source_metadata": {
+                            "uploader": base.get("uploader"),
+                            "search_query": base.get("search_query"),
+                            "title": base.get("title"),
+                        },
+                        "rejection_reasons": ["source_permanently_unavailable"],
+                        "scanned_at": _now(),
+                        "claimed_starts": [],
+                        "regions": [],
+                    }
+                    _atomic_json(cache_path, cached)
+                    return status_result(
+                        "source_unavailable_cached",
+                        cached=False,
+                        rejection_reasons=cached["rejection_reasons"],
+                    )
+                if not target_info.get("quality_format_available", True):
+                    cached = {
+                        "policy": SCAN_POLICY_VERSION,
+                        "clip_seconds": CLIP_SECONDS,
+                        "video_id": video_id,
+                        "extraction_format_id": None,
+                        "available_proxy_format_id": target_info.get("format_id"),
+                        "source_metadata": {
+                            "uploader": base.get("uploader"),
+                            "search_query": base.get("search_query"),
+                            "title": base.get("title"),
+                        },
+                        "rejection_reasons": ["source_high_quality_format_unavailable"],
+                        "scanned_at": _now(),
+                        "claimed_starts": [],
+                        "regions": [],
+                    }
+                    _atomic_json(cache_path, cached)
+                    return status_result(
+                        "source_quality_rejected",
+                        cached=False,
+                        rejection_reasons=cached["rejection_reasons"],
+                    )
                 download_started = time.perf_counter()
                 source, info = _download_full_source_for_scan(base, root)
                 download_seconds = time.perf_counter() - download_started
@@ -1953,6 +2269,52 @@ def acquire_scanned_source_group(
                             **common,
                         }
                 _atomic_json(cache_path, cached)
+            regions = [
+                region
+                for region in cached.get("regions", [])
+                if region_passes_confidence_gate(region)
+            ]
+            if regions and proxy_asr_mode != "off":
+                if proxy_asr_request_dir is None or proxy_asr_result_dir is None:
+                    raise ValueError(
+                        "Proxy ASR request and result directories are required"
+                    )
+                probe = _current_proxy_asr(cached)
+                if probe is None:
+                    probe = _proxy_asr_from_guidance(stats)
+                if probe is None:
+                    if proxy is None:
+                        probe_source, _ = _download_full_source_for_scan(base, root)
+                        proxy = root / "probe-proxy.flac"
+                        scanner.create_proxy(probe_source, proxy)
+                    try:
+                        probe = _probe_source_proxy_asr(
+                            proxy,
+                            regions,
+                            root,
+                            video_id=video_id,
+                            request_dir=proxy_asr_request_dir,
+                            result_dir=proxy_asr_result_dir,
+                            timeout_seconds=proxy_asr_timeout_seconds,
+                        )
+                    except TimeoutError as error:
+                        probe = {
+                            "policy": SOURCE_ASR_PROBE_POLICY,
+                            "status": "timeout",
+                            "accepted": None,
+                            "checked_regions": [],
+                            "error": str(error),
+                            "completed_at": _now(),
+                        }
+                probe["enforced"] = proxy_asr_mode == "enforce"
+                cached["proxy_asr"] = probe
+                _atomic_json(cache_path, cached)
+                if proxy_asr_mode == "enforce" and probe.get("accepted") is not True:
+                    return status_result(
+                        "source_proxy_asr_rejected",
+                        cached=reused_cache,
+                        proxy_asr=probe,
+                    )
             claimed_starts = [
                 float(value) for value in cached.get("claimed_starts", [])
             ]
@@ -2002,6 +2364,7 @@ def acquire_scanned_source_group(
                         "scan_seconds": cached.get("scan_seconds"),
                         "download_seconds": cached.get("download_seconds"),
                         "proxy_seconds": cached.get("proxy_seconds"),
+                        "proxy_asr": cached.get("proxy_asr"),
                         "extraction_download_seconds": round(
                             extraction_download_seconds, 3
                         ),
@@ -2282,6 +2645,10 @@ def acquire_dataset(
     content_priors = _load_catalog_content_priors(catalog_path, platform=source)
     scanner = None
     scan_cache_dir: Path | None = None
+    proxy_asr_mode = "off"
+    proxy_asr_request_dir: Path | None = None
+    proxy_asr_result_dir: Path | None = None
+    proxy_asr_timeout_seconds = 120.0
     if source_scan_config is not None:
         from .source_scanner import M2DSourceScanner
 
@@ -2293,6 +2660,14 @@ def acquire_dataset(
             max_clips_per_video=max_clips_per_video,
         )
         scan_cache_dir = Path(source_scan_config["cache_dir"])
+        proxy_asr_mode = str(source_scan_config.get("proxy_asr_mode", "off"))
+        if source_scan_config.get("proxy_asr_request_dir") is not None:
+            proxy_asr_request_dir = Path(source_scan_config["proxy_asr_request_dir"])
+        if source_scan_config.get("proxy_asr_result_dir") is not None:
+            proxy_asr_result_dir = Path(source_scan_config["proxy_asr_result_dir"])
+        proxy_asr_timeout_seconds = float(
+            source_scan_config.get("proxy_asr_timeout_seconds", 120.0)
+        )
         scanner = M2DSourceScanner(
             m2d_repo=Path(source_scan_config["m2d_repo"]),
             checkpoint=Path(source_scan_config["checkpoint"]),
@@ -2360,9 +2735,7 @@ def acquire_dataset(
     with attempts_path.open("a", encoding="utf-8") as attempt_log:
         with ThreadPoolExecutor(max_workers=download_workers) as executor:
             group_iterator = iter(limited_groups)
-            in_flight: dict[
-                Future[list[dict[str, Any]]], list[dict[str, Any]]
-            ] = {}
+            in_flight: dict[Future[list[dict[str, Any]]], list[dict[str, Any]]] = {}
 
             def submit_group(group: list[dict[str, Any]]) -> None:
                 if scanner is not None and scan_cache_dir is not None:
@@ -2373,6 +2746,10 @@ def acquire_dataset(
                         scanner=scanner,
                         cache_dir=scan_cache_dir,
                         guidance=guidance,
+                        proxy_asr_mode=proxy_asr_mode,
+                        proxy_asr_request_dir=proxy_asr_request_dir,
+                        proxy_asr_result_dir=proxy_asr_result_dir,
+                        proxy_asr_timeout_seconds=proxy_asr_timeout_seconds,
                     )
                 else:
                     future = executor.submit(
@@ -2535,6 +2912,14 @@ def main() -> None:
     parser.add_argument("--m2d-ontology", type=Path)
     parser.add_argument("--m2d-device", default="cuda")
     parser.add_argument("--m2d-batch-size", type=int, default=128)
+    parser.add_argument(
+        "--source-asr-probe-mode",
+        choices=("off", "shadow", "enforce"),
+        default="off",
+    )
+    parser.add_argument("--source-asr-probe-requests", type=Path)
+    parser.add_argument("--source-asr-probe-results", type=Path)
+    parser.add_argument("--source-asr-probe-timeout", type=float, default=120.0)
     parser.add_argument("--yt-dlp-python", type=Path)
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument(
@@ -2578,6 +2963,15 @@ def main() -> None:
         )
     if args.m2d_batch_size < 1:
         parser.error("--m2d-batch-size must be positive")
+    if args.source_asr_probe_timeout <= 0:
+        parser.error("--source-asr-probe-timeout must be positive")
+    if args.source_asr_probe_mode != "off" and (
+        args.source_asr_probe_requests is None or args.source_asr_probe_results is None
+    ):
+        parser.error(
+            "--source-asr-probe-mode requires --source-asr-probe-requests "
+            "and --source-asr-probe-results"
+        )
     if args.verify_only:
         result = verify_dataset(args.output, target=args.total)
         print(json.dumps(result, indent=2))
@@ -2638,6 +3032,10 @@ def main() -> None:
                 "ontology": args.m2d_ontology,
                 "device": args.m2d_device,
                 "batch_size": args.m2d_batch_size,
+                "proxy_asr_mode": args.source_asr_probe_mode,
+                "proxy_asr_request_dir": args.source_asr_probe_requests,
+                "proxy_asr_result_dir": args.source_asr_probe_results,
+                "proxy_asr_timeout_seconds": args.source_asr_probe_timeout,
             }
             if args.scan_before_extract
             else None

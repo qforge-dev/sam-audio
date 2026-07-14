@@ -171,7 +171,7 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
         "source_platform": "dailymotion",
         "source_url": "https://example.test/movie",
         "title": "English Movie Scene HD",
-        "duration_seconds": 120,
+        "duration_seconds": 600,
         "clip_start_seconds": 5.0,
         "clip_end_seconds": 35.0,
         "retrieval_status": "success",

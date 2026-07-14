@@ -621,9 +621,7 @@ def _cohort_funnel(
             "asr_pass_percent": percentage(
                 counts["asr_accepted"], counts["asr_scored"]
             ),
-            "final_yield_percent": percentage(
-                counts["accepted"], counts["downloaded"]
-            ),
+            "final_yield_percent": percentage(counts["accepted"], counts["downloaded"]),
             "post_asr_keep_percent": percentage(
                 counts["accepted"], counts["asr_accepted"]
             ),
@@ -644,6 +642,10 @@ def _source_scan_status(workspace: Path) -> dict[str, Any]:
     cache_dir = workspace / "source-scans"
     scanned = passing_sources = passing_regions = claimed_regions = 0
     quality_rejected = no_matches = timed_sources = 0
+    proxy_asr_scored = proxy_asr_accepted = proxy_asr_rejected = 0
+    proxy_asr_enforced_rejected = proxy_asr_regions_checked = 0
+    proxy_asr_live_scored = proxy_asr_derived = 0
+    proxy_asr_seconds = 0.0
     scan_seconds = download_seconds = proxy_seconds = 0.0
     now = datetime.now(UTC)
     recent = {
@@ -669,6 +671,27 @@ def _source_scan_status(workspace: Path) -> dict[str, Any]:
             no_matches += 1
         passing_regions += len(regions)
         claimed_regions += len(item.get("claimed_starts") or [])
+        proxy_asr = item.get("proxy_asr") or {}
+        if proxy_asr.get("policy") == "source_proxy_asr_top3_beam1_v1":
+            accepted = proxy_asr.get("accepted")
+            if accepted is not None:
+                proxy_asr_scored += 1
+                if (
+                    proxy_asr.get("status") == "completed"
+                    and proxy_asr.get("processing_seconds") is not None
+                ):
+                    proxy_asr_live_scored += 1
+                    proxy_asr_seconds += float(
+                        proxy_asr.get("processing_seconds") or 0.0
+                    )
+                elif proxy_asr.get("status") == "derived_from_catalog":
+                    proxy_asr_derived += 1
+                proxy_asr_regions_checked += len(proxy_asr.get("checked_regions") or [])
+                if accepted:
+                    proxy_asr_accepted += 1
+                else:
+                    proxy_asr_rejected += 1
+                    proxy_asr_enforced_rejected += int(bool(proxy_asr.get("enforced")))
         scan_seconds += float(item.get("scan_seconds") or 0.0)
         if item.get("download_seconds") is not None:
             timed_sources += 1
@@ -688,18 +711,34 @@ def _source_scan_status(workspace: Path) -> dict[str, Any]:
         "policy": "whole_source_proxy_m2d_v1",
         "scanned_sources": scanned,
         "passing_sources": passing_sources,
-        "source_match_percent": round(
-            100.0 * passing_sources / scanned, 2
-        )
+        "source_match_percent": round(100.0 * passing_sources / scanned, 2)
         if scanned
         else 0.0,
         "quality_rejected_sources": quality_rejected,
         "no_match_sources": no_matches,
         "passing_regions": passing_regions,
         "claimed_regions": claimed_regions,
-        "region_claim_percent": round(
-            100.0 * claimed_regions / passing_regions, 2
+        "proxy_asr_policy": "source_proxy_asr_top3_beam1_v1",
+        "proxy_asr_scored_sources": proxy_asr_scored,
+        "proxy_asr_accepted_sources": proxy_asr_accepted,
+        "proxy_asr_rejected_sources": proxy_asr_rejected,
+        "proxy_asr_enforced_rejected_sources": proxy_asr_enforced_rejected,
+        "proxy_asr_live_scored_sources": proxy_asr_live_scored,
+        "proxy_asr_catalog_derived_sources": proxy_asr_derived,
+        "proxy_asr_accept_percent": round(
+            100.0 * proxy_asr_accepted / proxy_asr_scored, 2
         )
+        if proxy_asr_scored
+        else 0.0,
+        "proxy_asr_average_seconds": round(proxy_asr_seconds / proxy_asr_live_scored, 3)
+        if proxy_asr_live_scored
+        else 0.0,
+        "proxy_asr_average_regions_checked": round(
+            proxy_asr_regions_checked / proxy_asr_scored, 3
+        )
+        if proxy_asr_scored
+        else 0.0,
+        "region_claim_percent": round(100.0 * claimed_regions / passing_regions, 2)
         if passing_regions
         else 0.0,
         "model_scan_seconds": round(scan_seconds, 3),
@@ -1688,6 +1727,7 @@ def main() -> None:
     configure = commands.add_parser("configure")
     configure.add_argument("--workspace", type=Path, required=True)
     configure.add_argument("--download-workers", type=int, required=True)
+    configure.add_argument("--acquisition-producers", type=int, default=1)
     configure.add_argument("--m2d-workers", type=int, required=True)
     configure.add_argument("--asr-workers", type=int, required=True)
     configure.add_argument("--upload-concurrency", type=int, required=True)
@@ -1794,14 +1834,13 @@ def main() -> None:
                 break
             time.sleep(max(1.0, args.interval_seconds))
     elif args.command == "configure":
+        if args.acquisition_producers < 1:
+            parser.error("--acquisition-producers must be positive")
         if args.base_clips_per_video < 1:
             parser.error("--base-clips-per-video must be positive")
         if args.source_content_minutes_per_hour <= 0:
             parser.error("--source-content-minutes-per-hour must be positive")
-        if (
-            args.max_duration_scaled_clips_per_video
-            < args.base_clips_per_video
-        ):
+        if args.max_duration_scaled_clips_per_video < args.base_clips_per_video:
             parser.error(
                 "--max-duration-scaled-clips-per-video must be at least "
                 "--base-clips-per-video"
@@ -1812,6 +1851,7 @@ def main() -> None:
             args.workspace / "config.json",
             {
                 "download_workers": args.download_workers,
+                "acquisition_producers": args.acquisition_producers,
                 "m2d_workers": args.m2d_workers,
                 "asr_workers": args.asr_workers,
                 "upload_concurrency": args.upload_concurrency,

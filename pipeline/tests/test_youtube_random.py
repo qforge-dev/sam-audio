@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import math
+import subprocess
 import wave
 from pathlib import Path
 
 import numpy as np
 
+import sam_audio_pipeline.youtube_random as youtube_random
 from sam_audio_pipeline.youtube_random import (
     CANDIDATE_DURATION_POLICY,
     DAILYMOTION_SEARCH_POLICY,
@@ -14,11 +17,16 @@ from sam_audio_pipeline.youtube_random import (
     _accepted,
     _candidate_allowed,
     _cinematic_candidate_priority,
+    _dailymotion_has_high_quality_format,
     _dailymotion_search_page,
+    _discovery_candidate_allowed,
     _group_candidates_by_video,
     _inject_cached_scan_sources,
     _load_source_scan_priors,
     _order_scanned_source_groups,
+    _permanent_media_error,
+    _proxy_asr_blocks_extraction,
+    _proxy_asr_from_guidance,
     _query_for_source,
     _remaining_scan_source_budget,
     _runtime_worker_limit,
@@ -133,14 +141,15 @@ def test_exhausted_cached_scan_group_is_removed_before_scheduling(
         )
     )
 
-    assert not _scan_group_has_remaining_work(
-        group, cache_dir=cache, guidance={}
+    assert not _scan_group_has_remaining_work(group, cache_dir=cache, guidance={})
+    assert (
+        _scan_group_has_remaining_work(
+            group,
+            cache_dir=cache,
+            guidance={"scene": {"attempted_starts": [], "accepted_starts": []}},
+        )
+        is False
     )
-    assert _scan_group_has_remaining_work(
-        group,
-        cache_dir=cache,
-        guidance={"scene": {"attempted_starts": [], "accepted_starts": []}},
-    ) is False
 
 
 def test_unseen_scan_group_is_kept_for_exploration(tmp_path: Path) -> None:
@@ -152,9 +161,102 @@ def test_unseen_scan_group_is_kept_for_exploration(tmp_path: Path) -> None:
         }
     ]
 
-    assert _scan_group_has_remaining_work(
-        group, cache_dir=tmp_path, guidance={}
+    assert _scan_group_has_remaining_work(group, cache_dir=tmp_path, guidance={})
+
+
+def test_low_quality_source_is_negatively_cached(tmp_path: Path, monkeypatch) -> None:
+    candidate = {
+        "candidate_id": "low-quality:0",
+        "video_id": "low-quality",
+        "source_platform": "dailymotion",
+        "source_url": "https://example.invalid/low-quality",
+        "source_clip_budget": 1,
+    }
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(
+        youtube_random,
+        "_preflight_source_for_scan",
+        lambda _: {"quality_format_available": False, "format_id": "hls-380"},
     )
+
+    results = acquire_scanned_source_group(
+        [candidate],
+        tmp_path / "output",
+        scanner=None,
+        cache_dir=cache,
+        guidance={},
+    )
+
+    assert results[0]["retrieval_status"] == "source_quality_rejected"
+    assert not _scan_group_has_remaining_work([candidate], cache_dir=cache, guidance={})
+    cached = json.loads((cache / "dailymotion-low-quality.json").read_text())
+    assert cached["rejection_reasons"] == ["source_high_quality_format_unavailable"]
+
+
+def test_busy_cross_process_source_lock_skips_without_waiting(tmp_path: Path) -> None:
+    candidate = {
+        "candidate_id": "busy:0",
+        "video_id": "busy",
+        "source_platform": "dailymotion",
+        "source_clip_budget": 1,
+    }
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    lock_path = cache / "dailymotion-busy.lock"
+
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert (
+            acquire_scanned_source_group(
+                [candidate],
+                tmp_path / "output",
+                scanner=None,
+                cache_dir=cache,
+                guidance={},
+            )
+            == []
+        )
+
+
+def test_only_permanent_media_failures_are_negatively_cached() -> None:
+    missing = subprocess.CalledProcessError(
+        1, ["yt-dlp"], stderr="ERROR: [dailymotion] x: Not found."
+    )
+    transient = subprocess.CalledProcessError(
+        1, ["yt-dlp"], stderr="HTTP Error 429: Too Many Requests"
+    )
+
+    assert _permanent_media_error(missing)
+    assert not _permanent_media_error(transient)
+
+
+def test_proxy_asr_catalog_evidence_requires_two_failures_or_one_success() -> None:
+    assert _proxy_asr_from_guidance({"asr_scored": 1, "asr_accepted": 0}) is None
+    rejected = _proxy_asr_from_guidance({"asr_scored": 2, "asr_accepted": 0})
+    accepted = _proxy_asr_from_guidance({"asr_scored": 3, "asr_accepted": 1})
+
+    assert rejected is not None and rejected["accepted"] is False
+    assert accepted is not None and accepted["accepted"] is True
+
+
+def test_only_enforced_proxy_asr_rejection_blocks_extraction() -> None:
+    shadow = {
+        "proxy_asr": {
+            "policy": "source_proxy_asr_top3_beam1_v1",
+            "accepted": False,
+            "enforced": False,
+        }
+    }
+    enforced = {
+        "proxy_asr": {
+            "policy": "source_proxy_asr_top3_beam1_v1",
+            "accepted": False,
+            "enforced": True,
+        }
+    }
+
+    assert not _proxy_asr_blocks_extraction(shadow)
+    assert _proxy_asr_blocks_extraction(enforced)
 
 
 def test_scanned_source_order_learns_productive_uploaders(tmp_path: Path) -> None:
@@ -360,9 +462,16 @@ def test_dailymotion_search_pages_are_reproducible_and_seeded() -> None:
     another_seed = [_dailymotion_search_page(18, query) for query in queries]
 
     assert first == second
-    assert all(1 <= page <= 6 for page in first)
-    assert len(set(first)) >= 4
+    assert all(1 <= page <= 10 for page in first)
+    assert len(set(first)) >= 6
     assert first != another_seed
+
+
+def test_dailymotion_search_requires_an_hd_source_variant() -> None:
+    assert not _dailymotion_has_high_quality_format({"available_formats": ["sd"]})
+    assert _dailymotion_has_high_quality_format(
+        {"available_formats": ["sd", "hd720@60"]}
+    )
 
 
 def test_cinematic_queries_and_metadata_filter_target_raw_scenes() -> None:
@@ -386,7 +495,7 @@ def test_cinematic_queries_and_metadata_filter_target_raw_scenes() -> None:
         {
             "id": "scene",
             "title": "Captain America Elevator Scene 4K",
-            "duration": 180,
+            "duration": 600,
             "channel": "Movie Clips",
         },
         profile="cinematic",
@@ -545,13 +654,13 @@ def test_cached_candidates_are_refiltered_under_current_metadata_policy(
             "candidate_id": "good:1",
             "video_id": "good",
             "title": "English Movie Scene",
-            "duration_seconds": 180,
+            "duration_seconds": 600,
         },
         {
             "candidate_id": "subbed:1",
             "video_id": "subbed",
             "title": "Movie Scene English Sub",
-            "duration_seconds": 180,
+            "duration_seconds": 600,
         },
     ]
     (metadata / "candidates.json").write_text(json.dumps(candidates))
@@ -587,13 +696,13 @@ def test_accepted_records_follow_current_metadata_policy() -> None:
     allowed = {
         "video_id": "allowed",
         "title": "English Movie Scene HD",
-        "duration_seconds": 180,
+        "duration_seconds": 600,
         "retrieval_status": "success",
     }
     excluded = {
         "video_id": "excluded",
         "title": "Prabhas Mass Entry Scene",
-        "duration_seconds": 180,
+        "duration_seconds": 600,
         "retrieval_status": "success",
     }
 
@@ -601,13 +710,26 @@ def test_accepted_records_follow_current_metadata_policy() -> None:
 
 
 def test_candidate_filter_rejects_short_live_and_pure_audio_results() -> None:
-    valid = {"id": "video", "title": "City festival vlog", "duration": 120}
+    valid = {"id": "video", "title": "City festival vlog", "duration": 600}
 
     assert _candidate_allowed(valid)
     assert not _candidate_allowed({**valid, "duration": 20})
     assert not _candidate_allowed({**valid, "live_status": "is_live"})
     assert not _candidate_allowed({**valid, "title": "Official Audio"})
     assert not _candidate_allowed({**valid, "title": "Song (Official Video)"})
+
+
+def test_discovery_duration_floor_does_not_invalidate_existing_records() -> None:
+    short_source = {
+        "id": "scene",
+        "title": "English Movie Scene HD",
+        "duration": 90,
+    }
+
+    assert _candidate_allowed(short_source, profile="cinematic")
+    assert not _discovery_candidate_allowed(
+        short_source, profile="cinematic", source="dailymotion"
+    )
 
 
 def test_candidate_filter_accepts_long_form_sources_with_a_safety_ceiling() -> None:

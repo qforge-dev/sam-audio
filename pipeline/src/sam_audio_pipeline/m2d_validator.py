@@ -641,6 +641,52 @@ def _runtime_asr_concurrency(path: Path | None, maximum: int) -> int:
         return 1
 
 
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+    os.replace(temporary, path)
+
+
+def _pending_asr_probe_requests(
+    request_dir: Path | None,
+    result_dir: Path | None,
+) -> list[tuple[Path, Path, Path, dict[str, Any]]]:
+    """Return valid proxy-ASR requests, resolving malformed ones as failures."""
+    if request_dir is None or result_dir is None:
+        return []
+    request_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    pending: list[tuple[Path, Path, Path, dict[str, Any]]] = []
+    for request_path in sorted(request_dir.glob("*.json")):
+        try:
+            request = json.loads(request_path.read_text())
+            request_id = str(request["request_id"])
+            if request_id != request_path.stem:
+                raise ValueError("request id does not match filename")
+            audio_path = Path(str(request["audio_path"]))
+            result_path = result_dir / f"{request_id}.json"
+            if result_path.exists():
+                request_path.unlink(missing_ok=True)
+                continue
+            if not audio_path.is_file():
+                _write_json_atomic(
+                    result_path,
+                    {
+                        "request_id": request_id,
+                        "accepted": False,
+                        "error": "probe_audio_missing",
+                        "rejection_reasons": ["probe_audio_missing"],
+                    },
+                )
+                request_path.unlink(missing_ok=True)
+                continue
+            pending.append((request_path, result_path, audio_path, request))
+        except (json.JSONDecodeError, KeyError, OSError, TypeError, ValueError):
+            request_path.unlink(missing_ok=True)
+    return pending
+
+
 def _transcribe_asr_file(
     model: Any,
     path: Path,
@@ -648,11 +694,13 @@ def _transcribe_asr_file(
     *,
     shard_index: int,
     shard_count: int,
+    beam_size: int | None = None,
 ) -> dict[str, Any]:
+    effective_beam_size = args.beam_size if beam_size is None else beam_size
     segments_source, info = model.transcribe(
         str(path),
         language=None,
-        beam_size=args.beam_size,
+        beam_size=effective_beam_size,
         vad_filter=True,
         condition_on_previous_text=False,
     )
@@ -671,7 +719,7 @@ def _transcribe_asr_file(
             "model": args.model,
             "device": args.device,
             "compute_type": args.compute_type,
-            "beam_size": args.beam_size,
+            "beam_size": effective_beam_size,
             "worker_shard_index": shard_index,
             "worker_shard_count": shard_count,
         },
@@ -745,6 +793,7 @@ def score_asr_directory(args: argparse.Namespace) -> None:
     shard_index = int(getattr(args, "shard_index", 0))
     shard_count = int(getattr(args, "shard_count", 1))
     processed = 0
+    probe_processed = 0
     previous_allowed_count = -1
     control_file = getattr(args, "autoscale_control", None)
     with (
@@ -776,25 +825,70 @@ def score_asr_directory(args: argparse.Namespace) -> None:
             if args.limit:
                 files = files[: args.limit]
             pending = [path for path in files if path.name not in existing]
-            if not pending:
+            probe_requests = _pending_asr_probe_requests(
+                getattr(args, "probe_requests_dir", None),
+                getattr(args, "probe_results_dir", None),
+            )
+            if not pending and not probe_requests:
                 if not follow or (producer_done and producer_done.is_file()):
                     break
                 time.sleep(poll_seconds)
                 continue
             concurrency = _runtime_asr_concurrency(control_file, max_inference_workers)
-            batch = pending[:concurrency]
-            futures = {
-                executor.submit(
-                    _transcribe_asr_file,
-                    model,
-                    path,
-                    args,
-                    shard_index=shard_index,
-                    shard_count=shard_count,
-                ): path
-                for path in batch
-            }
+            # A probe unblocks up to eight future extracts. Give it one slot while
+            # retaining one final-validation slot, and use both slots for probes
+            # only when the normal ASR queue is empty.
+            if probe_requests and max_inference_workers >= 2:
+                concurrency = max(concurrency, 2)
+            jobs: list[tuple[str, Any]] = []
+            if probe_requests:
+                probe_slots = concurrency if not pending else 1
+                jobs.extend(("probe", item) for item in probe_requests[:probe_slots])
+            remaining_slots = concurrency - len(jobs)
+            jobs.extend(("final", path) for path in pending[:remaining_slots])
+            futures: dict[Any, tuple[str, Any]] = {}
+            for kind, item in jobs:
+                path = item[2] if kind == "probe" else item
+                futures[
+                    executor.submit(
+                        _transcribe_asr_file,
+                        model,
+                        path,
+                        args,
+                        shard_index=shard_index,
+                        shard_count=shard_count,
+                        beam_size=(1 if kind == "probe" else None),
+                    )
+                ] = (kind, item)
             for future in as_completed(futures):
+                kind, item = futures[future]
+                if kind == "probe":
+                    request_path, result_path, _, request = item
+                    try:
+                        result = {
+                            **future.result(),
+                            "request_id": request["request_id"],
+                            "probe": {
+                                "video_id": request.get("video_id"),
+                                "start_seconds": request.get("start_seconds"),
+                                "policy": request.get("policy"),
+                            },
+                        }
+                    except Exception as error:
+                        result = {
+                            "request_id": request.get("request_id"),
+                            "accepted": False,
+                            "error": f"{type(error).__name__}: {error}",
+                            "rejection_reasons": ["probe_inference_failed"],
+                        }
+                    _write_json_atomic(result_path, result)
+                    request_path.unlink(missing_ok=True)
+                    probe_processed += 1
+                    if probe_processed % 25 == 0:
+                        logger.info(
+                            "Completed %d proxy-ASR source probes", probe_processed
+                        )
+                    continue
                 result = future.result()
                 destination.write(json.dumps(result, separators=(",", ":")) + "\n")
                 destination.flush()
@@ -1369,6 +1463,8 @@ def _parser() -> argparse.ArgumentParser:
     asr_score.add_argument("--max-inference-workers", type=int, default=1)
     asr_score.add_argument("--cpu-threads", type=int, default=0)
     asr_score.add_argument("--autoscale-control", type=Path)
+    asr_score.add_argument("--probe-requests-dir", type=Path)
+    asr_score.add_argument("--probe-results-dir", type=Path)
     asr_score.set_defaults(handler=score_asr_directory)
 
     materialize = subparsers.add_parser(

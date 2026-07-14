@@ -11,6 +11,7 @@ from sam_audio_pipeline.m2d_validator import (
     _belongs_to_shard,
     _m2d_asr_allowlist,
     _M2DAllowlistTail,
+    _pending_asr_probe_requests,
     _runtime_asr_concurrency,
     evaluate_asr,
     evaluate_probabilities,
@@ -18,6 +19,34 @@ from sam_audio_pipeline.m2d_validator import (
     materialize_accepted,
     merge_materialized,
 )
+
+
+def test_proxy_asr_queue_resolves_missing_audio_and_returns_valid_jobs(
+    tmp_path: Path,
+) -> None:
+    requests = tmp_path / "requests"
+    results = tmp_path / "results"
+    requests.mkdir()
+    audio = tmp_path / "probe.wav"
+    _wav(audio)
+    (requests / "valid.json").write_text(
+        json.dumps({"request_id": "valid", "audio_path": str(audio)})
+    )
+    (requests / "missing.json").write_text(
+        json.dumps(
+            {"request_id": "missing", "audio_path": str(tmp_path / "missing.wav")}
+        )
+    )
+    (requests / "malformed.json").write_text("not-json")
+
+    pending = _pending_asr_probe_requests(requests, results)
+
+    assert [(item[0].name, item[2]) for item in pending] == [("valid.json", audio)]
+    assert not (requests / "missing.json").exists()
+    assert not (requests / "malformed.json").exists()
+    missing = json.loads((results / "missing.json").read_text())
+    assert missing["accepted"] is False
+    assert missing["rejection_reasons"] == ["probe_audio_missing"]
 
 
 def test_runtime_asr_concurrency_is_bounded_and_failure_safe(tmp_path: Path) -> None:
@@ -481,7 +510,7 @@ def _validated_batch(root: Path, records: list[tuple[str, str, float]]) -> Path:
                 "source_platform": "dailymotion",
                 "source_url": f"https://www.dailymotion.com/video/{video_id}",
                 "title": "English Movie Scene HD",
-                "duration_seconds": 120,
+                    "duration_seconds": 600,
                 "uploader": "Movie Scenes",
                 "clip_start_seconds": start,
                 "local_path": f"audio/{filename}",

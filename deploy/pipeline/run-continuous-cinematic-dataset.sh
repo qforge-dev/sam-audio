@@ -15,6 +15,7 @@ RUNS_DIR="$WORKSPACE/acquisition-runs"
 BUCKET=${SAM_CONTINUOUS_S3_BUCKET:?SAM_CONTINUOUS_S3_BUCKET is required}
 S3_PREFIX=${SAM_CONTINUOUS_S3_PREFIX:-cinematic-dialogue-dataset}
 DOWNLOAD_WORKERS=${SAM_CONTINUOUS_DOWNLOAD_WORKERS:-8}
+ACQUISITION_PRODUCERS=${SAM_CONTINUOUS_ACQUISITION_PRODUCERS:-2}
 SEARCH_WORKERS=${SAM_CONTINUOUS_SEARCH_WORKERS:-8}
 M2D_WORKERS=${SAM_CONTINUOUS_M2D_WORKERS:-1}
 ASR_WORKERS=${SAM_CONTINUOUS_ASR_WORKERS:-1}
@@ -39,8 +40,10 @@ SOURCE_CONTENT_MINUTES_PER_HOUR=${SAM_CONTINUOUS_SOURCE_CONTENT_MINUTES_PER_HOUR
 MAX_DURATION_SCALED_CLIPS_PER_VIDEO=${SAM_CONTINUOUS_MAX_DURATION_SCALED_CLIPS_PER_VIDEO:-60}
 SOURCE_SCAN_ENABLED=${SAM_CONTINUOUS_SOURCE_SCAN_ENABLED:-true}
 SOURCE_SCAN_BATCH_SIZE=${SAM_CONTINUOUS_SOURCE_SCAN_BATCH_SIZE:-128}
+SOURCE_ASR_PROBE_MODE=${SAM_CONTINUOUS_SOURCE_ASR_PROBE_MODE:-enforce}
+SOURCE_ASR_PROBE_TIMEOUT=${SAM_CONTINUOUS_SOURCE_ASR_PROBE_TIMEOUT:-120}
 
-for value in "$DOWNLOAD_WORKERS" "$SEARCH_WORKERS" "$M2D_WORKERS" "$ASR_WORKERS" "$UPLOAD_CONCURRENCY"; do
+for value in "$DOWNLOAD_WORKERS" "$ACQUISITION_PRODUCERS" "$SEARCH_WORKERS" "$M2D_WORKERS" "$ASR_WORKERS" "$UPLOAD_CONCURRENCY"; do
   if (( value < 1 )); then
     echo "All worker counts must be positive" >&2
     exit 2
@@ -59,12 +62,14 @@ export PYTHONPATH="$PIPELINE_ROOT/src"
 export HF_HOME=${HF_HOME:-/home/ubuntu/.cache/huggingface}
 mkdir -p "$RUNS_DIR" "$WORKSPACE/raw-audio" "$WORKSPACE/accepted/audio" \
   "$WORKSPACE/m2d-validation" "$WORKSPACE/asr-validation" \
-  "$WORKSPACE/source-scans"
+  "$WORKSPACE/source-scans" "$WORKSPACE/source-asr-probe-requests" \
+  "$WORKSPACE/source-asr-probe-results"
 cd "$PIPELINE_ROOT"
 
 configure_args=(
   --workspace "$WORKSPACE"
   --download-workers "$DOWNLOAD_WORKERS"
+  --acquisition-producers "$ACQUISITION_PRODUCERS"
   --m2d-workers "$M2D_WORKERS"
   --asr-workers "$ASR_WORKERS"
   --upload-concurrency "$UPLOAD_CONCURRENCY"
@@ -112,12 +117,17 @@ restart_worker() {
 }
 
 download_forever() {
-  local seed_file="$WORKSPACE/next-seed"
+  local producer_index=$1
+  local seed_file="$WORKSPACE/next-seed-$producer_index"
+  local legacy_seed_file="$WORKSPACE/next-seed"
+  local workers_per_producer=$(((DOWNLOAD_WORKERS + ACQUISITION_PRODUCERS - 1) / ACQUISITION_PRODUCERS))
+  local base_seed
   local seed
-  seed=$(test -s "$seed_file" && tr -dc '0-9' < "$seed_file" || date -u +%Y%m%d)
+  base_seed=$(test -s "$legacy_seed_file" && tr -dc '0-9' < "$legacy_seed_file" || date -u +%Y%m%d)
+  seed=$(test -s "$seed_file" && tr -dc '0-9' < "$seed_file" || echo $((base_seed + producer_index)))
   while true; do
     local run_dir="$RUNS_DIR/run-$seed"
-    local next_seed=$((seed + 1))
+    local next_seed=$((seed + ACQUISITION_PRODUCERS))
     local next_run_dir="$RUNS_DIR/run-$next_seed"
     local prefetch_pid
     local scan_args=()
@@ -132,6 +142,10 @@ download_forever() {
         --m2d-ontology "$ONTOLOGY"
         --m2d-device cuda
         --m2d-batch-size "$SOURCE_SCAN_BATCH_SIZE"
+        --source-asr-probe-mode "$SOURCE_ASR_PROBE_MODE"
+        --source-asr-probe-requests "$WORKSPACE/source-asr-probe-requests"
+        --source-asr-probe-results "$WORKSPACE/source-asr-probe-results"
+        --source-asr-probe-timeout "$SOURCE_ASR_PROBE_TIMEOUT"
         --yt-dlp-python "$PIPELINE_PYTHON"
       )
     fi
@@ -165,7 +179,7 @@ download_forever() {
       --query-count 500 \
       --results-per-query 100 \
       --search-workers "$SEARCH_WORKERS" \
-      --download-workers "$DOWNLOAD_WORKERS" \
+      --download-workers "$workers_per_producer" \
       --worker-limit-file "$WORKSPACE/autoscale-control.json" \
       --candidate-multiplier 1.8 \
       --max-attempts 40000 \
@@ -188,7 +202,9 @@ shutdown() {
 trap shutdown TERM INT EXIT
 
 heartbeat_loop downloader &
-restart_worker downloader download_forever &
+for ((index=0; index<ACQUISITION_PRODUCERS; index++)); do
+  restart_worker downloader download_forever "$index" &
+done
 
 heartbeat_loop promoter &
 restart_worker promoter "$PIPELINE_PYTHON" -m sam_audio_pipeline.continuous_dataset \
@@ -210,6 +226,13 @@ for ((index=0; index<M2D_WORKERS; index++)); do
 done
 
 for ((index=0; index<ASR_WORKERS; index++)); do
+  probe_args=()
+  if (( index == 0 )); then
+    probe_args=(
+      --probe-requests-dir "$WORKSPACE/source-asr-probe-requests"
+      --probe-results-dir "$WORKSPACE/source-asr-probe-results"
+    )
+  fi
   heartbeat_loop "asr-$index" &
   restart_worker "asr-$index" "$WHISPER_PYTHON" \
     -m sam_audio_pipeline.m2d_validator asr-score \
@@ -222,6 +245,7 @@ for ((index=0; index<ASR_WORKERS; index++)); do
     --max-inference-workers "$ASR_CONCURRENCY_MAX" \
     --cpu-threads "$ASR_CPU_THREADS" \
     --autoscale-control "$WORKSPACE/autoscale-control.json" \
+    "${probe_args[@]}" \
     --follow --poll-seconds 2 \
     --shard-index "$index" --shard-count "$ASR_WORKERS" &
 done
