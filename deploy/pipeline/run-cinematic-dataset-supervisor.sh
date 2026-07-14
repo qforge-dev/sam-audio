@@ -26,6 +26,7 @@ wait_for_initial_batch() {
 
 acquire_batch() {
   local seed=$1
+  local target=$2
   local batch_dir="/home/ubuntu/cinematic-dm-raw-$seed"
   # Download each source once, then inspect many non-overlapping ten-second
   # positions. This improves useful-clip yield without duplicate transfers.
@@ -33,7 +34,7 @@ acquire_batch() {
     --output "$batch_dir" \
     --source dailymotion \
     --profile cinematic \
-    --total 7000 \
+    --total "$target" \
     --seed "$seed" \
     --clips-per-video 48 \
     --query-count 500 \
@@ -86,18 +87,20 @@ try_materialize() {
 }
 
 wait_for_initial_batch
-acquire_batch 20260715
+acquire_batch 20260715 7000
 score_batch /home/ubuntu/cinematic-dm-raw-20260715
 if try_materialize; then
   exit 0
 fi
 
 for seed in 20260716 20260717 20260718 20260719; do
-  acquire_batch "$seed"
-  score_batch "/home/ubuntu/cinematic-dm-raw-$seed"
-  if try_materialize; then
-    exit 0
-  fi
+  for checkpoint in 2500 4500 7000; do
+    acquire_batch "$seed" "$checkpoint"
+    score_batch "/home/ubuntu/cinematic-dm-raw-$seed"
+    if try_materialize; then
+      exit 0
+    fi
+  done
 done
 
 echo "Five acquisition batches did not yield 1,000 final clips" >&2
