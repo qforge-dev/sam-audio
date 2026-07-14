@@ -24,6 +24,8 @@ SCAN_POLICY_VERSION = "whole_source_proxy_m2d_v1"
 PROXY_SAMPLE_RATE = 16_000
 PROXY_ACTIVITY_DBFS = -50.0
 REGION_HOP_SECONDS = 5.0
+MIN_REGION_FOREGROUND_SPEECH_COVERAGE = 0.48
+MAX_REGION_VOCAL_MUSIC_COVERAGE = 0.11
 
 
 def _region_score(evaluation: dict[str, Any]) -> float:
@@ -41,6 +43,17 @@ def _region_score(evaluation: dict[str, Any]) -> float:
 def compact_evaluation(evaluation: dict[str, Any]) -> dict[str, Any]:
     """Keep selection evidence without duplicating per-second label payloads."""
     return {key: value for key, value in evaluation.items() if key != "windows"}
+
+
+def region_passes_confidence_gate(region: dict[str, Any]) -> bool:
+    """Keep enough high-confidence regions to saturate full-quality extraction."""
+    evidence = region.get("evidence") or {}
+    return (
+        float(evidence.get("foreground_speech_coverage") or 0.0)
+        >= MIN_REGION_FOREGROUND_SPEECH_COVERAGE
+        and float(evidence.get("vocal_music_coverage") or 0.0)
+        <= MAX_REGION_VOCAL_MUSIC_COVERAGE
+    )
 
 
 def select_candidate_regions(
@@ -82,14 +95,14 @@ def select_candidate_regions(
         )
         if not evaluation["accepted"]:
             continue
-        ranked.append(
-            {
-                "start_seconds": round(start, 3),
-                "end_seconds": round(start + clip_seconds, 3),
-                "score": round(_region_score(evaluation), 8),
-                "evidence": compact_evaluation(evaluation),
-            }
-        )
+        region = {
+            "start_seconds": round(start, 3),
+            "end_seconds": round(start + clip_seconds, 3),
+            "score": round(_region_score(evaluation), 8),
+            "evidence": compact_evaluation(evaluation),
+        }
+        if region_passes_confidence_gate(region):
+            ranked.append(region)
     ranked.sort(key=lambda item: (-float(item["score"]), item["start_seconds"]))
     selected: list[dict[str, Any]] = []
     for region in ranked:
@@ -117,6 +130,7 @@ class M2DSourceScanner:
         ontology: Path,
         device: str = "cuda",
         batch_size: int = 128,
+        inference_concurrency: int = 2,
     ) -> None:
         try:
             import soundfile as sf
@@ -138,7 +152,10 @@ class M2DSourceScanner:
         self.device = device
         self.batch_size = max(1, batch_size)
         self.sample_rate = int(self.model.cfg.sample_rate)
-        self._inference_lock = threading.Lock()
+        self.inference_concurrency = max(1, inference_concurrency)
+        self._inference_slots = threading.BoundedSemaphore(
+            self.inference_concurrency
+        )
 
     def create_proxy(self, source: Path, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -262,7 +279,7 @@ class M2DSourceScanner:
         clip_seconds: float,
         max_regions: int,
     ) -> dict[str, Any]:
-        with self._inference_lock:
+        with self._inference_slots:
             probabilities, active_windows, inference_seconds = self._probabilities(
                 proxy
             )
@@ -278,6 +295,7 @@ class M2DSourceScanner:
             "proxy_sample_rate_hz": self.sample_rate,
             "proxy_activity_threshold_dbfs": PROXY_ACTIVITY_DBFS,
             "m2d_windows": len(probabilities),
+            "m2d_inference_concurrency": self.inference_concurrency,
             "active_proxy_windows": active_windows,
             "scan_seconds": round(inference_seconds, 3),
             "regions": regions,

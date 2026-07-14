@@ -29,7 +29,9 @@ CPU_HIGH=${SAM_CONTINUOUS_CPU_HIGH:-85}
 CPU_EMERGENCY=${SAM_CONTINUOUS_CPU_EMERGENCY:-95}
 M2D_BACKLOG_HIGH=${SAM_CONTINUOUS_M2D_BACKLOG_HIGH:-64}
 ASR_BACKLOG_HIGH=${SAM_CONTINUOUS_ASR_BACKLOG_HIGH:-8}
-GPU_RESERVE_MB=${SAM_CONTINUOUS_GPU_RESERVE_MB:-12000}
+# The second faster-whisper task shares the already-loaded model and needs far less
+# than 12 GiB. Keep an 8 GiB guard for concurrent M2D source scans and model APIs.
+GPU_RESERVE_MB=${SAM_CONTINUOUS_GPU_RESERVE_MB:-8000}
 AUTOSCALE_COOLDOWN_SECONDS=${SAM_CONTINUOUS_AUTOSCALE_COOLDOWN_SECONDS:-60}
 AUTOSCALE_INTERVAL_SECONDS=${SAM_CONTINUOUS_AUTOSCALE_INTERVAL_SECONDS:-10}
 BASE_CLIPS_PER_VIDEO=${SAM_CONTINUOUS_BASE_CLIPS_PER_VIDEO:-16}
@@ -115,6 +117,9 @@ download_forever() {
   seed=$(test -s "$seed_file" && tr -dc '0-9' < "$seed_file" || date -u +%Y%m%d)
   while true; do
     local run_dir="$RUNS_DIR/run-$seed"
+    local next_seed=$((seed + 1))
+    local next_run_dir="$RUNS_DIR/run-$next_seed"
+    local prefetch_pid
     local scan_args=()
     if [[ "$SOURCE_SCAN_ENABLED" == "true" ]]; then
       scan_args=(
@@ -130,6 +135,23 @@ download_forever() {
         --yt-dlp-python "$PIPELINE_PYTHON"
       )
     fi
+    mkdir -p "$next_run_dir"
+    nice -n 15 "$PIPELINE_PYTHON" -m sam_audio_pipeline.youtube_random \
+      --output "$next_run_dir" \
+      --source dailymotion \
+      --profile cinematic \
+      --clip-seconds 30 \
+      --total 2000 \
+      --seed "$next_seed" \
+      --clips-per-video "$BASE_CLIPS_PER_VIDEO" \
+      --source-content-minutes-per-hour "$SOURCE_CONTENT_MINUTES_PER_HOUR" \
+      --max-clips-per-video "$MAX_DURATION_SCALED_CLIPS_PER_VIDEO" \
+      --query-count 500 \
+      --results-per-query 100 \
+      --search-workers "$SEARCH_WORKERS" \
+      --candidate-multiplier 1.8 \
+      --discover-only >"$next_run_dir/prefetch.log" 2>&1 &
+    prefetch_pid=$!
     nice -n 10 "$MODEL_PYTHON" -m sam_audio_pipeline.youtube_random \
       --output "$run_dir" \
       --source dailymotion \
@@ -148,7 +170,8 @@ download_forever() {
       --candidate-multiplier 1.8 \
       --max-attempts 40000 \
       "${scan_args[@]}" || true
-    seed=$((seed + 1))
+    wait "$prefetch_pid" || true
+    seed=$next_seed
     printf '%s\n' "$seed" > "$seed_file.tmp"
     mv "$seed_file.tmp" "$seed_file"
   done

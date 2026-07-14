@@ -5,7 +5,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sam_audio_pipeline.source_scanner import M2DSourceScanner, select_candidate_regions
+from sam_audio_pipeline.source_scanner import (
+    MAX_REGION_VOCAL_MUSIC_COVERAGE,
+    MIN_REGION_FOREGROUND_SPEECH_COVERAGE,
+    M2DSourceScanner,
+    region_passes_confidence_gate,
+    select_candidate_regions,
+)
 
 
 def test_proxy_creation_preserves_stereo_with_one_ffmpeg_thread(
@@ -86,6 +92,37 @@ def test_source_scan_rejects_vocal_music_regions() -> None:
     )
 
     assert regions == []
+
+
+def test_region_confidence_gate_requires_measured_foreground_speech_margin() -> None:
+    assert region_passes_confidence_gate(
+        {
+            "evidence": {
+                "foreground_speech_coverage": (
+                    MIN_REGION_FOREGROUND_SPEECH_COVERAGE
+                )
+            }
+        }
+    )
+    assert not region_passes_confidence_gate(
+        {
+            "evidence": {
+                "foreground_speech_coverage": (
+                    MIN_REGION_FOREGROUND_SPEECH_COVERAGE - 0.01
+                )
+            }
+        }
+    )
+    assert not region_passes_confidence_gate(
+        {
+            "evidence": {
+                "foreground_speech_coverage": (
+                    MIN_REGION_FOREGROUND_SPEECH_COVERAGE
+                ),
+                "vocal_music_coverage": MAX_REGION_VOCAL_MUSIC_COVERAGE + 0.01,
+            }
+        }
+    )
 
 
 def test_whole_source_stereo_metric_detects_dual_mono() -> None:

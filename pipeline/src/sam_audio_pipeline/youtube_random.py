@@ -1382,6 +1382,75 @@ def _inject_productive_catalog_sources(
     return augmented
 
 
+def _inject_cached_scan_sources(
+    candidates: list[dict[str, Any]],
+    cache_dir: Path,
+    guidance: dict[str, dict[str, Any]],
+    *,
+    clips_per_video: int,
+    source_content_minutes_per_hour: float | None,
+    max_clips_per_video: int,
+) -> list[dict[str, Any]]:
+    """Make unclaimed passing regions reusable even before a source is accepted."""
+    from .source_scanner import region_passes_confidence_gate
+
+    known = {str(item["video_id"]) for item in candidates}
+    augmented = list(candidates)
+    for path in cache_dir.glob("*.json"):
+        try:
+            scan = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        video_id = str(scan.get("video_id") or "")
+        if not video_id or video_id in known or not any(
+            region_passes_confidence_gate(region)
+            for region in (scan.get("regions") or [])
+        ):
+            continue
+        metadata = scan.get("source_metadata") or {}
+        duration = max(
+            MIN_SOURCE_DURATION_SECONDS,
+            float(scan.get("m2d_windows") or 0.0) + 1.0,
+        )
+        budget = (
+            source_clip_budget(
+                duration,
+                clip_seconds=CLIP_SECONDS,
+                base_clips=clips_per_video,
+                content_minutes_per_hour=source_content_minutes_per_hour,
+                max_clips=max_clips_per_video,
+            )
+            if source_content_minutes_per_hour is not None
+            else clips_per_video
+        )
+        if int(guidance.get(video_id, {}).get("accepted", 0)) >= budget:
+            continue
+        candidate = {
+            "candidate_id": f"{video_id}:scan-cache",
+            "video_id": video_id,
+            "source_url": f"https://www.dailymotion.com/video/{video_id}",
+            "source_platform": "dailymotion",
+            "title": metadata.get("title"),
+            "duration_seconds": duration,
+            "uploader": metadata.get("uploader"),
+            "search_query": metadata.get("search_query"),
+            "clip_start_seconds": 0.0,
+            "clip_end_seconds": CLIP_SECONDS,
+            "segment_index": 0,
+            "source_clip_budget": budget,
+            "selection": "cached_proxy_scan_reuse",
+            "mixture_bias": ["dialogue", "music", "environmental_sfx"],
+            "source_audio_rights": (
+                "Underlying media remains subject to its source terms."
+            ),
+        }
+        if not _candidate_allowed(candidate, profile="cinematic"):
+            continue
+        augmented.append(candidate)
+        known.add(video_id)
+    return augmented
+
+
 def _order_scanned_source_groups(
     groups: list[list[dict[str, Any]]],
     guidance: dict[str, dict[str, Any]],
@@ -1390,22 +1459,26 @@ def _order_scanned_source_groups(
 ) -> list[list[dict[str, Any]]]:
     """Use 70% proven-source exploitation while retaining 30% exploration."""
 
-    scan_priors = scan_priors or {"uploader": {}, "query": {}}
+    scan_priors = scan_priors or {"video": {}, "uploader": {}, "query": {}}
     content_priors = content_priors or {
         "uploader": {},
         "query": {},
         "global": {"acceptance": 0.5},
     }
 
-    def score(group: list[dict[str, Any]]) -> tuple[float, float, float]:
+    def score(group: list[dict[str, Any]]) -> tuple[float, float, float, float]:
         item = group[0]
         stats = guidance.get(str(item["video_id"]), {})
         scored = int(stats.get("scored", 0))
         accepted = int(stats.get("accepted", 0))
         posterior = (accepted + 1.0) / (scored + 10.0)
         duration = float(item.get("duration_seconds") or 0.0)
+        cached_regions = float(
+            scan_priors.get("video", {}).get(str(item["video_id"]), 0.0)
+        )
         return (
             posterior,
+            cached_regions,
             float(_cinematic_candidate_priority(item)),
             min(duration, MAX_SOURCE_DURATION_SECONDS),
         )
@@ -1414,32 +1487,44 @@ def _order_scanned_source_groups(
         group: list[dict[str, Any]],
     ) -> tuple[float, float, float]:
         item = group[0]
-        predictions = [
-            scan_priors.get("uploader", {}).get(
-                str(item.get("uploader") or "").strip().lower()
-            ),
-            scan_priors.get("query", {}).get(
-                str(item.get("search_query") or "").strip().lower()
-            ),
-        ]
-        known = [float(value) for value in predictions if value is not None]
-        predicted_regions = sum(known) / len(known) if known else 0.0
-        acceptance_predictions = [
-            content_priors.get("uploader", {}).get(
-                str(item.get("uploader") or "").strip().lower()
-            ),
-            content_priors.get("query", {}).get(
-                str(item.get("search_query") or "").strip().lower()
-            ),
-        ]
-        known_acceptance = [
-            float(value) for value in acceptance_predictions if value is not None
-        ]
-        predicted_acceptance = (
-            sum(known_acceptance) / len(known_acceptance)
-            if known_acceptance
-            else float(content_priors["global"]["acceptance"])
-        )
+        cached_regions = scan_priors.get("video", {}).get(str(item["video_id"]))
+        if cached_regions is not None:
+            predicted_regions = min(
+                float(MAX_SCAN_REGIONS_PER_ACQUISITION), float(cached_regions)
+            )
+        else:
+            predictions = [
+                scan_priors.get("uploader", {}).get(
+                    str(item.get("uploader") or "").strip().lower()
+                ),
+                scan_priors.get("query", {}).get(
+                    str(item.get("search_query") or "").strip().lower()
+                ),
+            ]
+            known = [float(value) for value in predictions if value is not None]
+            predicted_regions = sum(known) / len(known) if known else 0.0
+        stats = guidance.get(str(item["video_id"]), {})
+        scored = int(stats.get("scored", 0))
+        accepted = int(stats.get("accepted", 0))
+        if scored:
+            predicted_acceptance = (accepted + 1.0) / (scored + 10.0)
+        else:
+            acceptance_predictions = [
+                content_priors.get("uploader", {}).get(
+                    str(item.get("uploader") or "").strip().lower()
+                ),
+                content_priors.get("query", {}).get(
+                    str(item.get("search_query") or "").strip().lower()
+                ),
+            ]
+            known_acceptance = [
+                float(value) for value in acceptance_predictions if value is not None
+            ]
+            predicted_acceptance = (
+                sum(known_acceptance) / len(known_acceptance)
+                if known_acceptance
+                else float(content_priors["global"]["acceptance"])
+            )
         return (
             predicted_regions * predicted_acceptance,
             float(_cinematic_candidate_priority(item)),
@@ -1497,6 +1582,8 @@ def _load_source_scan_priors(
     cache_dir: Path, candidates: list[dict[str, Any]]
 ) -> dict[str, dict[str, float]]:
     """Learn uploader/query productivity from completed whole-source scans."""
+    from .source_scanner import region_passes_confidence_gate
+
     metadata = {str(item["video_id"]): item for item in candidates}
     aggregates: dict[str, dict[str, list[float]]] = {
         "uploader": {},
@@ -1505,16 +1592,24 @@ def _load_source_scan_priors(
     global_sources = 0
     global_regions = 0.0
     samples: list[tuple[dict[str, Any], float]] = []
+    video_regions: dict[str, float] = {}
     for path in cache_dir.glob("*.json"):
         try:
             scan = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        item = scan.get("source_metadata") or metadata.get(str(scan.get("video_id")))
+        video_id = str(scan.get("video_id") or "")
+        passing_regions = sum(
+            region_passes_confidence_gate(region)
+            for region in (scan.get("regions") or [])
+        )
+        if video_id:
+            video_regions[video_id] = float(passing_regions)
+        item = scan.get("source_metadata") or metadata.get(video_id)
         if not item:
             continue
         # Cap one unusually dense source so it cannot dominate a whole uploader.
-        reward = float(min(10, len(scan.get("regions") or [])))
+        reward = float(min(10, passing_regions))
         global_sources += 1
         global_regions += reward
         samples.append((item, reward))
@@ -1532,12 +1627,15 @@ def _load_source_scan_priors(
             aggregate[0] += 1.0
             aggregate[1] += reward
     return {
-        family: {
-            key: (total_reward + prior_strength * global_mean)
-            / (source_count + prior_strength)
-            for key, (source_count, total_reward) in values.items()
-        }
-        for family, values in aggregates.items()
+        "video": video_regions,
+        **{
+            family: {
+                key: (total_reward + prior_strength * global_mean)
+                / (source_count + prior_strength)
+                for key, (source_count, total_reward) in values.items()
+            }
+            for family, values in aggregates.items()
+        },
     }
 
 
@@ -1671,15 +1769,15 @@ def _remaining_scan_source_budget(
     source_budget: int,
     *,
     accepted_count: int,
-    accepted_starts: list[float],
+    attempted_starts: list[float],
     claimed_starts: list[float],
 ) -> int:
-    """Count accepted and in-flight claims once when enforcing source diversity."""
-    unmatched_claims = sum(
-        not any(abs(claimed - accepted) < 0.5 for accepted in accepted_starts)
+    """Count accepted clips and unresolved in-flight claims toward the budget."""
+    unresolved_claims = sum(
+        not any(abs(claimed - attempted) < 0.5 for attempted in attempted_starts)
         for claimed in claimed_starts
     )
-    return max(0, source_budget - accepted_count - unmatched_claims)
+    return max(0, source_budget - accepted_count - unresolved_claims)
 
 
 def _scan_group_has_remaining_work(
@@ -1689,7 +1787,7 @@ def _scan_group_has_remaining_work(
     guidance: dict[str, dict[str, Any]],
 ) -> bool:
     """Drop globally exhausted scan groups before they consume worker slots."""
-    from .source_scanner import load_cached_scan
+    from .source_scanner import load_cached_scan, region_passes_confidence_gate
 
     base = group[0]
     video_id = str(base["video_id"])
@@ -1710,7 +1808,7 @@ def _scan_group_has_remaining_work(
         _remaining_scan_source_budget(
             source_budget,
             accepted_count=accepted_count,
-            accepted_starts=accepted_starts,
+            attempted_starts=attempted_starts,
             claimed_starts=claimed_starts,
         )
         <= 0
@@ -1724,6 +1822,7 @@ def _scan_group_has_remaining_work(
             claimed_starts=claimed_starts,
         )
         for region in cached.get("regions", [])
+        if region_passes_confidence_gate(region)
     )
 
 
@@ -1736,7 +1835,11 @@ def acquire_scanned_source_group(
     guidance: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Scan one full source first, then extract only passing stereo regions."""
-    from .source_scanner import SCAN_POLICY_VERSION, load_cached_scan
+    from .source_scanner import (
+        SCAN_POLICY_VERSION,
+        load_cached_scan,
+        region_passes_confidence_gate,
+    )
 
     base = candidates[0]
     video_id = str(base["video_id"])
@@ -1754,7 +1857,7 @@ def acquire_scanned_source_group(
     remaining_budget = _remaining_scan_source_budget(
         source_budget,
         accepted_count=accepted_count,
-        accepted_starts=accepted_starts,
+        attempted_starts=attempted_starts,
         claimed_starts=cached_claims,
     )
     started = time.perf_counter()
@@ -1856,7 +1959,8 @@ def acquire_scanned_source_group(
             available = [
                 region
                 for region in cached.get("regions", [])
-                if _scan_region_available(
+                if region_passes_confidence_gate(region)
+                and _scan_region_available(
                     float(region["start_seconds"]),
                     attempted_starts=attempted_starts,
                     accepted_starts=accepted_starts,
@@ -2197,6 +2301,14 @@ def acquire_dataset(
             device=str(source_scan_config.get("device", "cuda")),
             batch_size=int(source_scan_config.get("batch_size", 128)),
         )
+        candidates = _inject_cached_scan_sources(
+            candidates,
+            scan_cache_dir,
+            guidance,
+            clips_per_video=clips_per_video,
+            source_content_minutes_per_hour=source_content_minutes_per_hour,
+            max_clips_per_video=max_clips_per_video,
+        )
     attempts_path = output_dir / "attempts.jsonl"
     attempts, attempted = _load_attempts(attempts_path, output_dir)
     accepted_count = len(_accepted(attempts, profile=profile))
@@ -2243,6 +2355,8 @@ def acquire_dataset(
             remaining_attempt_capacity -= len(selected)
     attempts_made = 0
     last_manifest_write = 0.0
+    last_logged_accepted = accepted_count
+    next_attempt_log = 100
     with attempts_path.open("a", encoding="utf-8") as attempt_log:
         with ThreadPoolExecutor(max_workers=download_workers) as executor:
             group_iterator = iter(limited_groups)
@@ -2327,12 +2441,18 @@ def acquire_dataset(
                             source=source,
                         )
                         last_manifest_write = checkpoint_time
-                    logger.info(
-                        "Accepted %d/%d after %d new attempts",
-                        accepted_count,
-                        total,
-                        attempts_made,
-                    )
+                    if (
+                        accepted_count != last_logged_accepted
+                        or attempts_made >= next_attempt_log
+                    ):
+                        logger.info(
+                            "Accepted %d/%d after %d new attempts",
+                            accepted_count,
+                            total,
+                            attempts_made,
+                        )
+                        last_logged_accepted = accepted_count
+                        next_attempt_log = attempts_made + 100
                     if (
                         scanner is not None
                         and successful_results > 0
@@ -2417,6 +2537,11 @@ def main() -> None:
     parser.add_argument("--m2d-batch-size", type=int, default=128)
     parser.add_argument("--yt-dlp-python", type=Path)
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument(
+        "--discover-only",
+        action="store_true",
+        help="Populate the reusable search candidate cache without downloading audio",
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
@@ -2461,6 +2586,31 @@ def main() -> None:
         return
     query_count = args.query_count or max(40, math.ceil(args.total * 0.4))
     max_attempts = args.max_attempts or math.ceil(args.total * 3.0)
+    if args.discover_only:
+        candidates = discover_candidates(
+            args.output,
+            seed=args.seed,
+            query_count=query_count,
+            results_per_query=args.results_per_query,
+            workers=args.search_workers,
+            minimum_candidates=math.ceil(args.total * args.candidate_multiplier),
+            profile=args.profile,
+            clips_per_video=clips_per_video,
+            source_content_minutes_per_hour=args.source_content_minutes_per_hour,
+            max_clips_per_video=args.max_clips_per_video,
+            source=args.source,
+        )
+        print(
+            json.dumps(
+                {
+                    "output": str(args.output),
+                    "seed": args.seed,
+                    "candidate_count": len(candidates),
+                },
+                indent=2,
+            )
+        )
+        return
     path = acquire_dataset(
         args.output,
         total=args.total,

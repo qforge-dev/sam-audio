@@ -639,6 +639,8 @@ def _cohort_funnel(
 
 
 def _source_scan_status(workspace: Path) -> dict[str, Any]:
+    from .source_scanner import region_passes_confidence_gate
+
     cache_dir = workspace / "source-scans"
     scanned = passing_sources = passing_regions = claimed_regions = 0
     quality_rejected = no_matches = timed_sources = 0
@@ -654,7 +656,11 @@ def _source_scan_status(workspace: Path) -> dict[str, Any]:
         except (json.JSONDecodeError, OSError):
             continue
         scanned += 1
-        regions = item.get("regions") or []
+        regions = [
+            region
+            for region in (item.get("regions") or [])
+            if region_passes_confidence_gate(region)
+        ]
         if regions:
             passing_sources += 1
         elif item.get("rejection_reasons"):

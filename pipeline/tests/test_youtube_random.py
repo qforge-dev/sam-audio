@@ -16,6 +16,7 @@ from sam_audio_pipeline.youtube_random import (
     _cinematic_candidate_priority,
     _dailymotion_search_page,
     _group_candidates_by_video,
+    _inject_cached_scan_sources,
     _load_source_scan_priors,
     _order_scanned_source_groups,
     _query_for_source,
@@ -91,11 +92,22 @@ def test_scan_budget_does_not_double_count_accepted_claims() -> None:
     remaining = _remaining_scan_source_budget(
         16,
         accepted_count=5,
-        accepted_starts=[0.0, 30.0, 60.0, 90.0, 120.0],
+        attempted_starts=[0.0, 30.0, 60.0, 90.0, 120.0],
         claimed_starts=[0.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0],
     )
 
     assert remaining == 9
+
+
+def test_completed_rejected_claims_do_not_consume_acceptance_budget() -> None:
+    remaining = _remaining_scan_source_budget(
+        16,
+        accepted_count=1,
+        attempted_starts=[0.0, 30.0, 60.0, 90.0, 120.0],
+        claimed_starts=[0.0, 30.0, 60.0, 90.0, 120.0],
+    )
+
+    assert remaining == 15
 
 
 def test_exhausted_cached_scan_group_is_removed_before_scheduling(
@@ -163,7 +175,20 @@ def test_scanned_source_order_learns_productive_uploaders(tmp_path: Path) -> Non
         },
     ]
     (cache / "good.json").write_text(
-        json.dumps({"video_id": "known-good", "regions": [{}] * 8})
+        json.dumps(
+            {
+                "video_id": "known-good",
+                "regions": [
+                    {
+                        "evidence": {
+                            "foreground_speech_coverage": 0.7,
+                            "vocal_music_coverage": 0.0,
+                        }
+                    }
+                ]
+                * 8,
+            }
+        )
     )
     (cache / "bad.json").write_text(
         json.dumps({"video_id": "known-bad", "regions": []})
@@ -191,6 +216,102 @@ def test_scanned_source_order_learns_productive_uploaders(tmp_path: Path) -> Non
     ordered = _order_scanned_source_groups(groups, {}, scan_priors=priors)
 
     assert ordered[0][0]["video_id"] == "new-good"
+
+
+def test_source_order_prefers_exact_cached_region_inventory() -> None:
+    groups = [
+        [{"video_id": "unscanned", "duration_seconds": 120}],
+        [{"video_id": "cached", "duration_seconds": 120}],
+    ]
+
+    ordered = _order_scanned_source_groups(
+        groups,
+        {},
+        scan_priors={
+            "video": {"cached": 8.0},
+            "uploader": {},
+            "query": {},
+        },
+    )
+
+    assert ordered[0][0]["video_id"] == "cached"
+
+
+def test_source_order_discount_cached_regions_that_failed_final_validation() -> None:
+    groups = [
+        [
+            {
+                "video_id": "dense-but-failing",
+                "uploader": "failed",
+                "duration_seconds": 120,
+            }
+        ],
+        [
+            {
+                "video_id": "unscanned",
+                "uploader": "promising",
+                "duration_seconds": 120,
+            }
+        ],
+    ]
+
+    ordered = _order_scanned_source_groups(
+        groups,
+        {"dense-but-failing": {"scored": 20, "accepted": 0}},
+        scan_priors={
+            "video": {"dense-but-failing": 40.0},
+            "uploader": {"promising": 4.0},
+            "query": {},
+        },
+        content_priors={
+            "uploader": {"promising": 0.5},
+            "query": {},
+            "global": {"acceptance": 0.5},
+        },
+    )
+
+    assert ordered[0][0]["video_id"] == "unscanned"
+
+
+def test_cached_passing_source_is_reintroduced_before_it_has_an_acceptance(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "dailymotion-cached.json").write_text(
+        json.dumps(
+            {
+                "video_id": "cached",
+                "m2d_windows": 600,
+                "source_metadata": {
+                    "title": "English Movie Scene HD",
+                    "uploader": "Movie Source",
+                    "search_query": "movie scene dialogue",
+                },
+                "regions": [
+                    {
+                        "start_seconds": 30.0,
+                        "evidence": {
+                            "foreground_speech_coverage": 0.7,
+                            "vocal_music_coverage": 0.0,
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    candidates = _inject_cached_scan_sources(
+        [],
+        cache,
+        {},
+        clips_per_video=16,
+        source_content_minutes_per_hour=10.0,
+        max_clips_per_video=60,
+    )
+
+    assert [item["video_id"] for item in candidates] == ["cached"]
+    assert candidates[0]["selection"] == "cached_proxy_scan_reuse"
 
 
 def test_source_order_optimizes_final_yield_not_only_m2d_regions() -> None:
