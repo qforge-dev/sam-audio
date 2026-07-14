@@ -8,6 +8,7 @@ import numpy as np
 
 from sam_audio_pipeline.youtube_random import (
     _candidate_allowed,
+    _group_candidates_by_video,
     _query_for_source,
     _sample_clip_starts,
     analyze_wav,
@@ -130,6 +131,24 @@ def test_cinematic_segment_sampling_is_reproducible_and_non_overlapping() -> Non
     assert all(
         right - left >= 12 for left, right in zip(first, first[1:], strict=False)
     )
+
+
+def test_dailymotion_work_is_grouped_by_video_without_reordering_clips() -> None:
+    candidates = [
+        {"video_id": "a", "candidate_id": "a:1"},
+        {"video_id": "b", "candidate_id": "b:1"},
+        {"video_id": "a", "candidate_id": "a:2"},
+    ]
+
+    assert _group_candidates_by_video(candidates, grouped=True) == [
+        [candidates[0], candidates[2]],
+        [candidates[1]],
+    ]
+    assert _group_candidates_by_video(candidates, grouped=False) == [
+        [candidates[0]],
+        [candidates[1]],
+        [candidates[2]],
+    ]
 
 
 def test_candidate_filter_rejects_short_live_and_pure_audio_results() -> None:

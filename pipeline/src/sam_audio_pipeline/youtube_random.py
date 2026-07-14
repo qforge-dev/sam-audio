@@ -681,6 +681,27 @@ def _download_json(stdout: str) -> dict[str, Any]:
     raise ValueError("yt-dlp did not emit download metadata")
 
 
+def _download_jsons(stdout: str) -> list[dict[str, Any]]:
+    values: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("id"):
+            values.append(value)
+    if not values:
+        raise ValueError("yt-dlp did not emit download metadata")
+    return values
+
+
+def _section_bounds(candidate: dict[str, Any]) -> tuple[float, float, float]:
+    start = float(candidate["clip_start_seconds"])
+    section_start = max(0.0, start - 5.0)
+    section_end = start + CLIP_SECONDS + 5.0
+    return section_start, section_end, start - section_start
+
+
 def _source_file(root: Path) -> Path:
     matches = [
         path
@@ -793,6 +814,74 @@ def _source_format(path: Path, info: dict[str, Any], client: str) -> dict[str, A
     }
 
 
+def _normalize_candidate_from_source(
+    candidate: dict[str, Any],
+    source: Path,
+    info: dict[str, Any],
+    retrieval_client: str,
+    output_dir: Path,
+    temporary_root: Path,
+    *,
+    started: float,
+) -> dict[str, Any]:
+    video_id = str(candidate["video_id"])
+    start = float(candidate["clip_start_seconds"])
+    _, _, trim_offset = _section_bounds(candidate)
+    destination = output_dir / "audio" / f"{video_id}_{round(start * 1000):010d}.wav"
+    normalized = temporary_root / f"clip-{video_id}-{round(start * 1000)}.wav"
+    result = {**candidate, "attempted_at": _now()}
+    source_format = _source_format(source, info, retrieval_client)
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-ss",
+            str(trim_offset),
+            "-i",
+            str(source),
+            "-t",
+            str(CLIP_SECONDS),
+            "-vn",
+            "-ac",
+            "2",
+            "-ar",
+            str(OUTPUT_SAMPLE_RATE),
+            "-acodec",
+            "pcm_s16le",
+            str(normalized),
+        ],
+        timeout=45,
+    )
+    metrics = analyze_wav(normalized)
+    rejections = quality_rejections(metrics, source_format)
+    result.update(
+        {
+            "source_format": source_format,
+            "quality_metrics": metrics,
+            "quality_rejections": rejections,
+        }
+    )
+    if rejections:
+        result["retrieval_status"] = "rejected"
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(normalized, destination)
+        result.update(
+            {
+                "retrieval_status": "success",
+                "local_path": str(destination.relative_to(output_dir)),
+                "sha256": sha256_file(destination),
+                "bytes": destination.stat().st_size,
+            }
+        )
+    result["processing_seconds"] = round(time.perf_counter() - started, 3)
+    return result
+
+
 def acquire_candidate(
     candidate: dict[str, Any],
     output_dir: Path,
@@ -800,14 +889,7 @@ def acquire_candidate(
     youtube_client: str = "auto",
 ) -> dict[str, Any]:
     started = time.perf_counter()
-    video_id = str(candidate["video_id"])
-    start = float(candidate["clip_start_seconds"])
-    # HLS section boundaries can begin several seconds after the requested time.
-    # A five-second handle keeps the normalized excerpt at exactly ten seconds.
-    section_start = max(0.0, start - 5.0)
-    section_end = start + CLIP_SECONDS + 5.0
-    trim_offset = start - section_start
-    destination = output_dir / "audio" / f"{video_id}_{round(start * 1000):010d}.wav"
+    section_start, section_end, _ = _section_bounds(candidate)
     result = {**candidate, "attempted_at": _now()}
     try:
         with tempfile.TemporaryDirectory(prefix="sam-source-random-") as temporary:
@@ -819,58 +901,16 @@ def acquire_candidate(
                 youtube_client=youtube_client,
             )
             info = _download_json(download.stdout)
-            source_format = _source_format(source, info, retrieval_client)
-            normalized = root / "clip.wav"
-            _run(
-                [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-nostdin",
-                    "-y",
-                    "-ss",
-                    str(trim_offset),
-                    "-i",
-                    str(source),
-                    "-t",
-                    str(CLIP_SECONDS),
-                    "-vn",
-                    "-ac",
-                    "2",
-                    "-ar",
-                    str(OUTPUT_SAMPLE_RATE),
-                    "-acodec",
-                    "pcm_s16le",
-                    str(normalized),
-                ],
-                timeout=45,
+            return _normalize_candidate_from_source(
+                candidate,
+                source,
+                info,
+                retrieval_client,
+                output_dir,
+                root,
+                started=started,
             )
-            metrics = analyze_wav(normalized)
-            rejections = quality_rejections(metrics, source_format)
-            result.update(
-                {
-                    "source_format": source_format,
-                    "quality_metrics": metrics,
-                    "quality_rejections": rejections,
-                }
-            )
-            if rejections:
-                result["retrieval_status"] = "rejected"
-            else:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                # /tmp and the dataset volume may be different filesystems.
-                shutil.move(normalized, destination)
-                result.update(
-                    {
-                        "retrieval_status": "success",
-                        "local_path": str(destination.relative_to(output_dir)),
-                        "sha256": sha256_file(destination),
-                        "bytes": destination.stat().st_size,
-                    }
-                )
     except Exception as error:
-        destination.unlink(missing_ok=True)
         result.update(
             {
                 "retrieval_status": "unavailable",
@@ -879,6 +919,128 @@ def acquire_candidate(
         )
     result["processing_seconds"] = round(time.perf_counter() - started, 3)
     return result
+
+
+def acquire_candidate_group(
+    candidates: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    youtube_client: str = "auto",
+) -> list[dict[str, Any]]:
+    """Retrieve multiple Dailymotion sections with one metadata session."""
+    if (
+        len(candidates) <= 1
+        or candidates[0].get("source_platform") != "dailymotion"
+    ):
+        return [
+            acquire_candidate(item, output_dir, youtube_client=youtube_client)
+            for item in candidates
+        ]
+    video_ids = {str(item["video_id"]) for item in candidates}
+    if len(video_ids) != 1:
+        raise ValueError("Grouped candidates must come from one video")
+    started = time.perf_counter()
+    results: list[dict[str, Any]] = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="sam-source-group-") as temporary:
+            root = Path(temporary)
+            command = [
+                sys.executable,
+                "-m",
+                "yt_dlp",
+                "--no-update",
+                "--quiet",
+                "--no-warnings",
+                "--no-playlist",
+                "--socket-timeout",
+                "20",
+                "--retries",
+                "2",
+                "--extractor-retries",
+                "2",
+            ]
+            for item in candidates:
+                section_start, section_end, _ = _section_bounds(item)
+                command.extend(
+                    [
+                        "--download-sections",
+                        f"*{section_start:.3f}-{section_end:.3f}",
+                    ]
+                )
+            command.extend(
+                [
+                    "--force-keyframes-at-cuts",
+                    "-f",
+                    (
+                        "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
+                        "bestaudio[acodec!=none]/best[acodec!=none]"
+                    ),
+                    "--print-json",
+                    "-o",
+                    str(root / "source-%(section_start)012.3f.%(ext)s"),
+                    str(candidates[0]["source_url"]),
+                ]
+            )
+            response = _run(command, timeout=60 + 20 * len(candidates))
+            info_by_start = {
+                round(float(info["section_start"]), 3): info
+                for info in _download_jsons(response.stdout)
+            }
+            for item in candidates:
+                section_start, _, _ = _section_bounds(item)
+                matches = list(root.glob(f"source-{section_start:012.3f}.*"))
+                try:
+                    info = info_by_start[round(section_start, 3)]
+                    if len(matches) != 1:
+                        raise ValueError(
+                            f"Expected one section for {section_start}, found {matches}"
+                        )
+                    results.append(
+                        _normalize_candidate_from_source(
+                            item,
+                            matches[0],
+                            info,
+                            "dailymotion-grouped",
+                            output_dir,
+                            root,
+                            started=started,
+                        )
+                    )
+                except Exception as error:
+                    results.append(
+                        {
+                            **item,
+                            "attempted_at": _now(),
+                            "retrieval_status": "unavailable",
+                            "error": f"{type(error).__name__}: {error}",
+                            "processing_seconds": round(
+                                time.perf_counter() - started, 3
+                            ),
+                        }
+                    )
+    except Exception as error:
+        return [
+            {
+                **item,
+                "attempted_at": _now(),
+                "retrieval_status": "unavailable",
+                "error": f"{type(error).__name__}: {error}",
+                "processing_seconds": round(time.perf_counter() - started, 3),
+            }
+            for item in candidates
+        ]
+    return results
+
+
+def _group_candidates_by_video(
+    candidates: list[dict[str, Any]], *, grouped: bool
+) -> list[list[dict[str, Any]]]:
+    if not grouped:
+        return [[item] for item in candidates]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in candidates:
+        groups.setdefault(str(item["video_id"]), []).append(item)
+    return list(groups.values())
 
 
 def _candidate_key(item: dict[str, Any]) -> str:
@@ -1068,21 +1230,37 @@ def acquire_dataset(
         total,
         len(pending),
     )
+    work_groups = _group_candidates_by_video(
+        pending,
+        grouped=(source == "dailymotion" and clips_per_video > 1),
+    )
     attempts_made = 0
     with attempts_path.open("a", encoding="utf-8") as attempt_log:
         with ThreadPoolExecutor(max_workers=download_workers) as executor:
-            for offset in range(0, len(pending), download_workers):
+            for offset in range(0, len(work_groups), download_workers):
                 if accepted_count >= total or attempts_made >= max_attempts:
                     break
-                batch = pending[offset : offset + download_workers]
-                results = list(
+                capacity = max_attempts - attempts_made
+                batch: list[list[dict[str, Any]]] = []
+                for group in work_groups[offset : offset + download_workers]:
+                    if capacity <= 0:
+                        break
+                    selected = group[:capacity]
+                    batch.append(selected)
+                    capacity -= len(selected)
+                grouped_results = list(
                     executor.map(
-                        lambda item: acquire_candidate(
-                            item, output_dir, youtube_client=youtube_client
+                        lambda group: acquire_candidate_group(
+                            group, output_dir, youtube_client=youtube_client
                         ),
                         batch,
                     )
                 )
+                results = [
+                    result
+                    for group_results in grouped_results
+                    for result in group_results
+                ]
                 for result in results:
                     attempts_made += 1
                     if (
