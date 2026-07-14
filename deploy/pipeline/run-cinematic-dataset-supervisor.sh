@@ -63,7 +63,7 @@ score_batch() {
 try_materialize() {
   local args=()
   local seed
-  for seed in 20260715 20260716 20260717; do
+  for seed in 20260715 20260716 20260717 20260718 20260719; do
     local batch_dir="/home/ubuntu/cinematic-dm-raw-$seed"
     if [[ -s "$batch_dir/m2d-validation.jsonl" && -s "$batch_dir/asr-validation.jsonl" ]]; then
       args+=(--batch "$batch_dir")
@@ -88,7 +88,7 @@ if try_materialize; then
   exit 0
 fi
 
-for seed in 20260716 20260717; do
+for seed in 20260716 20260717 20260718 20260719; do
   acquire_batch "$seed"
   score_batch "/home/ubuntu/cinematic-dm-raw-$seed"
   if try_materialize; then
@@ -96,5 +96,5 @@ for seed in 20260716 20260717; do
   fi
 done
 
-echo "Three acquisition batches did not yield 1,000 final clips" >&2
+echo "Five acquisition batches did not yield 1,000 final clips" >&2
 exit 1
