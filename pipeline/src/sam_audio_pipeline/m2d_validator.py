@@ -42,11 +42,14 @@ WINDOW_HOP_SECONDS = 1.0
 MIN_WINDOW_PROBABILITY = 0.004
 MAX_ACTIVE_RANK = 15
 MIN_SPEECH_WINDOWS = 3
+MIN_STRONG_SPEECH_PROBABILITY = 0.10
+MAX_STRONG_SPEECH_RANK = 5
+MIN_STRONG_SPEECH_WINDOWS = 5
 MIN_BACKGROUND_WINDOWS = 4
 MIN_OVERLAP_WINDOWS = 3
 MAX_VOCAL_MUSIC_WINDOWS = 1
 TOP_LABELS = 8
-POLICY_VERSION = "spoken_dialogue_instrumental_background_m2d_v2"
+POLICY_VERSION = "spoken_dialogue_instrumental_background_m2d_v3"
 
 
 def _now() -> str:
@@ -146,6 +149,10 @@ def evaluate_probabilities(
             evidence["speech"][0] >= MIN_WINDOW_PROBABILITY
             and evidence["speech"][1] <= MAX_ACTIVE_RANK
         )
+        strong_speech_active = (
+            evidence["speech"][0] >= MIN_STRONG_SPEECH_PROBABILITY
+            and evidence["speech"][1] <= MAX_STRONG_SPEECH_RANK
+        )
         background_active = (
             evidence["background"][0] >= MIN_WINDOW_PROBABILITY
             and evidence["background"][1] <= MAX_ACTIVE_RANK
@@ -172,6 +179,7 @@ def evaluate_probabilities(
                 "vocal_music_score": round(evidence["vocal_music"][0], 8),
                 "vocal_music_rank": evidence["vocal_music"][1],
                 "speech_active": speech_active,
+                "strong_speech_active": strong_speech_active,
                 "background_active": background_active,
                 "vocal_music_active": vocal_music_active,
                 "overlap_active": speech_active and background_active,
@@ -187,6 +195,7 @@ def evaluate_probabilities(
         )
 
     speech_windows = sum(item["speech_active"] for item in windows)
+    strong_speech_windows = sum(item["strong_speech_active"] for item in windows)
     background_windows = sum(item["background_active"] for item in windows)
     overlap_windows = sum(item["overlap_active"] for item in windows)
     vocal_music_windows = sum(item["vocal_music_active"] for item in windows)
@@ -208,6 +217,8 @@ def evaluate_probabilities(
     rejections: list[str] = []
     if speech_windows < MIN_SPEECH_WINDOWS:
         rejections.append("insufficient_speech")
+    if strong_speech_windows < MIN_STRONG_SPEECH_WINDOWS:
+        rejections.append("insufficient_strong_speech")
     if background_windows < MIN_BACKGROUND_WINDOWS:
         rejections.append("insufficient_background")
     if overlap_windows < MIN_OVERLAP_WINDOWS:
@@ -222,10 +233,12 @@ def evaluate_probabilities(
         "background_bucket": background_bucket,
         "window_count": window_count,
         "speech_active_windows": speech_windows,
+        "strong_speech_active_windows": strong_speech_windows,
         "background_active_windows": background_windows,
         "overlap_active_windows": overlap_windows,
         "vocal_music_active_windows": vocal_music_windows,
         "speech_coverage": round(speech_windows / window_count, 6),
+        "strong_speech_coverage": round(strong_speech_windows / window_count, 6),
         "background_coverage": round(background_windows / window_count, 6),
         "overlap_coverage": round(overlap_windows / window_count, 6),
         "vocal_music_coverage": round(vocal_music_windows / window_count, 6),
@@ -292,6 +305,9 @@ def score_directory(args: argparse.Namespace) -> None:
         "minimum_window_probability": MIN_WINDOW_PROBABILITY,
         "maximum_active_rank": MAX_ACTIVE_RANK,
         "minimum_speech_windows": MIN_SPEECH_WINDOWS,
+        "minimum_strong_speech_probability": MIN_STRONG_SPEECH_PROBABILITY,
+        "maximum_strong_speech_rank": MAX_STRONG_SPEECH_RANK,
+        "minimum_strong_speech_windows": MIN_STRONG_SPEECH_WINDOWS,
         "minimum_background_windows": MIN_BACKGROUND_WINDOWS,
         "minimum_overlap_windows": MIN_OVERLAP_WINDOWS,
         "maximum_vocal_music_windows": MAX_VOCAL_MUSIC_WINDOWS,
@@ -322,25 +338,72 @@ def score_directory(args: argparse.Namespace) -> None:
     logger.info("Wrote %d new validation records to %s", processed, args.output)
 
 
-def materialize_accepted(args: argparse.Namespace) -> None:
-    results = [
-        json.loads(line)
-        for line in args.results.read_text().splitlines()
-        if line.strip()
-    ]
-    accepted = [item for item in results if item.get("accepted")]
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    audio_dir = args.output_dir / "audio"
-    audio_dir.mkdir(exist_ok=True)
-    for result in accepted:
-        source = args.input_dir / result["filename"]
-        destination = audio_dir / result["filename"]
+def _enforce_current_voice_gate(result: dict[str, Any]) -> dict[str, Any]:
+    """Apply the strong-voice gate to current and legacy M2D results."""
+    result = dict(result)
+    windows = []
+    for source in result.get("windows", []):
+        window = dict(source)
+        window["strong_speech_active"] = (
+            float(window.get("speech_score", 0.0))
+            >= MIN_STRONG_SPEECH_PROBABILITY
+            and int(window.get("speech_rank", 10_000)) <= MAX_STRONG_SPEECH_RANK
+        )
+        windows.append(window)
+    strong_speech_windows = sum(
+        bool(window["strong_speech_active"]) for window in windows
+    )
+    strong_voice_present = strong_speech_windows >= MIN_STRONG_SPEECH_WINDOWS
+    reasons = list(dict.fromkeys(result.get("rejection_reasons", [])))
+    if not strong_voice_present and "insufficient_strong_speech" not in reasons:
+        reasons.append("insufficient_strong_speech")
+    previous_policy = result.get("policy")
+    result.update(
+        {
+            "accepted": bool(result.get("accepted")) and strong_voice_present,
+            "policy": POLICY_VERSION,
+            "rejection_reasons": reasons,
+            "strong_speech_active_windows": strong_speech_windows,
+            "strong_speech_coverage": round(
+                strong_speech_windows / max(1, len(windows)), 6
+            ),
+            "windows": windows,
+        }
+    )
+    if previous_policy and previous_policy != POLICY_VERSION:
+        result["policy_migrated_from"] = previous_policy
+    return result
+
+
+def _materialize_audio(
+    input_dir: Path, output_dir: Path, selected: list[dict[str, Any]]
+) -> None:
+    output_dir.mkdir(exist_ok=True)
+    selected_names = {item["filename"] for item in selected}
+    for stale in output_dir.glob("*.wav"):
+        if stale.name not in selected_names:
+            stale.unlink()
+    for result in selected:
+        source = input_dir / result["filename"]
+        destination = output_dir / result["filename"]
         if destination.exists():
             continue
         try:
             os.link(source, destination)
         except OSError:
             shutil.copy2(source, destination)
+
+
+def materialize_accepted(args: argparse.Namespace) -> None:
+    results = [
+        _enforce_current_voice_gate(json.loads(line))
+        for line in args.results.read_text().splitlines()
+        if line.strip()
+    ]
+    accepted = [item for item in results if item.get("accepted")]
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir = args.output_dir / "audio"
+    _materialize_audio(args.input_dir, audio_dir, accepted)
 
     music_led = [
         item for item in accepted if item["background_bucket"] == "music_led"
@@ -352,16 +415,7 @@ def materialize_accepted(args: argparse.Namespace) -> None:
     balanced = music_led[:balance_size] + nonmusic_led[:balance_size]
     balanced.sort(key=lambda item: item["filename"])
     balanced_dir = args.output_dir / "balanced-audio"
-    balanced_dir.mkdir(exist_ok=True)
-    for result in balanced:
-        source = args.input_dir / result["filename"]
-        destination = balanced_dir / result["filename"]
-        if destination.exists():
-            continue
-        try:
-            os.link(source, destination)
-        except OSError:
-            shutil.copy2(source, destination)
+    _materialize_audio(args.input_dir, balanced_dir, balanced)
 
     source_manifest = json.loads(args.source_manifest.read_text())
     source_by_name = {
@@ -428,7 +482,10 @@ def materialize_accepted(args: argparse.Namespace) -> None:
     audit["balanced_audio_files"] = len(list(balanced_dir.glob("*.wav")))
     audit["balanced_listening_subset"] = manifest["balanced_listening_subset"]
     (args.output_dir / "audit.json").write_text(json.dumps(audit, indent=2) + "\n")
-    shutil.copy2(args.results, args.output_dir / "m2d-validation.jsonl")
+    normalized_results = "".join(
+        json.dumps(result, separators=(",", ":")) + "\n" for result in results
+    )
+    (args.output_dir / "m2d-validation.jsonl").write_text(normalized_results)
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -248,6 +248,13 @@ subset with equal music-led and non-music-led counts. Every record keeps the
 per-window scores, ranks, top labels, temporal coverage, rejection reasons,
 exact M2D checkpoint hash, and validator policy version.
 
+Policy v3 requires audible voice evidence in at least five 2-second windows:
+the M2D speech-family probability must be at least `0.10` and rank within the
+top five labels in each counted window. This strong gate is separate from the
+older low-confidence speech diagnostic and rejects clips tagged as speech only
+because of weak background evidence. Materializing an older M2D JSONL applies
+the v3 voice gate from its stored per-window scores without rerunning the model.
+
 ### Manual listening review
 
 Start the local review app on the balanced M2D subset:
@@ -266,7 +273,7 @@ or **Not OK**. Not OK supports multiple reasons: lacking music, lacking
 background audio/SFX, singing or vocal music, speech that is not dialogue, low
 quality, low volume, distortion/clipping, wrong voice/background balance, or an
 Other reason with a required note. Keyboard shortcuts are shown in the app.
-Press `X` to open Not OK, `1`–`9` to toggle its rejection reasons, `Enter`
+Press `X` to open Not OK, `1`–`9`/`0` to toggle its rejection reasons, `Enter`
 to save, or `Esc` to cancel. This keeps multi-reason tagging keyboard-only.
 
 Progress is written atomically after every decision to

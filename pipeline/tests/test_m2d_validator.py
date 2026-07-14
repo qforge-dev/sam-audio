@@ -47,6 +47,13 @@ def test_evaluate_probabilities_requires_temporal_overlap():
     assert result["accepted"] is False
     assert "insufficient_dialogue_background_overlap" in result["rejection_reasons"]
 
+    weak_false_positive = np.asarray([[0.02, 0.50, 0.47, 0.01]] * 9)
+    result = evaluate_probabilities(weak_false_positive, labels, families)
+    assert result["speech_active_windows"] == 9
+    assert result["strong_speech_active_windows"] == 0
+    assert result["accepted"] is False
+    assert "insufficient_strong_speech" in result["rejection_reasons"]
+
 
 def test_load_label_families_uses_ontology_descendants(tmp_path: Path):
     labels = tmp_path / "labels.csv"
@@ -89,11 +96,16 @@ def _wav(path: Path) -> None:
         destination.writeframes(b"\0\0\0\0" * 16)
 
 
+def _strong_voice_windows() -> list[dict[str, float | int]]:
+    return [{"speech_score": 0.5, "speech_rank": 1} for _ in range(9)]
+
+
 def test_materialize_preserves_source_and_links_only_accepted(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
     _wav(source / "ok.wav")
     _wav(source / "no.wav")
+    _wav(source / "weak.wav")
     results = tmp_path / "results.jsonl"
     results.write_text(
         "\n".join(
@@ -104,6 +116,7 @@ def test_materialize_preserves_source_and_links_only_accepted(tmp_path: Path):
                         "accepted": True,
                         "background_bucket": "music_led",
                         "rejection_reasons": [],
+                        "windows": _strong_voice_windows(),
                     }
                 ),
                 json.dumps(
@@ -112,16 +125,30 @@ def test_materialize_preserves_source_and_links_only_accepted(tmp_path: Path):
                         "accepted": True,
                         "background_bucket": "effects_ambience_led",
                         "rejection_reasons": [],
+                        "windows": _strong_voice_windows(),
                     }
                 ),
-                json.dumps(
-                    {
-                        "filename": "no.wav",
+                    json.dumps(
+                        {
+                            "filename": "no.wav",
                         "accepted": False,
                         "background_bucket": "music_led",
                         "rejection_reasons": ["insufficient_speech"],
-                    }
-                ),
+                            "windows": [],
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "filename": "weak.wav",
+                            "accepted": True,
+                            "background_bucket": "music_led",
+                            "rejection_reasons": [],
+                            "windows": [
+                                {"speech_score": 0.02, "speech_rank": 10}
+                                for _ in range(9)
+                            ],
+                        }
+                    ),
             ]
         )
         + "\n"
@@ -134,12 +161,15 @@ def test_materialize_preserves_source_and_links_only_accepted(tmp_path: Path):
                     {"local_path": "audio/ok.wav"},
                     {"local_path": "audio/ok-effects.wav"},
                     {"local_path": "audio/no.wav"},
+                    {"local_path": "audio/weak.wav"},
                 ]
             }
         )
     )
     _wav(source / "ok-effects.wav")
     output = tmp_path / "accepted"
+    (output / "audio").mkdir(parents=True)
+    _wav(output / "audio" / "stale.wav")
     materialize_accepted(
         Namespace(
             input_dir=source,
@@ -152,6 +182,8 @@ def test_materialize_preserves_source_and_links_only_accepted(tmp_path: Path):
     assert (source / "no.wav").exists()
     assert (output / "audio" / "ok.wav").exists()
     assert not (output / "audio" / "no.wav").exists()
+    assert not (output / "audio" / "weak.wav").exists()
+    assert not (output / "audio" / "stale.wav").exists()
     audit = json.loads((output / "audit.json").read_text())
     assert audit["accepted_record_count"] == 2
     assert audit["balanced_audio_files"] == 2

@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, field_validator
 
 Decision = Literal["good", "perfect", "not_ok"]
 Reason = Literal[
+    "lacking_voice",
     "lacking_music",
     "lacking_background_audio",
     "vocal_music",
@@ -192,6 +193,7 @@ class ReviewStore:
             "source_url": record.get("source_url"),
             "background_bucket": validation.get("background_bucket"),
             "speech_coverage": validation.get("speech_coverage"),
+            "strong_speech_coverage": validation.get("strong_speech_coverage"),
             "background_coverage": validation.get("background_coverage"),
             "overlap_coverage": validation.get("overlap_coverage"),
             "vocal_music_coverage": validation.get("vocal_music_coverage"),
@@ -231,6 +233,7 @@ class ReviewStore:
                     "active_reviewers": active_reviewers,
                 },
                 "reason_labels": {
+                    "lacking_voice": "Lacking voice / dialogue",
                     "lacking_music": "Lacking music",
                     "lacking_background_audio": "Lacking background audio / SFX",
                     "vocal_music": "Singing or vocal music",

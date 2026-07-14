@@ -166,7 +166,7 @@
           <div class="bad-panel" id="badPanel">
             <h3>What disqualifies this clip?</h3>
             <div class="reason-grid" id="reasonGrid"></div>
-            <div class="bad-shortcuts">Press 1–9 to toggle reasons · Enter to save · Esc to cancel</div>
+            <div class="bad-shortcuts">Press 1–9 or 0 to toggle reasons · Enter to save · Esc to cancel</div>
             <textarea id="note" placeholder="Other reason or useful detail for improving the pipeline…"></textarea>
             <div class="bad-actions">
               <button class="nav-btn" id="cancelBad">Cancel · Esc</button>
@@ -178,7 +178,7 @@
             <button class="nav-btn" id="skipBtn">Skip · random next →</button>
             <label class="auto"><input type="checkbox" id="autoPlay" checked> Play next automatically</label>
           </div>
-          <div class="shortcut">Shortcuts: Space play/pause · G good · P perfect · X not OK · 1–9 reasons · Enter save · → random next</div>
+          <div class="shortcut">Shortcuts: Space play/pause · G good · P perfect · X not OK · 1–9/0 reasons · Enter save · → random next</div>
         </div>
       </main>
     </div>
@@ -251,7 +251,8 @@
       await refreshState();
       $('datasetName').textContent = `${app.state.dataset.name} · ${app.state.summary.total} clips`;
       Object.entries(app.state.reason_labels).forEach(([key, label], index) => {
-        $('reasonGrid').insertAdjacentHTML('beforeend', `<label class="reason"><input type="checkbox" value="${key}"><span>${esc(label)}</span><kbd>${index + 1}</kbd></label>`);
+        const shortcut = index === 9 ? '0' : String(index + 1);
+        $('reasonGrid').insertAdjacentHTML('beforeend', `<label class="reason"><input type="checkbox" value="${key}"><span>${esc(label)}</span><kbd>${shortcut}</kbd></label>`);
       });
       const buckets = [...new Set(app.state.clips.map(c => c.background_bucket).filter(Boolean))].sort();
       for (const bucket of buckets) $('bucketFilter').insertAdjacentHTML('beforeend', `<option value="${esc(bucket)}">${esc(bucket.replaceAll('_', ' '))}</option>`);
@@ -317,7 +318,7 @@
       $('clipTitle').textContent = clip.title || 'Untitled source clip';
       $('clipFilename').textContent = clip.filename;
       $('bucketText').textContent = (clip.background_bucket || '').replaceAll('_', ' ');
-      $('metrics').innerHTML = `<span>speech ${pct(clip.speech_coverage)}</span><span>background ${pct(clip.background_coverage)}</span><span>overlap ${pct(clip.overlap_coverage)}</span>`;
+      $('metrics').innerHTML = `<span>strong voice ${pct(clip.strong_speech_coverage)}</span><span>background ${pct(clip.background_coverage)}</span><span>overlap ${pct(clip.overlap_coverage)}</span>`;
       $('chips').innerHTML = clip.top_labels.map(label => `<span class="chip">${esc(label)}</span>`).join('');
       $('audio').src = api(`/api/audio/${encodeURIComponent(clip.filename)}`);
       const canReview = !clip.review && isMine(clip);
@@ -464,9 +465,10 @@
       document.addEventListener('keydown', event => {
         if (['INPUT','TEXTAREA','SELECT'].includes(event.target.tagName)) return;
         const badPanelOpen = $('badPanel').classList.contains('open');
-        if (badPanelOpen && /^[1-9]$/.test(event.key)) {
+        if (badPanelOpen && /^[0-9]$/.test(event.key)) {
           event.preventDefault();
-          const reason = document.querySelectorAll('#reasonGrid input')[Number(event.key) - 1];
+          const reasonIndex = event.key === '0' ? 9 : Number(event.key) - 1;
+          const reason = document.querySelectorAll('#reasonGrid input')[reasonIndex];
           if (reason) reason.checked = !reason.checked;
           return;
         }
