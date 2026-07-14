@@ -166,6 +166,45 @@ Dashboard state is encoded in clean paths and is safe to refresh or share:
 Selecting a tab, job, dataset, or sound updates browser history. Back and
 forward navigation restore the corresponding view and selected record.
 
+## General YouTube random datasets
+
+This sampler searches YouTube directly and does not read AudioSet manifests or
+timestamps. Randomized, reproducible queries favor program audio containing
+voices, music, and environmental effects while excluding obvious music-only,
+sleep, ambience, and playlist results. Each video ID contributes at most one
+clip.
+
+```bash
+cd pipeline
+uv run sam-pipeline-youtube-random \
+  --output ~/Downloads/youtube-random-1000-20260714 \
+  --total 1000 \
+  --seed 20260714 \
+  --query-count 400 \
+  --results-per-query 15 \
+  --search-workers 8 \
+  --download-workers 8 \
+  --candidate-multiplier 2 \
+  --max-attempts 2500
+```
+
+Acquisition is resumable. `attempts.jsonl` records every accepted, rejected, or
+unavailable candidate; `metadata/candidates.json` and `metadata/search.json`
+preserve search provenance; `manifest.json` contains only accepted records and
+hashes. `audit.json` is written only after reopening and verifying the complete
+dataset. The gate requires source audio at 44.1 kHz or better and at least 120
+kbps, then verifies exact ten-second PCM16/48 kHz stereo output, real left/right
+difference, loudness, silent-frame/run limits, clipping, uniqueness, and SHA-256.
+
+Re-run the same command to continue an interrupted build. Audit an existing set
+without downloading:
+
+```bash
+uv run sam-pipeline-youtube-random \
+  --output ~/Downloads/youtube-random-1000-20260714 \
+  --total 1000 --verify-only
+```
+
 ## AudioSet validation batches
 
 Acquire a reproducible random sample from the official AudioSet segment CSVs.

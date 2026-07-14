@@ -93,6 +93,19 @@ data** dashboard. Each original also reports mono/stereo layout, codec/container
 sample rate, bit depth, bitrate, and a lossless/lossy quality tier. The direct
 model ZIP API remains unchanged.
 
+A separate resumable sampler can build private, mix-biased datasets directly
+from general YouTube search (not AudioSet). It downloads only a short source
+section, produces an exact ten-second PCM16/48 kHz stereo WAV, and rejects low
+source bitrate/sample rate, duplicated mono, quiet or silent audio, clipping,
+and duration errors:
+
+```bash
+cd pipeline
+uv run sam-pipeline-youtube-random \
+  --output ~/Downloads/youtube-random-1000-20260714 \
+  --total 1000 --seed 20260714
+```
+
 Generation, prompt, batching, and TF32 policy are configured with the
 `SAM_AUDIO_*` environment variables demonstrated in
 [`deploy/start-sam-audio-api.sh`](deploy/start-sam-audio-api.sh). A supplied

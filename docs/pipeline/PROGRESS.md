@@ -38,6 +38,9 @@ was an example batch size, not a workflow limit.
   facts, with an idempotent historical backfill.
 - [x] Give pipeline, review, dataset, job, and source dashboard states durable
   URLs with refresh and browser-history restoration.
+- [x] Add a resumable general-YouTube (non-AudioSet) sampler with deterministic
+  discovery, exact ten-second cuts, stereo/source-quality/silence gates,
+  per-attempt provenance, hashes, and a full-dataset verifier.
 - [x] Require stereo input, gate SAM targets with source-scene presence, support
   single-stage inference, and use identity pass-through for pure SFX sources.
 - [x] Add persistent datasets, successive upload jobs, and reconciliation of
