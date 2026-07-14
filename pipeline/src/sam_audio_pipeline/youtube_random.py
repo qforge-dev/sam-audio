@@ -52,7 +52,7 @@ MIN_SOURCE_DURATION_SECONDS = 30.0
 MIN_DISCOVERY_SOURCE_DURATION_SECONDS = 2 * 60.0
 MAX_SOURCE_DURATION_SECONDS = 12 * 3600.0
 CANDIDATE_DURATION_POLICY = "source_duration_2m_to_12h_v3"
-DAILYMOTION_SEARCH_POLICY = "seeded_relevance_pages_1_to_10_hd_v3"
+DAILYMOTION_SEARCH_POLICY = "seeded_relevance_pages_1_to_10_gameplay_v4"
 YTDLP_PYTHON = sys.executable
 SILENCE_THRESHOLD_DBFS = -55.0
 MIN_RMS_DBFS = -35.0
@@ -193,6 +193,17 @@ CINEMATIC_SOURCES = (
     "animated series clip",
     "video game cutscene",
     "game cinematic scene",
+    "gameplay story mode",
+    "gameplay walkthrough",
+    "RPG gameplay",
+    "open world gameplay",
+    "adventure game gameplay",
+    "horror game gameplay",
+    "crime series episode",
+    "science fiction series episode",
+    "drama series episode",
+    "animated episode",
+    "web series episode",
     "short film scene",
     "news package",
 )
@@ -212,6 +223,15 @@ CINEMATIC_SCENES = (
     "comedy dialogue",
     "crowd scene dialogue",
     "workplace dialogue",
+    "NPC conversation",
+    "mission dialogue",
+    "combat dialogue",
+    "party banter",
+    "quest dialogue",
+    "radio dialogue",
+    "in game dialogue",
+    "exploration dialogue",
+    "environmental dialogue",
 )
 
 CINEMATIC_AUDIO_HINTS = (
@@ -220,6 +240,26 @@ CINEMATIC_AUDIO_HINTS = (
     "dialogue HD",
     "soundtrack scene",
     "cinematic sound",
+    "English gameplay",
+    "English story",
+    "English episode",
+)
+
+CINEMATIC_BROAD_QUERIES = (
+    "gameplay",
+    "game walkthrough",
+    "story mode",
+    "NPC dialogue",
+    "mission dialogue",
+    "party banter",
+    "game cutscene",
+    "game movie",
+    "full episode",
+    "TV series episode",
+    "animated episode",
+    "web series",
+    "movie scene",
+    "short film",
 )
 
 CINEMATIC_TITLE_TERMS = (
@@ -229,6 +269,10 @@ CINEMATIC_TITLE_TERMS = (
     "short film",
     "cutscene",
     "cinematic",
+    "gameplay",
+    "walkthrough",
+    "story mode",
+    "game movie",
     "tv series",
     "episode",
     "news package",
@@ -341,6 +385,11 @@ CINEMATIC_PRIORITY_WEIGHTS = (
     ("movie clip", 8),
     ("movie scene", 7),
     ("cinematic", 6),
+    ("story mode", 7),
+    ("game movie", 6),
+    ("gameplay", 5),
+    ("walkthrough", 4),
+    ("npc", 4),
     ("full episode", 5),
     ("short film", 5),
     ("animated", 4),
@@ -377,6 +426,18 @@ def _run(command: list[str], *, timeout: float) -> subprocess.CompletedProcess[s
     )
 
 
+def _exception_text(error: Exception) -> str:
+    summary = f"{type(error).__name__}: {error}"
+    if not isinstance(error, subprocess.CalledProcessError):
+        return summary
+    output = "\n".join(
+        part.strip() for part in (error.stdout, error.stderr) if part and part.strip()
+    )
+    if len(output) > 2_000:
+        output = output[-2_000:]
+    return f"{summary}: {output}" if output else summary
+
+
 def _permanent_media_error(error: subprocess.CalledProcessError) -> bool:
     message = f"{error.stdout or ''}\n{error.stderr or ''}".lower()
     return any(
@@ -385,6 +446,8 @@ def _permanent_media_error(error: subprocess.CalledProcessError) -> bool:
             "not found",
             "video has been deleted",
             "private video",
+            "private content",
+            "no video formats found",
             "no longer available",
             "this video is unavailable",
         )
@@ -398,15 +461,24 @@ def build_queries(seed: int, count: int, *, profile: str = "general") -> list[st
     seen: set[str] = set()
     while len(queries) < count:
         if profile == "cinematic":
-            query = " ".join(
-                (
-                    generator.choice(CINEMATIC_SOURCES),
-                    generator.choice(CINEMATIC_SCENES),
-                    generator.choice(CINEMATIC_AUDIO_HINTS),
-                    "English",
-                    CINEMATIC_SEARCH_EXCLUSIONS,
+            if generator.random() < 0.4:
+                query = " ".join(
+                    (
+                        generator.choice(CINEMATIC_BROAD_QUERIES),
+                        generator.choice(("English", "HD", "dialogue", "story")),
+                        CINEMATIC_SEARCH_EXCLUSIONS,
+                    )
                 )
-            )
+            else:
+                query = " ".join(
+                    (
+                        generator.choice(CINEMATIC_SOURCES),
+                        generator.choice(CINEMATIC_SCENES),
+                        generator.choice(CINEMATIC_AUDIO_HINTS),
+                        "English",
+                        CINEMATIC_SEARCH_EXCLUSIONS,
+                    )
+                )
         else:
             query = " ".join(
                 (
@@ -1632,7 +1704,7 @@ def _current_proxy_asr(scan: dict[str, Any]) -> dict[str, Any] | None:
 
 def _proxy_asr_blocks_extraction(scan: dict[str, Any]) -> bool:
     probe = _current_proxy_asr(scan)
-    return bool(probe and probe.get("enforced") and probe.get("accepted") is False)
+    return bool(probe and probe.get("enforced") and probe.get("accepted") is not True)
 
 
 def _proxy_asr_from_guidance(stats: dict[str, Any]) -> dict[str, Any] | None:
@@ -1990,10 +2062,14 @@ def _scan_region_available(
     attempted_starts: list[float],
     accepted_starts: list[float],
     claimed_starts: list[float],
+    clip_seconds: float | None = None,
 ) -> bool:
+    separation_seconds = CLIP_SECONDS if clip_seconds is None else clip_seconds
     return (
         not any(abs(start - value) < 0.5 for value in attempted_starts)
-        and not any(abs(start - value) < CLIP_SECONDS for value in accepted_starts)
+        and not any(
+            abs(start - value) < separation_seconds for value in accepted_starts
+        )
         and not any(abs(start - value) < 0.5 for value in claimed_starts)
     )
 
@@ -2018,6 +2094,7 @@ def _scan_group_has_remaining_work(
     *,
     cache_dir: Path,
     guidance: dict[str, dict[str, Any]],
+    clip_seconds: float | None = None,
 ) -> bool:
     """Drop globally exhausted scan groups before they consume worker slots."""
     from .source_scanner import load_cached_scan, region_passes_confidence_gate
@@ -2029,8 +2106,9 @@ def _scan_group_has_remaining_work(
     accepted_starts = [float(value) for value in stats.get("accepted_starts", [])]
     accepted_count = int(stats.get("accepted", 0))
     source_budget = int(base.get("source_clip_budget") or len(group))
+    effective_clip_seconds = CLIP_SECONDS if clip_seconds is None else clip_seconds
     cached = load_cached_scan(
-        _scan_cache_path(cache_dir, base), clip_seconds=CLIP_SECONDS
+        _scan_cache_path(cache_dir, base), clip_seconds=effective_clip_seconds
     )
     if cached is None:
         return accepted_count < source_budget
@@ -2053,6 +2131,7 @@ def _scan_group_has_remaining_work(
             attempted_starts=attempted_starts,
             accepted_starts=accepted_starts,
             claimed_starts=claimed_starts,
+            clip_seconds=effective_clip_seconds,
         )
         for region in cached.get("regions", [])
         if region_passes_confidence_gate(region)
@@ -2070,6 +2149,7 @@ def acquire_scanned_source_group(
     proxy_asr_request_dir: Path | None = None,
     proxy_asr_result_dir: Path | None = None,
     proxy_asr_timeout_seconds: float = 120.0,
+    defer_claim_commit: bool = False,
 ) -> list[dict[str, Any]]:
     """Serialize scan/claim mutations for one source across producer processes."""
     lock_path = _scan_cache_path(cache_dir, candidates[0]).with_suffix(".lock")
@@ -2089,6 +2169,7 @@ def acquire_scanned_source_group(
             proxy_asr_request_dir=proxy_asr_request_dir,
             proxy_asr_result_dir=proxy_asr_result_dir,
             proxy_asr_timeout_seconds=proxy_asr_timeout_seconds,
+            defer_claim_commit=defer_claim_commit,
         )
 
 
@@ -2103,6 +2184,7 @@ def _acquire_scanned_source_group_locked(
     proxy_asr_request_dir: Path | None = None,
     proxy_asr_result_dir: Path | None = None,
     proxy_asr_timeout_seconds: float = 120.0,
+    defer_claim_commit: bool = False,
 ) -> list[dict[str, Any]]:
     """Scan one full source first, then extract only passing stereo regions."""
     from .source_scanner import (
@@ -2341,9 +2423,6 @@ def _acquire_scanned_source_group_locked(
             extraction_download_seconds = (
                 time.perf_counter() - extraction_download_started
             )
-            selected_starts = [float(region["start_seconds"]) for region in available]
-            cached["claimed_starts"] = sorted(set(claimed_starts + selected_starts))
-            _atomic_json(cache_path, cached)
             results: list[dict[str, Any]] = []
             for index, region in enumerate(available):
                 start = float(region["start_seconds"])
@@ -2396,10 +2475,22 @@ def _acquire_scanned_source_group_locked(
                             ),
                         }
                     )
+            attempted_region_starts = [
+                float(result["clip_start_seconds"])
+                for result in results
+                if result.get("selection") == "whole_source_proxy_scan"
+                and result.get("retrieval_status")
+                in {"success", "rejected", "unavailable"}
+            ]
+            if not defer_claim_commit:
+                cached["claimed_starts"] = sorted(
+                    set(claimed_starts + attempted_region_starts)
+                )
+                _atomic_json(cache_path, cached)
             return results
     except Exception as error:
         return status_result(
-            "source_scan_unavailable", error=f"{type(error).__name__}: {error}"
+            "source_scan_unavailable", error=_exception_text(error)
         )
 
 

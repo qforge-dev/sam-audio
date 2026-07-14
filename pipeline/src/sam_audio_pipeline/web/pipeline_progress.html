@@ -80,6 +80,8 @@
     <div class="section-head" id="strategyHeading" hidden><div><h2>Scan-before-extract experiment</h2><p>Only the post-deployment cohort is used here, so the old random sampler cannot hide the result.</p></div></div>
     <section class="funnel" id="strategy" hidden></section>
     <section class="funnel" id="sourceScans" hidden></section>
+    <div class="section-head" id="sourceFrontierHeading" hidden><div><h2>Independent source stages</h2><p>Persistent leased queues keep discovery, transfer, scanning, and extraction moving separately.</p></div></div>
+    <section class="funnel" id="sourceFrontier" hidden></section>
     <section class="funnel" id="funnel"></section>
     <section class="funnel" id="queues"></section>
     <div class="section-head" id="autoscalerHeading" hidden><div><h2>Adaptive worker control</h2><p>Queue pressure and aggregate host resources determine live concurrency limits.</p></div></div>
@@ -188,6 +190,30 @@
             ].map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
           } else {
             $('strategyHeading').hidden = true; $('strategy').hidden = true; $('sourceScans').hidden = true;
+          }
+          const frontier = data.source_frontier || {};
+          if (frontier.enabled) {
+            const counts = frontier.counts || {};
+            const ages = frontier.oldest_ready_minutes || {};
+            const stages = frontier.stages || {};
+            const sourceWorkers = frontier.workers || [];
+            const healthySourceWorkers = sourceWorkers.filter(worker => worker.state === 'running').length;
+            const stageText = stage => {
+              const item = stages[stage] || {};
+              const p95 = item.duration_p95_seconds == null ? 'collecting latency' : `p95 ${Number(item.duration_p95_seconds).toFixed(1)} s`;
+              return `${Number(item.active_per_minute || 0).toFixed(2)} work/min · ${p95} · ${number(item.active_events)} work / ${number(item.events)} total events`;
+            };
+            $('sourceFrontierHeading').hidden = false;
+            $('sourceFrontier').hidden = false;
+            $('sourceFrontier').innerHTML = [
+              ['Ready to download', number(counts.discovered), ages.discovered == null ? 'No ready source' : `oldest ${Number(ages.discovered).toFixed(1)} min · ${stageText('download')}`],
+              ['Ready to scan', number(counts.downloaded), `${(Number(frontier.downloaded_queue_bytes || 0) / 1073741824).toFixed(2)} GiB queued · ${ages.downloaded == null ? stageText('scan') : `oldest ${Number(ages.downloaded).toFixed(1)} min · ${stageText('scan')}`}`],
+              ['Ready to extract', number(counts.scanned), ages.scanned == null ? stageText('extract') : `oldest ${Number(ages.scanned).toFixed(1)} min · ${stageText('extract')}`],
+              ['Source terminal', `${number(counts.complete)} / ${number(counts.rejected)}`, `complete / rejected · ${number(healthySourceWorkers)}/${number(sourceWorkers.length)} stage workers healthy`]
+            ].map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
+          } else {
+            $('sourceFrontierHeading').hidden = true;
+            $('sourceFrontier').hidden = true;
           }
           const metrics = [
             ['downloaded','Lifetime downloaded','Passed stereo/source quality'],

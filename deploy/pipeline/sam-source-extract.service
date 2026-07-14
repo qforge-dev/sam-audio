@@ -1,0 +1,19 @@
+[Unit]
+Description=Independent full-quality source clip extractor
+After=network-online.target sam-source-scan.service sam-cinematic-continuous.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
+EnvironmentFile=/etc/sam-cinematic-continuous.env
+ExecStart=/home/ubuntu/sam-audio-deploy/deploy/pipeline/run-source-extract.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

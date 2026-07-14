@@ -42,6 +42,7 @@ SOURCE_SCAN_ENABLED=${SAM_CONTINUOUS_SOURCE_SCAN_ENABLED:-true}
 SOURCE_SCAN_BATCH_SIZE=${SAM_CONTINUOUS_SOURCE_SCAN_BATCH_SIZE:-128}
 SOURCE_ASR_PROBE_MODE=${SAM_CONTINUOUS_SOURCE_ASR_PROBE_MODE:-enforce}
 SOURCE_ASR_PROBE_TIMEOUT=${SAM_CONTINUOUS_SOURCE_ASR_PROBE_TIMEOUT:-120}
+STAGED_ACQUISITION=${SAM_CONTINUOUS_STAGED_ACQUISITION:-false}
 
 for value in "$DOWNLOAD_WORKERS" "$ACQUISITION_PRODUCERS" "$SEARCH_WORKERS" "$M2D_WORKERS" "$ASR_WORKERS" "$UPLOAD_CONCURRENCY"; do
   if (( value < 1 )); then
@@ -202,9 +203,11 @@ shutdown() {
 trap shutdown TERM INT EXIT
 
 heartbeat_loop downloader &
-for ((index=0; index<ACQUISITION_PRODUCERS; index++)); do
-  restart_worker downloader download_forever "$index" &
-done
+if [[ "$STAGED_ACQUISITION" != "true" ]]; then
+  for ((index=0; index<ACQUISITION_PRODUCERS; index++)); do
+    restart_worker downloader download_forever "$index" &
+  done
+fi
 
 heartbeat_loop promoter &
 restart_worker promoter "$PIPELINE_PYTHON" -m sam_audio_pipeline.continuous_dataset \

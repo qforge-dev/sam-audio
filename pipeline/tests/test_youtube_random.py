@@ -140,7 +140,6 @@ def test_exhausted_cached_scan_group_is_removed_before_scheduling(
             }
         )
     )
-
     assert not _scan_group_has_remaining_work(group, cache_dir=cache, guidance={})
     assert (
         _scan_group_has_remaining_work(
@@ -151,6 +150,34 @@ def test_exhausted_cached_scan_group_is_removed_before_scheduling(
         is False
     )
 
+
+def test_remaining_work_uses_explicit_clip_duration_for_cache(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    group = [
+        {
+            "video_id": "thirty-second-scene",
+            "source_platform": "dailymotion",
+            "source_clip_budget": 16,
+        }
+    ]
+    (cache / "dailymotion-thirty-second-scene.json").write_text(
+        json.dumps(
+            {
+                "policy": "whole_source_proxy_m2d_v1",
+                "clip_seconds": 30.0,
+                "claimed_starts": [30.0],
+                "regions": [{"start_seconds": 30.0}],
+            }
+        )
+    )
+
+    assert not _scan_group_has_remaining_work(
+        group,
+        cache_dir=cache,
+        guidance={},
+        clip_seconds=30.0,
+    )
 
 def test_unseen_scan_group_is_kept_for_exploration(tmp_path: Path) -> None:
     group = [
@@ -227,6 +254,12 @@ def test_only_permanent_media_failures_are_negatively_cached() -> None:
     )
 
     assert _permanent_media_error(missing)
+    assert _permanent_media_error(
+        subprocess.CalledProcessError(1, ["yt-dlp"], stderr="Private content")
+    )
+    assert _permanent_media_error(
+        subprocess.CalledProcessError(1, ["yt-dlp"], stderr="No video formats found")
+    )
     assert not _permanent_media_error(transient)
 
 
@@ -254,9 +287,17 @@ def test_only_enforced_proxy_asr_rejection_blocks_extraction() -> None:
             "enforced": True,
         }
     }
+    inconclusive = {
+        "proxy_asr": {
+            "policy": "source_proxy_asr_top3_beam1_v1",
+            "accepted": None,
+            "enforced": True,
+        }
+    }
 
     assert not _proxy_asr_blocks_extraction(shadow)
     assert _proxy_asr_blocks_extraction(enforced)
+    assert _proxy_asr_blocks_extraction(inconclusive)
 
 
 def test_scanned_source_order_learns_productive_uploaders(tmp_path: Path) -> None:
@@ -479,15 +520,37 @@ def test_cinematic_queries_and_metadata_filter_target_raw_scenes() -> None:
 
     assert all("-reaction" in query and "-Bollywood" in query for query in queries)
     assert all(
-        any(
-            hint in query for hint in ("English", "dialogue", "soundtrack", "cinematic")
-        )
+            any(
+                hint in query
+                for hint in (
+                    "English",
+                    "HD",
+                    "dialogue",
+                    "soundtrack",
+                    "cinematic",
+                    "story",
+                )
+            )
         for query in queries
     )
     assert all(
         any(
-            kind in query
-            for kind in ("scene", "clip", "cutscene", "short film", "package")
+                kind in query
+                for kind in (
+                    "scene",
+                    "clip",
+                    "cutscene",
+                    "short film",
+                    "package",
+                    "gameplay",
+                    "episode",
+                    "dialogue",
+                    "banter",
+                    "story mode",
+                    "walkthrough",
+                    "game movie",
+                    "web series",
+                )
         )
         for query in queries
     )
@@ -740,6 +803,15 @@ def test_candidate_filter_accepts_long_form_sources_with_a_safety_ceiling() -> N
     }
 
     assert _candidate_allowed(long_game)
+    assert _candidate_allowed(long_game, profile="cinematic")
+    assert _candidate_allowed(
+        {**long_game, "title": "RPG Story Mode Walkthrough English"},
+        profile="cinematic",
+    )
+    assert not _candidate_allowed(
+        {**long_game, "title": "Gameplay Review and Analysis"},
+        profile="cinematic",
+    )
     assert not _candidate_allowed(
         {**long_game, "duration": MAX_SOURCE_DURATION_SECONDS + 1}
     )

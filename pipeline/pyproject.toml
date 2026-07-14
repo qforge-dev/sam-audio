@@ -24,6 +24,7 @@ sam-pipeline-audio-profile-backfill = "sam_audio_pipeline.audio_profile:main"
 sam-pipeline-youtube-random = "sam_audio_pipeline.youtube_random:main"
 sam-pipeline-m2d-validate = "sam_audio_pipeline.m2d_validator:main"
 sam-pipeline-review = "sam_audio_pipeline.review_app:main"
+sam-pipeline-source = "sam_audio_pipeline.source_pipeline:main"
 sam-audio-flamingo-api = "sam_audio_pipeline.flamingo_api:main"
 
 [dependency-groups]

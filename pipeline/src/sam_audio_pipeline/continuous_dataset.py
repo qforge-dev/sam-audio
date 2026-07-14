@@ -766,6 +766,8 @@ def progress_snapshot(
     throughput_window_minutes: float = 60.0,
     target_hours: float = 10_000.0,
 ) -> dict[str, Any]:
+    from .source_frontier import frontier_snapshot
+
     connection = connect(workspace)
     counts = pipeline_counts(connection)
     workers = []
@@ -1051,6 +1053,9 @@ def progress_snapshot(
         "throughput": throughput,
         "throughput_windows": throughput_windows,
         "strategy": strategy,
+        "source_frontier": frontier_snapshot(
+            workspace, window_minutes=min(15.0, throughput_window_minutes)
+        ),
         "goal": {
             "target_audio_hours": target_hours,
             "current_audio_hours": round(current_hours, 4),

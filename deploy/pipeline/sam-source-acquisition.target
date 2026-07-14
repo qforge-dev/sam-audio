@@ -1,0 +1,7 @@
+[Unit]
+Description=Independent cinematic source acquisition pipeline
+Wants=sam-source-discovery.service sam-source-download.service sam-source-scan.service sam-source-extract.service sam-source-autoscale.service
+After=network-online.target sam-cinematic-continuous.service
+
+[Install]
+WantedBy=multi-user.target

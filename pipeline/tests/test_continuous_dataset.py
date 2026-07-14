@@ -254,6 +254,7 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
     assert snapshot["snapshot_sequence_end"] == 1
     assert len(snapshot["records"]) == 1
     progress = progress_snapshot(workspace)
+    assert progress["source_frontier"]["enabled"] is False
     assert progress["counts"]["downloaded"] == 1
     assert progress["counts"]["accepted"] == 1
     assert progress["counts"]["rejected_total"] == 0
