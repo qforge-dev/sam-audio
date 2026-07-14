@@ -1,0 +1,16 @@
+[Unit]
+Description=Acquire and validate the 1000-clip cinematic audio dataset
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
+ExecStart=/home/ubuntu/sam-audio-deploy/deploy/pipeline/run-cinematic-dataset-supervisor.sh
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
