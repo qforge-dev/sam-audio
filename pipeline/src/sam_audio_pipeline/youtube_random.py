@@ -251,6 +251,9 @@ CINEMATIC_EXCLUDED_TERMS = (
     "whatsapp status",
     "backsound",
     "behind the scenes",
+    "english sub",
+    "englishsub",
+    "multi sub",
     "bollywood",
     "hindi",
     "tamil",
@@ -272,6 +275,16 @@ CINEMATIC_EXCLUDED_TERMS = (
     "mammootty",
     "vijayakanth",
     "mohanlal",
+    "prabhas",
+    "mass entry",
+    "dhanush",
+    "vadivelu",
+    "adithya tv",
+    "hera pheri",
+    "paresh raval",
+    "manipuri",
+    "nepali movie",
+    "auzaar",
     "ajay devgan",
     "sunny deol",
     "sanjay dutt",
@@ -497,9 +510,25 @@ def discover_candidates(
             and int(search_metadata.get("clips_per_video", 1)) == clips_per_video
             and search_metadata.get("source", "youtube") == source
         )
-        if compatible and len(existing) >= minimum_candidates:
-            logger.info("Reusing %d discovered candidates", len(existing))
-            return existing
+        if compatible:
+            filtered = [
+                item for item in existing if _candidate_allowed(item, profile=profile)
+            ]
+            if len(filtered) >= minimum_candidates:
+                if len(filtered) != len(existing):
+                    logger.info(
+                        "Removed %d cached candidates under the current "
+                        "metadata policy",
+                        len(existing) - len(filtered),
+                    )
+                    candidates_path.write_text(json.dumps(filtered, indent=2) + "\n")
+                    search_metadata["unique_candidates"] = len(filtered)
+                    search_metadata["metadata_policy_refiltered_at"] = _now()
+                    search_path.write_text(
+                        json.dumps(search_metadata, indent=2) + "\n"
+                    )
+                logger.info("Reusing %d discovered candidates", len(filtered))
+                return filtered
 
     queries = build_queries(seed, query_count, profile=profile)
     found: dict[str, dict[str, Any]] = {}

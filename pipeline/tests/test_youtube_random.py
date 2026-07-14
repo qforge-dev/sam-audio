@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import wave
 from pathlib import Path
@@ -14,6 +15,7 @@ from sam_audio_pipeline.youtube_random import (
     _use_full_source_for_group,
     analyze_wav,
     build_queries,
+    discover_candidates,
     quality_rejections,
 )
 
@@ -102,6 +104,16 @@ def test_cinematic_queries_and_metadata_filter_target_raw_scenes() -> None:
         },
         profile="cinematic",
     )
+    for title in (
+        "Battle Through The Heavens Episode 152 English Sub",
+        "Prabhas Mass Entry Scene",
+        "Raghuvaran Scene - Dhanush Dialogue",
+        "Hera Pheri Paresh Raval Comedy Scene",
+    ):
+        assert not _candidate_allowed(
+            {"id": title, "title": title, "duration": 180},
+            profile="cinematic",
+        )
 
 
 def test_non_youtube_search_removes_negative_query_tokens() -> None:
@@ -170,6 +182,54 @@ def test_dailymotion_work_is_grouped_by_video_without_reordering_clips() -> None
         [candidates[1]],
         [candidates[2]],
     ]
+
+
+def test_cached_candidates_are_refiltered_under_current_metadata_policy(
+    tmp_path: Path,
+) -> None:
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    candidates = [
+        {
+            "candidate_id": "good:1",
+            "video_id": "good",
+            "title": "English Movie Scene",
+            "duration_seconds": 180,
+        },
+        {
+            "candidate_id": "subbed:1",
+            "video_id": "subbed",
+            "title": "Movie Scene English Sub",
+            "duration_seconds": 180,
+        },
+    ]
+    (metadata / "candidates.json").write_text(json.dumps(candidates))
+    (metadata / "search.json").write_text(
+        json.dumps(
+            {
+                "profile": "cinematic",
+                "clips_per_video": 48,
+                "source": "dailymotion",
+            }
+        )
+    )
+
+    filtered = discover_candidates(
+        tmp_path,
+        seed=1,
+        query_count=1,
+        results_per_query=1,
+        workers=1,
+        minimum_candidates=1,
+        profile="cinematic",
+        clips_per_video=48,
+        source="dailymotion",
+    )
+
+    assert [item["video_id"] for item in filtered] == ["good"]
+    assert json.loads((metadata / "search.json").read_text())[
+        "unique_candidates"
+    ] == 1
 
 
 def test_candidate_filter_rejects_short_live_and_pure_audio_results() -> None:
