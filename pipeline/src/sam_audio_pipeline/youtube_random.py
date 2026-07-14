@@ -705,6 +705,17 @@ def _section_bounds(candidate: dict[str, Any]) -> tuple[float, float, float]:
     return section_start, section_end, start - section_start
 
 
+def _use_full_source_for_group(candidates: list[dict[str, Any]]) -> bool:
+    """Prefer one source transfer when section requests cover much of the video."""
+    if not candidates:
+        return False
+    duration = float(candidates[0].get("duration_seconds") or 0.0)
+    if duration <= 0:
+        return False
+    requested_with_padding = len(candidates) * (CLIP_SECONDS + 10.0)
+    return requested_with_padding / duration >= 0.4
+
+
 def _source_file(root: Path) -> Path:
     matches = [
         path
@@ -826,10 +837,16 @@ def _normalize_candidate_from_source(
     temporary_root: Path,
     *,
     started: float,
+    source_start_seconds: float | None = None,
 ) -> dict[str, Any]:
     video_id = str(candidate["video_id"])
     start = float(candidate["clip_start_seconds"])
-    _, _, trim_offset = _section_bounds(candidate)
+    if source_start_seconds is None:
+        _, _, trim_offset = _section_bounds(candidate)
+    else:
+        trim_offset = start - source_start_seconds
+        if trim_offset < 0:
+            raise ValueError("Candidate starts before the downloaded source")
     destination = output_dir / "audio" / f"{video_id}_{round(start * 1000):010d}.wav"
     normalized = temporary_root / f"clip-{video_id}-{round(start * 1000)}.wav"
     result = {**candidate, "attempted_at": _now()}
@@ -962,51 +979,82 @@ def acquire_candidate_group(
                 "--extractor-retries",
                 "2",
             ]
-            for item in candidates:
-                section_start, section_end, _ = _section_bounds(item)
+            use_full_source = _use_full_source_for_group(candidates)
+            if use_full_source:
                 command.extend(
                     [
-                        "--download-sections",
-                        f"*{section_start:.3f}-{section_end:.3f}",
+                        "-f",
+                        (
+                            "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
+                            "bestaudio[acodec!=none]/best[acodec!=none]"
+                        ),
+                        "--print-json",
+                        "-o",
+                        str(root / "source.%(ext)s"),
+                        str(candidates[0]["source_url"]),
                     ]
                 )
-            command.extend(
-                [
-                    "--force-keyframes-at-cuts",
-                    "-f",
-                    (
-                        "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
-                        "bestaudio[acodec!=none]/best[acodec!=none]"
-                    ),
-                    "--print-json",
-                    "-o",
-                    str(root / "source-%(section_start)012.3f.%(ext)s"),
-                    str(candidates[0]["source_url"]),
-                ]
-            )
-            response = _run(command, timeout=60 + 20 * len(candidates))
-            info_by_start = {
-                round(float(info["section_start"]), 3): info
-                for info in _download_jsons(response.stdout)
-            }
+                response = _run(command, timeout=600)
+                full_source = _source_file(root)
+                full_info = _download_json(response.stdout)
+                info_by_start: dict[float, dict[str, Any]] = {}
+            else:
+                for item in candidates:
+                    section_start, section_end, _ = _section_bounds(item)
+                    command.extend(
+                        [
+                            "--download-sections",
+                            f"*{section_start:.3f}-{section_end:.3f}",
+                        ]
+                    )
+                command.extend(
+                    [
+                        "--force-keyframes-at-cuts",
+                        "-f",
+                        (
+                            "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
+                            "bestaudio[acodec!=none]/best[acodec!=none]"
+                        ),
+                        "--print-json",
+                        "-o",
+                        str(root / "source-%(section_start)012.3f.%(ext)s"),
+                        str(candidates[0]["source_url"]),
+                    ]
+                )
+                response = _run(command, timeout=60 + 20 * len(candidates))
+                info_by_start = {
+                    round(float(info["section_start"]), 3): info
+                    for info in _download_jsons(response.stdout)
+                }
             for item in candidates:
                 section_start, _, _ = _section_bounds(item)
-                matches = list(root.glob(f"source-{section_start:012.3f}.*"))
                 try:
-                    info = info_by_start[round(section_start, 3)]
-                    if len(matches) != 1:
-                        raise ValueError(
-                            f"Expected one section for {section_start}, found {matches}"
-                        )
+                    if use_full_source:
+                        source = full_source
+                        info = full_info
+                        retrieval_client = "dailymotion-grouped-full"
+                        source_start_seconds = 0.0
+                    else:
+                        matches = list(root.glob(f"source-{section_start:012.3f}.*"))
+                        info = info_by_start[round(section_start, 3)]
+                        if len(matches) != 1:
+                            raise ValueError(
+                                "Expected one section for "
+                                f"{section_start}, found {matches}"
+                            )
+                        source = matches[0]
+                        retrieval_client = "dailymotion-grouped"
+                        source_start_seconds = None
                     results.append(
                         _normalize_candidate_from_source(
                             item,
-                            matches[0],
+                            source,
                             info,
-                            "dailymotion-grouped",
+                            retrieval_client,
                             output_dir,
                             root,
                             started=started,
+                            source_start_seconds=source_start_seconds,
                         )
                     )
                 except Exception as error:

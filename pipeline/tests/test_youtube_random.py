@@ -11,6 +11,7 @@ from sam_audio_pipeline.youtube_random import (
     _group_candidates_by_video,
     _query_for_source,
     _sample_clip_starts,
+    _use_full_source_for_group,
     analyze_wav,
     build_queries,
     quality_rejections,
@@ -142,6 +143,14 @@ def test_long_cinematic_sources_can_supply_many_distinct_excerpts() -> None:
     assert all(
         right - left >= 12 for left, right in zip(starts, starts[1:], strict=False)
     )
+
+
+def test_group_download_uses_one_full_transfer_when_sections_cover_source() -> None:
+    dense = [{"duration_seconds": 220}] * 11
+    sparse = [{"duration_seconds": 3600}] * 48
+
+    assert _use_full_source_for_group(dense) is True
+    assert _use_full_source_for_group(sparse) is False
 
 
 def test_dailymotion_work_is_grouped_by_video_without_reordering_clips() -> None:
