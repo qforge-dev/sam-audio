@@ -163,6 +163,12 @@ def test_progress_dashboard_reports_live_pipeline_funnel(tmp_path: Path):
     assert "Dataset Pipeline Progress" in client.get("/progress").text
     payload = client.get("/api/progress").json()
     assert payload["stage"] == "downloading"
+    assert payload["active_stages"] == ["acquisition", "m2d", "speech"]
+    assert payload["batches"][0]["workers"] == {
+        "acquisition": "running",
+        "m2d": "running",
+        "speech": "running",
+    }
     assert payload["totals"] == {
         "attempts": 3,
         "downloaded": 3,
@@ -174,6 +180,13 @@ def test_progress_dashboard_reports_live_pipeline_funnel(tmp_path: Path):
     }
     assert payload["final"]["materialized"] == 1
     assert payload["review_snapshot"]["materialized"] == 2
+
+    (final_dir / "audit.json").write_text(
+        json.dumps({"record_count": 1000, "all_requirements_pass": True})
+    )
+    completed = client.get("/api/progress").json()
+    assert completed["stage"] == "complete"
+    assert completed["active_stages"] == []
 
     with (batch / "attempts.jsonl").open("a") as destination:
         destination.write("{}\n")

@@ -9,6 +9,7 @@ import numpy as np
 
 from sam_audio_pipeline.m2d_validator import (
     _m2d_asr_allowlist,
+    _M2DAllowlistTail,
     evaluate_asr,
     evaluate_probabilities,
     load_label_families,
@@ -100,8 +101,7 @@ def test_evaluate_probabilities_requires_temporal_overlap():
     assert "vocal_music_present" in result["rejection_reasons"]
 
     disjoint = np.asarray(
-        [[0.80, 0.001, 0.001, 0.001]] * 4
-        + [[0.001, 0.50, 0.40, 0.001]] * 5
+        [[0.80, 0.001, 0.001, 0.001]] * 4 + [[0.001, 0.50, 0.40, 0.001]] * 5
     )
     result = evaluate_probabilities(disjoint, labels, families)
     assert result["accepted"] is False
@@ -227,12 +227,46 @@ def test_asr_allowlist_contains_only_current_m2d_passes(tmp_path: Path) -> None:
         )
     )
 
-    allowed, scored_count = _m2d_asr_allowlist(
-        results, require_cinematic_mix=False
-    )
+    allowed, scored_count = _m2d_asr_allowlist(results, require_cinematic_mix=False)
 
     assert allowed == {"pass.wav"}
     assert scored_count == 2
+
+
+def test_m2d_allowlist_tail_incrementally_consumes_appended_results(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "m2d.jsonl"
+    results.write_text("")
+    tail = _M2DAllowlistTail(results, require_cinematic_mix=False)
+    assert tail.refresh() == (set(), 0)
+
+    with results.open("a") as destination:
+        destination.write(
+            json.dumps(
+                {
+                    "filename": "pass.wav",
+                    "accepted": True,
+                    "rejection_reasons": [],
+                    "windows": _strong_voice_windows(),
+                }
+            )
+            + "\n"
+        )
+        destination.write(
+            json.dumps(
+                {
+                    "filename": "fail.wav",
+                    "accepted": False,
+                    "rejection_reasons": ["insufficient_speech"],
+                    "windows": [],
+                }
+            )
+            + "\n"
+        )
+
+    assert tail.refresh() == ({"pass.wav"}, 2)
+    assert tail.refresh() == ({"pass.wav"}, 2)
 
 
 def test_materialize_preserves_source_and_links_only_accepted(tmp_path: Path):
@@ -263,27 +297,26 @@ def test_materialize_preserves_source_and_links_only_accepted(tmp_path: Path):
                         "windows": _strong_voice_windows(),
                     }
                 ),
-                    json.dumps(
-                        {
-                            "filename": "no.wav",
+                json.dumps(
+                    {
+                        "filename": "no.wav",
                         "accepted": False,
                         "background_bucket": "music_led",
                         "rejection_reasons": ["insufficient_speech"],
-                            "windows": [],
-                        }
-                    ),
-                    json.dumps(
-                        {
-                            "filename": "weak.wav",
-                            "accepted": True,
-                            "background_bucket": "music_led",
-                            "rejection_reasons": [],
-                            "windows": [
-                                {"speech_score": 0.02, "speech_rank": 10}
-                                for _ in range(9)
-                            ],
-                        }
-                    ),
+                        "windows": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "filename": "weak.wav",
+                        "accepted": True,
+                        "background_bucket": "music_led",
+                        "rejection_reasons": [],
+                        "windows": [
+                            {"speech_score": 0.02, "speech_rank": 10} for _ in range(9)
+                        ],
+                    }
+                ),
             ]
         )
         + "\n"
@@ -400,9 +433,7 @@ def test_materialize_intersects_m2d_and_asr_acceptance(tmp_path: Path) -> None:
     }
 
 
-def _validated_batch(
-    root: Path, records: list[tuple[str, str, float]]
-) -> Path:
+def _validated_batch(root: Path, records: list[tuple[str, str, float]]) -> Path:
     audio = root / "audio"
     audio.mkdir(parents=True)
     manifest_records = []

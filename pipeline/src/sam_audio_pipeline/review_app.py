@@ -219,6 +219,21 @@ class PipelineProgressStore:
                 asr_accepted &= m2d_accepted
                 combined = len(m2d_accepted & asr_accepted)
                 exists = path.exists()
+                markers = {
+                    "acquisition": path / f".acquisition-complete-{raw_target}",
+                    "m2d": path / f".m2d-complete-{raw_target}",
+                    "speech": path / f".asr-complete-{raw_target}",
+                }
+                workers = {
+                    worker: (
+                        "complete"
+                        if raw_target and marker.is_file()
+                        else "running"
+                        if raw_target
+                        else "waiting"
+                    )
+                    for worker, marker in markers.items()
+                }
                 if not any((attempts, raw_target, downloaded, m2d_scored, asr_scored)):
                     status = "waiting"
                 elif raw_target and downloaded < raw_target:
@@ -244,6 +259,7 @@ class PipelineProgressStore:
                         "asr_scored": asr_scored,
                         "asr_accepted": len(asr_accepted),
                         "combined_eligible": combined,
+                        "workers": workers,
                     }
                 )
             final_count, final_verified, final_path = self._final_counts()
@@ -266,15 +282,27 @@ class PipelineProgressStore:
             non_waiting = [batch for batch in batches if batch["status"] != "waiting"]
             if non_waiting:
                 active = non_waiting[-1]
+            active_stages = (
+                [
+                    worker
+                    for worker, status in active["workers"].items()
+                    if status == "running"
+                ]
+                if active
+                else []
+            )
             stage = (
                 "complete"
                 if final_verified and final_count == self.target
                 else (active["status"] if active else "waiting")
             )
+            if stage == "complete":
+                active_stages = []
             return {
                 "updated_at": _now(),
                 "target": self.target,
                 "stage": stage,
+                "active_stages": active_stages,
                 "final": {
                     "materialized": final_count,
                     "verified": final_verified,

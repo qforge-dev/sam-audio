@@ -12,6 +12,7 @@ import random
 import re
 import shutil
 import sys
+import time
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -144,9 +145,7 @@ def load_label_families(
     }
 
 
-def _family_evidence(
-    probabilities: np.ndarray, family: set[int]
-) -> tuple[float, int]:
+def _family_evidence(probabilities: np.ndarray, family: set[int]) -> tuple[float, int]:
     if not family:
         return 0.0, len(probabilities) + 1
     ordered = np.argsort(probabilities)[::-1]
@@ -201,13 +200,11 @@ def evaluate_probabilities(
             and evidence["speech"][1] <= MAX_STRONG_SPEECH_RANK
         )
         foreground_speech_active = (
-            evidence["foreground_speech"][0]
-            >= MIN_FOREGROUND_SPEECH_PROBABILITY
+            evidence["foreground_speech"][0] >= MIN_FOREGROUND_SPEECH_PROBABILITY
             and evidence["foreground_speech"][1] <= MAX_FOREGROUND_SPEECH_RANK
         )
         synthetic_speech_active = (
-            evidence["synthetic_speech"][0]
-            >= MIN_SYNTHETIC_SPEECH_PROBABILITY
+            evidence["synthetic_speech"][0] >= MIN_SYNTHETIC_SPEECH_PROBABILITY
             and evidence["synthetic_speech"][1] <= MAX_SYNTHETIC_SPEECH_RANK
         )
         cinematic_music_active = (
@@ -245,14 +242,10 @@ def evaluate_probabilities(
                 "vocal_music_rank": evidence["vocal_music"][1],
                 "speech_active": speech_active,
                 "strong_speech_active": strong_speech_active,
-                "foreground_speech_score": round(
-                    evidence["foreground_speech"][0], 8
-                ),
+                "foreground_speech_score": round(evidence["foreground_speech"][0], 8),
                 "foreground_speech_rank": evidence["foreground_speech"][1],
                 "foreground_speech_active": foreground_speech_active,
-                "synthetic_speech_score": round(
-                    evidence["synthetic_speech"][0], 8
-                ),
+                "synthetic_speech_score": round(evidence["synthetic_speech"][0], 8),
                 "synthetic_speech_rank": evidence["synthetic_speech"][1],
                 "synthetic_speech_active": synthetic_speech_active,
                 "cinematic_music_active": cinematic_music_active,
@@ -276,12 +269,8 @@ def evaluate_probabilities(
     foreground_speech_windows = sum(
         item["foreground_speech_active"] for item in windows
     )
-    synthetic_speech_windows = sum(
-        item["synthetic_speech_active"] for item in windows
-    )
-    cinematic_music_windows = sum(
-        item["cinematic_music_active"] for item in windows
-    )
+    synthetic_speech_windows = sum(item["synthetic_speech_active"] for item in windows)
+    cinematic_music_windows = sum(item["cinematic_music_active"] for item in windows)
     cinematic_sfx_windows = sum(item["cinematic_sfx_active"] for item in windows)
     background_windows = sum(item["background_active"] for item in windows)
     overlap_windows = sum(item["overlap_active"] for item in windows)
@@ -290,9 +279,7 @@ def evaluate_probabilities(
         item["music_score"] for item in windows if item["overlap_active"]
     )
     overlap_nonmusic = sum(
-        item["nonmusic_background_score"]
-        for item in windows
-        if item["overlap_active"]
+        item["nonmusic_background_score"] for item in windows if item["overlap_active"]
     )
     if overlap_music > overlap_nonmusic * 1.25:
         background_bucket = "music_led"
@@ -342,12 +329,8 @@ def evaluate_probabilities(
         "foreground_speech_coverage": round(
             foreground_speech_windows / window_count, 6
         ),
-        "synthetic_speech_coverage": round(
-            synthetic_speech_windows / window_count, 6
-        ),
-        "cinematic_music_coverage": round(
-            cinematic_music_windows / window_count, 6
-        ),
+        "synthetic_speech_coverage": round(synthetic_speech_windows / window_count, 6),
+        "cinematic_music_coverage": round(cinematic_music_windows / window_count, 6),
         "cinematic_sfx_coverage": round(cinematic_sfx_windows / window_count, 6),
         "cinematic_mix_required": require_cinematic_mix,
         "cinematic_mix_pass": (
@@ -371,9 +354,7 @@ def _audio_windows(
     length = int(round(WINDOW_SECONDS * sample_rate))
     starts = list(np.arange(0.0, 10.0 - WINDOW_SECONDS + 1e-6, WINDOW_HOP_SECONDS))
     windows = [
-        waveform[
-            round(start * sample_rate) : round(start * sample_rate) + length
-        ]
+        waveform[round(start * sample_rate) : round(start * sample_rate) + length]
         for start in starts
     ]
     minimum = 3 * sample_rate
@@ -399,9 +380,6 @@ def score_directory(args: argparse.Namespace) -> None:
     labels, families = load_label_families(args.class_labels, args.ontology)
     model = PortableM2D(weight_file=str(args.checkpoint), num_classes=len(labels))
     model = model.to(args.device).eval()
-    files = sorted(args.input_dir.glob(args.glob))
-    if args.limit:
-        files = files[: args.limit]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     existing: set[str] = set()
     if args.output.exists() and not args.overwrite:
@@ -409,15 +387,18 @@ def score_directory(args: argparse.Namespace) -> None:
             if line.strip():
                 existing.add(str(json.loads(line)["filename"]))
     mode = "w" if args.overwrite else "a"
+    follow = bool(getattr(args, "follow", False))
+    producer_done = getattr(args, "producer_done", None)
+    poll_seconds = max(0.1, float(getattr(args, "poll_seconds", 2.0)))
+    if follow and not producer_done:
+        raise ValueError("--follow requires --producer-done")
     metadata = {
         "model": "nttcslab/m2d",
         "checkpoint": args.checkpoint.parent.name,
         "checkpoint_sha256": _sha256(args.checkpoint),
         "m2d_repository_commit": args.m2d_commit,
         "policy": (
-            CINEMATIC_POLICY_VERSION
-            if args.require_cinematic_mix
-            else POLICY_VERSION
+            CINEMATIC_POLICY_VERSION if args.require_cinematic_mix else POLICY_VERSION
         ),
         "window_seconds": WINDOW_SECONDS,
         "window_hop_seconds": WINDOW_HOP_SECONDS,
@@ -427,14 +408,10 @@ def score_directory(args: argparse.Namespace) -> None:
         "minimum_strong_speech_probability": MIN_STRONG_SPEECH_PROBABILITY,
         "maximum_strong_speech_rank": MAX_STRONG_SPEECH_RANK,
         "minimum_strong_speech_windows": MIN_STRONG_SPEECH_WINDOWS,
-        "minimum_foreground_speech_probability": (
-            MIN_FOREGROUND_SPEECH_PROBABILITY
-        ),
+        "minimum_foreground_speech_probability": (MIN_FOREGROUND_SPEECH_PROBABILITY),
         "maximum_foreground_speech_rank": MAX_FOREGROUND_SPEECH_RANK,
         "minimum_foreground_speech_windows": MIN_FOREGROUND_SPEECH_WINDOWS,
-        "minimum_synthetic_speech_probability": (
-            MIN_SYNTHETIC_SPEECH_PROBABILITY
-        ),
+        "minimum_synthetic_speech_probability": (MIN_SYNTHETIC_SPEECH_PROBABILITY),
         "maximum_synthetic_speech_rank": MAX_SYNTHETIC_SPEECH_RANK,
         "maximum_synthetic_speech_windows": MAX_SYNTHETIC_SPEECH_WINDOWS,
         "minimum_cinematic_music_probability": MIN_CINEMATIC_MUSIC_PROBABILITY,
@@ -449,31 +426,47 @@ def score_directory(args: argparse.Namespace) -> None:
     }
     processed = 0
     with args.output.open(mode, encoding="utf-8") as destination:
-        for index, path in enumerate(files, start=1):
-            if path.name in existing:
+        while True:
+            files = sorted(args.input_dir.glob(args.glob))
+            if args.limit:
+                files = files[: args.limit]
+            pending = [path for path in files if path.name not in existing]
+            if not pending:
+                if not follow or producer_done.is_file():
+                    break
+                time.sleep(poll_seconds)
                 continue
-            waveform, _ = librosa.load(path, mono=True, sr=model.cfg.sample_rate)
-            windows, starts = _audio_windows(waveform, model.cfg.sample_rate)
-            batch = torch.from_numpy(windows).to(args.device)
-            with torch.inference_mode():
-                probabilities = model(batch).softmax(dim=-1).cpu().numpy()
-            result = {
-                "filename": path.name,
-                "scored_at": _now(),
-                "m2d": metadata,
-                **evaluate_probabilities(
-                    probabilities,
-                    labels,
-                    families,
-                    starts=starts,
-                    require_cinematic_mix=args.require_cinematic_mix,
-                ),
-            }
-            destination.write(json.dumps(result, separators=(",", ":")) + "\n")
-            destination.flush()
-            processed += 1
-            if index % 25 == 0 or index == len(files):
-                logger.info("M2D scored %d/%d clips", index, len(files))
+            for path in pending:
+                waveform, _ = librosa.load(path, mono=True, sr=model.cfg.sample_rate)
+                windows, starts = _audio_windows(waveform, model.cfg.sample_rate)
+                batch = torch.from_numpy(windows).to(args.device)
+                with torch.inference_mode():
+                    probabilities = model(batch).softmax(dim=-1).cpu().numpy()
+                result = {
+                    "filename": path.name,
+                    "scored_at": _now(),
+                    "m2d": metadata,
+                    **evaluate_probabilities(
+                        probabilities,
+                        labels,
+                        families,
+                        starts=starts,
+                        require_cinematic_mix=args.require_cinematic_mix,
+                    ),
+                }
+                destination.write(json.dumps(result, separators=(",", ":")) + "\n")
+                destination.flush()
+                existing.add(path.name)
+                processed += 1
+                if processed % 25 == 0:
+                    completed = sum(path.name in existing for path in files)
+                    logger.info(
+                        "M2D scored %d/%d currently discovered clips",
+                        completed,
+                        len(files),
+                    )
+            if not follow:
+                break
     logger.info("Wrote %d new validation records to %s", processed, args.output)
 
 
@@ -533,6 +526,54 @@ def _m2d_asr_allowlist(
     return allowed, len(latest)
 
 
+class _M2DAllowlistTail:
+    """Incrementally follow M2D JSONL output without repeatedly rereading it."""
+
+    def __init__(self, path: Path, *, require_cinematic_mix: bool):
+        self.path = path
+        self.require_cinematic_mix = require_cinematic_mix
+        self.identity: tuple[int, int] | None = None
+        self.offset = 0
+        self.latest: dict[str, bool] = {}
+
+    def refresh(self) -> tuple[set[str], int]:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return set(), 0
+        identity = (stat.st_dev, stat.st_ino)
+        if self.identity != identity or stat.st_size < self.offset:
+            self.identity = identity
+            self.offset = 0
+            self.latest = {}
+        with self.path.open("rb") as source:
+            source.seek(self.offset)
+            while True:
+                line_start = source.tell()
+                line = source.readline()
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    source.seek(line_start)
+                    break
+                try:
+                    item = json.loads(line)
+                    filename = str(item["filename"])
+                except (json.JSONDecodeError, KeyError, TypeError, UnicodeError):
+                    continue
+                self.latest[filename] = bool(
+                    _enforce_current_voice_gate(
+                        item,
+                        require_cinematic_mix=self.require_cinematic_mix,
+                    ).get("accepted")
+                )
+            self.offset = source.tell()
+        return (
+            {filename for filename, accepted in self.latest.items() if accepted},
+            len(self.latest),
+        )
+
+
 def score_asr_directory(args: argparse.Namespace) -> None:
     try:
         from faster_whisper import WhisperModel
@@ -547,23 +588,15 @@ def score_asr_directory(args: argparse.Namespace) -> None:
         compute_type=args.compute_type,
         download_root=(str(args.download_root) if args.download_root else None),
     )
-    files = sorted(args.input_dir.glob(args.glob))
     m2d_results = getattr(args, "m2d_results", None)
-    if m2d_results:
-        allowed, scored_count = _m2d_asr_allowlist(
+    allowlist_tail = (
+        _M2DAllowlistTail(
             m2d_results,
-            require_cinematic_mix=bool(
-                getattr(args, "require_cinematic_mix", False)
-            ),
+            require_cinematic_mix=bool(getattr(args, "require_cinematic_mix", False)),
         )
-        files = [path for path in files if path.name in allowed]
-        logger.info(
-            "Restricted ASR to %d M2D-passing clips from %d scored filenames",
-            len(files),
-            scored_count,
-        )
-    if args.limit:
-        files = files[: args.limit]
+        if m2d_results
+        else None
+    )
     existing: set[str] = set()
     if args.output.exists() and not args.overwrite:
         for line in args.output.read_text().splitlines():
@@ -578,65 +611,97 @@ def score_asr_directory(args: argparse.Namespace) -> None:
                 existing.add(str(item["filename"]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     mode = "w" if args.overwrite else "a"
+    follow = bool(getattr(args, "follow", False))
+    producer_done = getattr(args, "producer_done", None)
+    poll_seconds = max(0.1, float(getattr(args, "poll_seconds", 2.0)))
+    if follow and not producer_done:
+        raise ValueError("--follow requires --producer-done")
     processed = 0
+    previous_allowed_count = -1
     with args.output.open(mode, encoding="utf-8") as destination:
-        for index, path in enumerate(files, start=1):
-            if path.name in existing:
+        while True:
+            files = sorted(args.input_dir.glob(args.glob))
+            if allowlist_tail:
+                allowed, scored_count = allowlist_tail.refresh()
+                files = [path for path in files if path.name in allowed]
+                if len(allowed) != previous_allowed_count:
+                    logger.info(
+                        "ASR queue has %d M2D passes from %d scored filenames",
+                        len(files),
+                        scored_count,
+                    )
+                    previous_allowed_count = len(allowed)
+            if args.limit:
+                files = files[: args.limit]
+            pending = [path for path in files if path.name not in existing]
+            if not pending:
+                if not follow or producer_done.is_file():
+                    break
+                time.sleep(poll_seconds)
                 continue
-            segments_source, info = model.transcribe(
-                str(path),
-                language=None,
-                beam_size=args.beam_size,
-                vad_filter=True,
-                condition_on_previous_text=False,
-            )
-            segments = list(segments_source)
-            transcript = " ".join(segment.text for segment in segments).strip()
-            best_log_probability = max(
-                (float(segment.avg_logprob) for segment in segments),
-                default=-99.0,
-            )
-            lowest_no_speech = min(
-                (float(segment.no_speech_prob) for segment in segments),
-                default=1.0,
-            )
-            result = {
-                "filename": path.name,
-                "scored_at": _now(),
-                "asr": {
-                    "model": args.model,
-                    "device": args.device,
-                    "compute_type": args.compute_type,
-                    "beam_size": args.beam_size,
-                },
-                **evaluate_asr(
-                    transcript=transcript,
-                    duration_after_vad=float(info.duration_after_vad),
-                    average_log_probability=best_log_probability,
-                    no_speech_probability=lowest_no_speech,
-                    detected_language=str(info.language),
-                    language_probability=float(info.language_probability),
-                ),
-                "segments": [
-                    {
-                        "start_seconds": round(float(segment.start), 3),
-                        "end_seconds": round(float(segment.end), 3),
-                        "text": segment.text.strip(),
-                        "average_log_probability": round(
-                            float(segment.avg_logprob), 8
-                        ),
-                        "no_speech_probability": round(
-                            float(segment.no_speech_prob), 8
-                        ),
-                    }
-                    for segment in segments
-                ],
-            }
-            destination.write(json.dumps(result, separators=(",", ":")) + "\n")
-            destination.flush()
-            processed += 1
-            if index % 25 == 0 or index == len(files):
-                logger.info("ASR scored %d/%d clips", index, len(files))
+            for path in pending:
+                segments_source, info = model.transcribe(
+                    str(path),
+                    language=None,
+                    beam_size=args.beam_size,
+                    vad_filter=True,
+                    condition_on_previous_text=False,
+                )
+                segments = list(segments_source)
+                transcript = " ".join(segment.text for segment in segments).strip()
+                best_log_probability = max(
+                    (float(segment.avg_logprob) for segment in segments),
+                    default=-99.0,
+                )
+                lowest_no_speech = min(
+                    (float(segment.no_speech_prob) for segment in segments),
+                    default=1.0,
+                )
+                result = {
+                    "filename": path.name,
+                    "scored_at": _now(),
+                    "asr": {
+                        "model": args.model,
+                        "device": args.device,
+                        "compute_type": args.compute_type,
+                        "beam_size": args.beam_size,
+                    },
+                    **evaluate_asr(
+                        transcript=transcript,
+                        duration_after_vad=float(info.duration_after_vad),
+                        average_log_probability=best_log_probability,
+                        no_speech_probability=lowest_no_speech,
+                        detected_language=str(info.language),
+                        language_probability=float(info.language_probability),
+                    ),
+                    "segments": [
+                        {
+                            "start_seconds": round(float(segment.start), 3),
+                            "end_seconds": round(float(segment.end), 3),
+                            "text": segment.text.strip(),
+                            "average_log_probability": round(
+                                float(segment.avg_logprob), 8
+                            ),
+                            "no_speech_probability": round(
+                                float(segment.no_speech_prob), 8
+                            ),
+                        }
+                        for segment in segments
+                    ],
+                }
+                destination.write(json.dumps(result, separators=(",", ":")) + "\n")
+                destination.flush()
+                existing.add(path.name)
+                processed += 1
+                if processed % 25 == 0:
+                    completed = sum(path.name in existing for path in files)
+                    logger.info(
+                        "ASR scored %d/%d currently eligible clips",
+                        completed,
+                        len(files),
+                    )
+            if not follow:
+                break
     logger.info("Wrote %d new ASR records to %s", processed, args.output)
 
 
@@ -652,8 +717,7 @@ def _enforce_current_voice_gate(
     for source in result.get("windows", []):
         window = dict(source)
         window["strong_speech_active"] = (
-            float(window.get("speech_score", 0.0))
-            >= MIN_STRONG_SPEECH_PROBABILITY
+            float(window.get("speech_score", 0.0)) >= MIN_STRONG_SPEECH_PROBABILITY
             and int(window.get("speech_rank", 10_000)) <= MAX_STRONG_SPEECH_RANK
         )
         foreground_score = float(window.get("foreground_speech_score", 0.0))
@@ -696,8 +760,7 @@ def _enforce_current_voice_gate(
             and synthetic_rank <= MAX_SYNTHETIC_SPEECH_RANK
         )
         window["cinematic_music_active"] = (
-            float(window.get("music_score", 0.0))
-            >= MIN_CINEMATIC_MUSIC_PROBABILITY
+            float(window.get("music_score", 0.0)) >= MIN_CINEMATIC_MUSIC_PROBABILITY
             and int(window.get("music_rank", 10_000)) <= MAX_CINEMATIC_MUSIC_RANK
         )
         window["cinematic_sfx_active"] = (
@@ -844,9 +907,7 @@ def materialize_accepted(args: argparse.Namespace) -> None:
     audio_dir = args.output_dir / "audio"
     _materialize_audio(args.input_dir, audio_dir, accepted)
 
-    music_led = [
-        item for item in accepted if item["background_bucket"] == "music_led"
-    ]
+    music_led = [item for item in accepted if item["background_bucket"] == "music_led"]
     nonmusic_led = [
         item for item in accepted if item["background_bucket"] != "music_led"
     ]
@@ -874,9 +935,7 @@ def materialize_accepted(args: argparse.Namespace) -> None:
         )
         records.append(original)
     rejection_counts = Counter(
-        reason
-        for result in results
-        for reason in result.get("rejection_reasons", [])
+        reason for result in results for reason in result.get("rejection_reasons", [])
     )
     asr_rejection_counts = Counter(
         reason
@@ -893,16 +952,10 @@ def materialize_accepted(args: argparse.Namespace) -> None:
         "accepted_record_count": len(records),
         "acceptance_rate": round(len(records) / max(1, len(results)), 6),
         "validator": "nttcslab/m2d AudioSet fine-tuned tagger",
-        "foreground_voice_validator": (
-            "faster-whisper" if asr_results_path else None
-        ),
-        "foreground_voice_policy": (
-            ASR_POLICY_VERSION if asr_results_path else None
-        ),
+        "foreground_voice_validator": ("faster-whisper" if asr_results_path else None),
+        "foreground_voice_policy": (ASR_POLICY_VERSION if asr_results_path else None),
         "policy": (
-            CINEMATIC_POLICY_VERSION
-            if require_cinematic_mix
-            else POLICY_VERSION
+            CINEMATIC_POLICY_VERSION if require_cinematic_mix else POLICY_VERSION
         ),
         "background_bucket_counts": dict(sorted(bucket_counts.items())),
         "rejection_reason_counts": dict(sorted(rejection_counts.items())),
@@ -961,20 +1014,12 @@ def merge_materialized(args: argparse.Namespace) -> None:
                 item,
                 require_cinematic_mix=args.require_cinematic_mix,
             )
-            for item in (
-                json.loads(line)
-                for line in m2d_lines
-                if line.strip()
-            )
+            for item in (json.loads(line) for line in m2d_lines if line.strip())
         }
         asr_lines = (batch_dir / "asr-validation.jsonl").read_text().splitlines()
         asr_by_name = {
             item["filename"]: item
-            for item in (
-                json.loads(line)
-                for line in asr_lines
-                if line.strip()
-            )
+            for item in (json.loads(line) for line in asr_lines if line.strip())
         }
         combined_count = 0
         for source_record in manifest.get("records", []):
@@ -1149,6 +1194,9 @@ def _parser() -> argparse.ArgumentParser:
     score.add_argument("--limit", type=int)
     score.add_argument("--overwrite", action="store_true")
     score.add_argument("--require-cinematic-mix", action="store_true")
+    score.add_argument("--follow", action="store_true")
+    score.add_argument("--producer-done", type=Path)
+    score.add_argument("--poll-seconds", type=float, default=2.0)
     score.set_defaults(handler=score_directory)
 
     asr_score = subparsers.add_parser(
@@ -1166,6 +1214,9 @@ def _parser() -> argparse.ArgumentParser:
     asr_score.add_argument("--glob", default="*.wav")
     asr_score.add_argument("--limit", type=int)
     asr_score.add_argument("--overwrite", action="store_true")
+    asr_score.add_argument("--follow", action="store_true")
+    asr_score.add_argument("--producer-done", type=Path)
+    asr_score.add_argument("--poll-seconds", type=float, default=2.0)
     asr_score.set_defaults(handler=score_asr_directory)
 
     materialize = subparsers.add_parser(

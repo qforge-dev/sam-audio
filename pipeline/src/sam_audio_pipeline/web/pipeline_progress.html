@@ -35,6 +35,10 @@
     .status { display:inline-block; padding:4px 8px; border-radius:99px; background:var(--panel2); color:var(--muted); font-size:11px; font-weight:750; }
     .status.downloading,.status.m2d_scoring,.status.speech_validation { color:var(--gold); }
     .status.validated,.status.complete { color:var(--green); }
+    .workers { display:flex; justify-content:flex-end; flex-wrap:wrap; gap:4px; margin-top:5px; }
+    .worker { padding:2px 5px; border-radius:5px; background:#0e151d; color:var(--muted); font-size:9px; }
+    .worker.running { color:var(--gold); border:1px solid rgba(247,199,93,.25); }
+    .worker.complete { color:var(--green); }
     .pipeline { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; }
     .pipeline span { padding:6px 9px; border-radius:8px; background:var(--panel2); border:1px solid var(--line); color:#bdcad5; }
     .error { color:#ff8b8b; white-space:pre-wrap; }
@@ -102,11 +106,14 @@
         $('target').textContent = number(data.target); $('finalCount').textContent = number(data.final.materialized);
         $('finalBar').style.width = `${Math.min(100, data.final.materialized / data.target * 100)}%`;
         $('finalText').textContent = data.final.verified ? `Verified at ${data.final.path}` : 'Waiting for enough clips to survive every gate.';
-        $('stage').className = `stage ${data.stage}`; $('stage').textContent = label(data.stage); $('stageHelp').textContent = stageHelp[data.stage] || '';
+        const active = data.active_stages || [];
+        $('stage').className = `stage ${active.length > 1 ? 'parallel' : data.stage}`;
+        $('stage').textContent = active.length > 1 ? `parallel: ${active.map(label).join(' + ')}` : label(data.stage);
+        $('stageHelp').textContent = active.length > 1 ? 'Independent workers are producing and consuming clips at the same time.' : (stageHelp[data.stage] || '');
         $('updated').textContent = `Live · updated ${new Date(data.updated_at).toLocaleTimeString()}`;
         const metrics = {...data.totals, review_snapshot:data.review_snapshot.materialized};
         $('funnel').innerHTML = metricDefinitions.map(([key,title,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${number(metrics[key])}</strong><small>${help}</small></div>`).join('');
-        $('batches').innerHTML = data.batches.map(batch => `<tr><td><strong>${batch.name}</strong></td><td><span class="status ${batch.status}">${label(batch.status)}</span></td><td>${number(batch.attempts)}</td><td>${number(batch.downloaded)}${batch.raw_target ? ` / ${number(batch.raw_target)}` : ''}</td><td>${number(batch.m2d_scored)}</td><td>${number(batch.m2d_accepted)}</td><td>${number(batch.asr_scored)}</td><td>${number(batch.asr_accepted)}</td><td>${number(batch.combined_eligible)}</td></tr>`).join('');
+        $('batches').innerHTML = data.batches.map(batch => `<tr><td><strong>${batch.name}</strong></td><td><span class="status ${batch.status}">${label(batch.status)}</span><div class="workers">${Object.entries(batch.workers || {}).map(([worker,status]) => `<span class="worker ${status}">${label(worker)} ${label(status)}</span>`).join('')}</div></td><td>${number(batch.attempts)}</td><td>${number(batch.downloaded)}${batch.raw_target ? ` / ${number(batch.raw_target)}` : ''}</td><td>${number(batch.m2d_scored)}</td><td>${number(batch.m2d_accepted)}</td><td>${number(batch.asr_scored)}</td><td>${number(batch.asr_accepted)}</td><td>${number(batch.combined_eligible)}</td></tr>`).join('');
         $('combinedNote').textContent = data.notes.combined_eligible; $('error').textContent = '';
       } catch(error) { $('error').textContent = error.message; }
     }
