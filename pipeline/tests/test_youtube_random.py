@@ -145,12 +145,13 @@ def test_long_cinematic_sources_can_supply_many_distinct_excerpts() -> None:
     )
 
 
-def test_group_download_uses_one_full_transfer_when_sections_cover_source() -> None:
+def test_group_download_uses_one_full_transfer_for_all_supported_sources() -> None:
     dense = [{"duration_seconds": 220}] * 11
     sparse = [{"duration_seconds": 3600}] * 48
 
     assert _use_full_source_for_group(dense) is True
-    assert _use_full_source_for_group(sparse) is False
+    assert _use_full_source_for_group(sparse) is True
+    assert _use_full_source_for_group([{"duration_seconds": 3601}] * 48) is False
 
 
 def test_dailymotion_work_is_grouped_by_video_without_reordering_clips() -> None:

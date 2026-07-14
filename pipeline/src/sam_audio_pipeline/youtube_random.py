@@ -46,6 +46,14 @@ MAX_SILENT_FRACTION = 0.10
 MAX_SILENT_RUN_SECONDS = 0.75
 MIN_SIDE_TO_TOTAL_DB = -45.0
 MAX_CLIPPED_FRACTION = 0.01
+HIGH_QUALITY_AUDIO_SELECTOR = (
+    "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
+    "bestaudio[acodec!=none]/best[acodec!=none]"
+)
+DAILYMOTION_EFFICIENT_SELECTOR = (
+    "best[height<=360][acodec!=none]/"
+    "best[height<=480][acodec!=none]/best[acodec!=none]"
+)
 
 SCENES = (
     "street market",
@@ -712,14 +720,11 @@ def _section_bounds(candidate: dict[str, Any]) -> tuple[float, float, float]:
 
 
 def _use_full_source_for_group(candidates: list[dict[str, Any]]) -> bool:
-    """Prefer one source transfer when section requests cover much of the video."""
+    """Dailymotion grouped clips are faster and more reliable from one transfer."""
     if not candidates:
         return False
     duration = float(candidates[0].get("duration_seconds") or 0.0)
-    if duration <= 0:
-        return False
-    requested_with_padding = len(candidates) * (CLIP_SECONDS + 10.0)
-    return requested_with_padding / duration >= 0.4
+    return len(candidates) > 1 and 0 < duration <= 3600
 
 
 def _source_file(root: Path) -> Path:
@@ -786,8 +791,9 @@ def _download_section(
                 "--force-keyframes-at-cuts",
                 "-f",
                 (
-                    "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
-                    "bestaudio[acodec!=none]/best[acodec!=none]"
+                    DAILYMOTION_EFFICIENT_SELECTOR
+                    if source_platform == "dailymotion"
+                    else HIGH_QUALITY_AUDIO_SELECTOR
                 ),
                 "--print-json",
                 "-o",
@@ -990,10 +996,7 @@ def acquire_candidate_group(
                 command.extend(
                     [
                         "-f",
-                        (
-                            "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
-                            "bestaudio[acodec!=none]/best[acodec!=none]"
-                        ),
+                        DAILYMOTION_EFFICIENT_SELECTOR,
                         "--print-json",
                         "-o",
                         str(root / "source.%(ext)s"),
@@ -1017,10 +1020,7 @@ def acquire_candidate_group(
                     [
                         "--force-keyframes-at-cuts",
                         "-f",
-                        (
-                            "bestaudio[asr>=44100][audio_channels=2][abr>=120]/"
-                            "bestaudio[acodec!=none]/best[acodec!=none]"
-                        ),
+                        DAILYMOTION_EFFICIENT_SELECTOR,
                         "--print-json",
                         "-o",
                         str(root / "source-%(section_start)012.3f.%(ext)s"),
