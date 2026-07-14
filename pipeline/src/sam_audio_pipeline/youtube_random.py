@@ -311,6 +311,7 @@ def build_queries(seed: int, count: int, *, profile: str = "general") -> list[st
                     generator.choice(CINEMATIC_SOURCES),
                     generator.choice(CINEMATIC_SCENES),
                     generator.choice(CINEMATIC_AUDIO_HINTS),
+                    "English",
                     CINEMATIC_SEARCH_EXCLUSIONS,
                 )
             )
@@ -404,6 +405,7 @@ def _search_dailymotion(
             "fields": fields,
             "limit": min(results, 100),
             "sort": "relevance",
+            "language": "en",
         }
     )
     request = urllib.request.Request(
