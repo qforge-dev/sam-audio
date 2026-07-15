@@ -328,7 +328,7 @@ class PipelineProgressStore:
 class ContinuousProgressStore:
     """Expose the permanent SQLite-backed pipeline without batch semantics."""
 
-    def __init__(self, workspace: Path, *, snapshot_size: int = 5000):
+    def __init__(self, workspace: Path, *, snapshot_size: int = 2500):
         self.workspace = workspace.resolve()
         self.snapshot_size = snapshot_size
 
@@ -918,7 +918,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--progress-final-dir", type=Path)
     parser.add_argument("--progress-target", type=int, default=1000)
     parser.add_argument("--continuous-workspace", type=Path)
-    parser.add_argument("--snapshot-size", type=int, default=5000)
+    parser.add_argument("--snapshot-size", type=int, default=2500)
     return parser
 
 

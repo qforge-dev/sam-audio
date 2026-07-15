@@ -13,6 +13,7 @@ import random
 import re
 import secrets
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -45,6 +46,9 @@ from .source_diversity import (
 logger = logging.getLogger(__name__)
 
 CLIP_SECONDS = 10.0
+YTDLP_CONCURRENT_FRAGMENTS = max(
+    1, int(os.environ.get("SAM_YTDLP_CONCURRENT_FRAGMENTS", "4"))
+)
 OUTPUT_SAMPLE_RATE = 48_000
 MIN_SOURCE_SAMPLE_RATE = 44_100
 MIN_SOURCE_BITRATE_KBPS = 120.0
@@ -53,7 +57,53 @@ MIN_DISCOVERY_SOURCE_DURATION_SECONDS = 2 * 60.0
 MAX_SOURCE_DURATION_SECONDS = 12 * 3600.0
 CANDIDATE_DURATION_POLICY = "source_duration_2m_to_12h_v3"
 DAILYMOTION_SEARCH_POLICY = "seeded_relevance_pages_1_to_10_gameplay_v4"
+MULTI_SOURCE_SEARCH_POLICY = "yt_dlp_native_and_yahoo_site_search_v1"
+SUPPORTED_DISCOVERY_SOURCES = (
+    "youtube",
+    "dailymotion",
+    "vimeo",
+    "tiktok",
+    "soundcloud",
+    "bilibili",
+    "internet_archive",
+)
+
+
+def _yt_dlp_transfer_args() -> list[str]:
+    """Bound parallel HLS/DASH fragments while leaving direct files unchanged."""
+    return ["--concurrent-fragments", str(YTDLP_CONCURRENT_FRAGMENTS)]
+YTDLP_SEARCH_PROVIDERS: dict[str, dict[str, Any]] = {
+    "soundcloud": {"search_key": "scsearch", "max_results": 20},
+    "bilibili": {
+        "search_key": "bilisearch",
+        "max_results": 8,
+        "hydrate": True,
+    },
+    "vimeo": {
+        "search_key": "yvsearch",
+        "site": "vimeo.com",
+        "max_results": 8,
+        "hydrate": True,
+    },
+    "tiktok": {
+        "search_key": "yvsearch",
+        "site": "tiktok.com",
+        "max_results": 8,
+        "hydrate": True,
+    },
+    "internet_archive": {
+        "search_key": "yvsearch",
+        "site": "archive.org/details",
+        # Archive collection pages can take much longer to inspect than a
+        # single-video page. A small sample keeps the provider from delaying
+        # the complete round-robin while still continuously adding sources.
+        "max_results": 2,
+        "hydrate": True,
+        "hydrate_timeout": 30,
+    },
+}
 YTDLP_PYTHON = sys.executable
+YOUTUBE_PROXY_CONFIG: Path | None = None
 SILENCE_THRESHOLD_DBFS = -55.0
 MIN_RMS_DBFS = -35.0
 MIN_PEAK_DBFS = -20.0
@@ -417,12 +467,118 @@ def _now() -> str:
 
 
 def _run(command: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    process = subprocess.Popen(
         command,
-        check=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # yt-dlp may have an ffmpeg child which keeps a temporary download open.
+        # Killing only yt-dlp lets TemporaryDirectory unlink the path while
+        # ffmpeg continues writing to the deleted inode, silently consuming disk.
+        stdout, stderr = _terminate_process_group(process)
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from None
+    except BaseException:
+        _terminate_process_group(process)
+        raise
+    completed = subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    if completed.returncode:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            command,
+            output=stdout,
+            stderr=stderr,
+        )
+    return completed
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
+    """Stop and reap a downloader plus every ffmpeg/ffprobe descendant."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        return process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return process.communicate()
+
+
+def _protected_proxy_configs(path: Path) -> list[Path]:
+    configs = sorted(path.glob("*.conf")) if path.is_dir() else [path]
+    configs = [config for config in configs if config.is_file()]
+    if not configs:
+        raise FileNotFoundError(f"yt-dlp proxy config is empty: {path}")
+    for config in configs:
+        if config.stat().st_mode & 0o077:
+            raise PermissionError(
+                f"yt-dlp proxy config must not be group/world accessible: {config}"
+            )
+    return configs
+
+
+def _yt_dlp_proxy_args(source_platform: str, affinity_key: str = "") -> list[str]:
+    """Select a protected all-provider proxy without credentials in argv."""
+    if YOUTUBE_PROXY_CONFIG is None:
+        return []
+    path = Path(YOUTUBE_PROXY_CONFIG)
+    if not path.exists():
+        raise FileNotFoundError(f"yt-dlp proxy config is missing: {path}")
+    configs = _protected_proxy_configs(path)
+    digest = hashlib.sha256(affinity_key.encode()).digest()
+    selected = configs[int.from_bytes(digest[:8], "big") % len(configs)]
+    return ["--config-locations", str(selected)]
+
+
+def _candidate_proxy_affinity(candidate: dict[str, Any]) -> str:
+    return ":".join(
+        (
+            str(candidate.get("video_id") or candidate.get("source_url") or "source"),
+            str(candidate.get("_youtube_proxy_attempt") or 0),
+        )
+    )
+
+
+def _yt_dlp_javascript_args(source_platform: str) -> list[str]:
+    if source_platform != "youtube":
+        return []
+    deno = shutil.which("deno") or str(Path.home() / ".deno" / "bin" / "deno")
+    return ["--js-runtimes", f"deno:{deno}"] if Path(deno).is_file() else []
+
+
+def _yt_dlp_youtube_client_args(
+    source_platform: str, client: str = "tv"
+) -> list[str]:
+    """Use the client that succeeds most often on authenticated proxy exits."""
+    if source_platform != "youtube":
+        return []
+    return ["--extractor-args", f"youtube:player_client={client}"]
+
+
+def _redact_proxy_credentials(value: str) -> str:
+    return re.sub(
+        r"(https?://)[^\s/:@]+:[^\s/@]+@",
+        r"\1***:***@",
+        value,
     )
 
 
@@ -430,8 +586,12 @@ def _exception_text(error: Exception) -> str:
     summary = f"{type(error).__name__}: {error}"
     if not isinstance(error, subprocess.CalledProcessError):
         return summary
-    output = "\n".join(
-        part.strip() for part in (error.stdout, error.stderr) if part and part.strip()
+    output = _redact_proxy_credentials(
+        "\n".join(
+            part.strip()
+            for part in (error.stdout, error.stderr)
+            if part and part.strip()
+        )
     )
     if len(output) > 2_000:
         output = output[-2_000:]
@@ -498,7 +658,7 @@ def build_queries(seed: int, count: int, *, profile: str = "general") -> list[st
 
 
 def _query_for_source(query: str, source: str) -> str:
-    """Remove YouTube-only negative tokens for APIs that treat them literally."""
+    """Remove YouTube-only negative tokens for other provider searches."""
     if source == "youtube":
         return query
     return " ".join(part for part in query.split() if not part.startswith("-"))
@@ -526,6 +686,7 @@ def _candidate_allowed(item: dict[str, Any], *, profile: str = "general") -> boo
         )
         and (
             profile != "cinematic"
+            or item.get("source_platform") in YTDLP_SEARCH_PROVIDERS
             or any(term in title for term in CINEMATIC_TITLE_TERMS)
         )
     )
@@ -555,11 +716,14 @@ def _search_youtube(query: str, results: int, profile: str) -> list[dict[str, An
             "--no-update",
             "--quiet",
             "--no-warnings",
+            *_yt_dlp_proxy_args("youtube", query),
+            *_yt_dlp_javascript_args("youtube"),
+            *_yt_dlp_youtube_client_args("youtube"),
             "--flat-playlist",
             "--dump-single-json",
             f"ytsearch{results}:{query}",
         ],
-        timeout=75,
+        timeout=120,
     )
     payload = json.loads(response.stdout)
     return [
@@ -567,6 +731,105 @@ def _search_youtube(query: str, results: int, profile: str) -> list[dict[str, An
         for item in payload.get("entries", [])
         if _discovery_candidate_allowed(item, profile=profile, source="youtube")
     ]
+
+
+def _search_result_url(item: dict[str, Any]) -> str | None:
+    for key in ("webpage_url", "original_url", "source_url", "url"):
+        value = str(item.get(key) or "").strip()
+        if value.startswith(("http://", "https://")):
+            return value
+    return None
+
+
+def _hydrate_search_result(
+    url: str,
+    *,
+    source_platform: str,
+    affinity_key: str,
+    timeout: float = 90,
+) -> dict[str, Any]:
+    response = _run(
+        [
+            YTDLP_PYTHON,
+            "-m",
+            "yt_dlp",
+            "--no-update",
+            "--quiet",
+            "--no-warnings",
+            "--no-playlist",
+            "--skip-download",
+            *_yt_dlp_proxy_args(source_platform, affinity_key),
+            "--dump-single-json",
+            url,
+        ],
+        timeout=timeout,
+    )
+    payload = json.loads(response.stdout)
+    if not isinstance(payload, dict):
+        raise ValueError("yt-dlp metadata response was not an object")
+    return payload
+
+
+def _search_ytdlp_provider(
+    query: str,
+    results: int,
+    profile: str,
+    source: str,
+) -> list[dict[str, Any]]:
+    try:
+        provider = YTDLP_SEARCH_PROVIDERS[source]
+    except KeyError as error:
+        raise ValueError(f"Unsupported discovery source: {source}") from error
+    limited_results = min(results, int(provider["max_results"]))
+    provider_query = _query_for_source(query, source)
+    if provider.get("site"):
+        provider_query = f"site:{provider['site']} {provider_query}"
+    target = f"{provider['search_key']}{limited_results}:{provider_query}"
+    response = _run(
+        [
+            YTDLP_PYTHON,
+            "-m",
+            "yt_dlp",
+            "--no-update",
+            "--quiet",
+            "--no-warnings",
+            *_yt_dlp_proxy_args(source, provider_query),
+            "--flat-playlist",
+            "--dump-single-json",
+            target,
+        ],
+        timeout=90,
+    )
+    payload = json.loads(response.stdout)
+    items: list[dict[str, Any]] = []
+    for flat_item in (payload.get("entries") or [])[:limited_results]:
+        url = _search_result_url(flat_item)
+        if not url:
+            continue
+        try:
+            item = (
+                _hydrate_search_result(
+                    url,
+                    source_platform=source,
+                    affinity_key=url,
+                    timeout=float(provider.get("hydrate_timeout", 90)),
+                )
+                if provider.get("hydrate")
+                else flat_item
+            )
+        except Exception:
+            logger.debug("Could not hydrate %s search result %s", source, url)
+            continue
+        item = {
+            **item,
+            "source_url": _search_result_url(item) or url,
+            "source_platform": source,
+        }
+        if not item.get("id"):
+            item["id"] = hashlib.sha256(url.encode()).hexdigest()[:24]
+        if _discovery_candidate_allowed(item, profile=profile, source=source):
+            items.append(item)
+    return items
 
 
 def _dailymotion_search_page(seed: int, query: str, *, pages: int = 10) -> int:
@@ -630,7 +893,9 @@ def _search(
 ) -> list[dict[str, Any]]:
     if source == "dailymotion":
         return _search_dailymotion(query, results, profile, page=search_page)
-    return _search_youtube(query, results, profile)
+    if source == "youtube":
+        return _search_youtube(query, results, profile)
+    return _search_ytdlp_provider(query, results, profile, source)
 
 
 def _sample_clip_starts(
@@ -708,6 +973,11 @@ def discover_candidates(
                 source != "dailymotion"
                 or search_metadata.get("search_page_policy")
                 == DAILYMOTION_SEARCH_POLICY
+            )
+            and (
+                source in {"youtube", "dailymotion"}
+                or search_metadata.get("search_provider_policy")
+                == MULTI_SOURCE_SEARCH_POLICY
             )
         )
         if compatible:
@@ -791,16 +1061,24 @@ def discover_candidates(
                         "video_id": video_id,
                         "source_url": (
                             item.get("source_url")
+                            or item.get("webpage_url")
+                            or item.get("original_url")
                             or (
                                 f"https://www.dailymotion.com/video/{video_id}"
                                 if source == "dailymotion"
-                                else f"https://www.youtube.com/watch?v={video_id}"
+                                else (
+                                    f"https://www.youtube.com/watch?v={video_id}"
+                                    if source == "youtube"
+                                    else item.get("url")
+                                )
                             )
                         ),
                         "source_platform": source,
                         "title": item.get("title"),
                         "duration_seconds": duration,
                         "uploader": item.get("uploader") or item.get("channel"),
+                        "description": item.get("description"),
+                        "tags": item.get("tags"),
                         "channel_id": item.get("channel_id"),
                         "view_count": item.get("view_count"),
                         "search_query": query,
@@ -841,6 +1119,11 @@ def discover_candidates(
                 "candidate_duration_policy": CANDIDATE_DURATION_POLICY,
                 "search_page_policy": (
                     DAILYMOTION_SEARCH_POLICY if source == "dailymotion" else None
+                ),
+                "search_provider_policy": (
+                    MULTI_SOURCE_SEARCH_POLICY
+                    if source not in {"youtube", "dailymotion"}
+                    else None
                 ),
                 "seed": seed,
                 "queries": queries,
@@ -1008,11 +1291,14 @@ def _download_section(
     youtube_client: str,
 ) -> tuple[subprocess.CompletedProcess[str], Path, str]:
     source_platform = candidate.get("source_platform", "youtube")
-    clients = (
-        ("dailymotion",)
-        if source_platform == "dailymotion"
-        else (("mweb", "default") if youtube_client == "auto" else (youtube_client,))
-    )
+    if source_platform == "youtube":
+        clients = (
+            ("tv", "mweb", "default")
+            if youtube_client == "auto"
+            else (youtube_client,)
+        )
+    else:
+        clients = (str(source_platform),)
     last_error: Exception | None = None
     for client in clients:
         download_root = root / client
@@ -1025,6 +1311,7 @@ def _download_section(
             "--quiet",
             "--no-warnings",
             "--no-playlist",
+            *_yt_dlp_transfer_args(),
             "--socket-timeout",
             "20",
             "--retries",
@@ -1032,12 +1319,15 @@ def _download_section(
             "--extractor-retries",
             "2",
         ]
-        deno = shutil.which("deno") or str(Path.home() / ".deno" / "bin" / "deno")
-        if Path(deno).is_file():
-            command.extend(["--js-runtimes", f"deno:{deno}"])
-        if client == "mweb":
+        command.extend(
+            _yt_dlp_proxy_args(source_platform, _candidate_proxy_affinity(candidate))
+        )
+        command.extend(_yt_dlp_javascript_args(source_platform))
+        if source_platform == "youtube" and client == "tv":
+            command.extend(_yt_dlp_youtube_client_args(source_platform, "tv"))
+        elif source_platform == "youtube" and client == "mweb":
             command.extend(["--extractor-args", "youtube:player_client=mweb"])
-        elif client == "android":
+        elif source_platform == "youtube" and client == "android":
             command.extend(
                 [
                     "--extractor-args",
@@ -1243,6 +1533,7 @@ def acquire_candidate_group(
                 "--quiet",
                 "--no-warnings",
                 "--no-playlist",
+                *_yt_dlp_transfer_args(),
                 "--socket-timeout",
                 "20",
                 "--retries",
@@ -1930,6 +2221,12 @@ def _download_full_source_for_scan(
     candidate: dict[str, Any], root: Path
 ) -> tuple[Path, dict[str, Any]]:
     duration = float(candidate.get("duration_seconds") or 0.0)
+    source_platform = str(candidate.get("source_platform") or "youtube")
+    selector = (
+        DAILYMOTION_SCAN_PROXY_SELECTOR
+        if source_platform == "dailymotion"
+        else HIGH_QUALITY_AUDIO_SELECTOR
+    )
     response = _run(
         [
             YTDLP_PYTHON,
@@ -1939,14 +2236,18 @@ def _download_full_source_for_scan(
             "--quiet",
             "--no-warnings",
             "--no-playlist",
+            *_yt_dlp_transfer_args(),
             "--socket-timeout",
             "30",
             "--retries",
             "3",
             "--extractor-retries",
             "3",
+            *_yt_dlp_proxy_args(source_platform, _candidate_proxy_affinity(candidate)),
+            *_yt_dlp_javascript_args(source_platform),
+            *_yt_dlp_youtube_client_args(source_platform),
             "-f",
-            DAILYMOTION_SCAN_PROXY_SELECTOR,
+            selector,
             "--print-json",
             "-o",
             str(root / "source.%(ext)s"),
@@ -1959,6 +2260,12 @@ def _download_full_source_for_scan(
 
 def _preflight_source_for_scan(candidate: dict[str, Any]) -> dict[str, Any]:
     """Require a high-quality extraction variant before downloading a proxy."""
+    source_platform = str(candidate.get("source_platform") or "youtube")
+    selector = (
+        DAILYMOTION_SOURCE_SCAN_SELECTOR
+        if source_platform == "dailymotion"
+        else HIGH_QUALITY_AUDIO_SELECTOR
+    )
     base_command = [
         YTDLP_PYTHON,
         "-m",
@@ -1968,13 +2275,16 @@ def _preflight_source_for_scan(candidate: dict[str, Any]) -> dict[str, Any]:
         "--no-warnings",
         "--no-playlist",
         "--skip-download",
+        *_yt_dlp_proxy_args(source_platform, _candidate_proxy_affinity(candidate)),
+        *_yt_dlp_javascript_args(source_platform),
+        *_yt_dlp_youtube_client_args(source_platform),
         "-f",
     ]
     try:
         response = _run(
             [
                 *base_command,
-                DAILYMOTION_SOURCE_SCAN_SELECTOR,
+                selector,
                 "--print-json",
                 str(candidate["source_url"]),
             ],
@@ -1982,6 +2292,8 @@ def _preflight_source_for_scan(candidate: dict[str, Any]) -> dict[str, Any]:
         )
         return {**_download_json(response.stdout), "quality_format_available": True}
     except subprocess.CalledProcessError:
+        if source_platform != "dailymotion":
+            raise
         # Distinguish a live source that only exposes the low-bitrate 380p
         # variant from a transient extraction/network failure. The former can
         # be cached permanently and skipped before proxy transfer on every run.
@@ -2003,6 +2315,12 @@ def _download_scanned_sections(
     root: Path,
 ) -> dict[float, tuple[Path, dict[str, Any]]]:
     """Fetch only selected high-quality excerpts after proxy scanning."""
+    source_platform = str(candidate.get("source_platform") or "youtube")
+    selector = (
+        DAILYMOTION_SOURCE_SCAN_SELECTOR
+        if source_platform == "dailymotion"
+        else HIGH_QUALITY_AUDIO_SELECTOR
+    )
     command = [
         YTDLP_PYTHON,
         "-m",
@@ -2011,12 +2329,16 @@ def _download_scanned_sections(
         "--quiet",
         "--no-warnings",
         "--no-playlist",
+        *_yt_dlp_transfer_args(),
         "--socket-timeout",
         "20",
         "--retries",
         "2",
         "--extractor-retries",
         "2",
+        *_yt_dlp_proxy_args(source_platform, _candidate_proxy_affinity(candidate)),
+        *_yt_dlp_javascript_args(source_platform),
+        *_yt_dlp_youtube_client_args(source_platform),
     ]
     section_starts: list[float] = []
     for region in regions:
@@ -2030,7 +2352,7 @@ def _download_scanned_sections(
     command.extend(
         [
             "-f",
-            DAILYMOTION_SOURCE_SCAN_SELECTOR,
+            selector,
             "--print-json",
             "-o",
             str(root / "selected-%(section_start)012.3f.%(ext)s"),
@@ -2150,6 +2472,7 @@ def acquire_scanned_source_group(
     proxy_asr_result_dir: Path | None = None,
     proxy_asr_timeout_seconds: float = 120.0,
     defer_claim_commit: bool = False,
+    youtube_proxy_attempt: int = 0,
 ) -> list[dict[str, Any]]:
     """Serialize scan/claim mutations for one source across producer processes."""
     lock_path = _scan_cache_path(cache_dir, candidates[0]).with_suffix(".lock")
@@ -2170,6 +2493,7 @@ def acquire_scanned_source_group(
             proxy_asr_result_dir=proxy_asr_result_dir,
             proxy_asr_timeout_seconds=proxy_asr_timeout_seconds,
             defer_claim_commit=defer_claim_commit,
+            youtube_proxy_attempt=youtube_proxy_attempt,
         )
 
 
@@ -2185,6 +2509,7 @@ def _acquire_scanned_source_group_locked(
     proxy_asr_result_dir: Path | None = None,
     proxy_asr_timeout_seconds: float = 120.0,
     defer_claim_commit: bool = False,
+    youtube_proxy_attempt: int = 0,
 ) -> list[dict[str, Any]]:
     """Scan one full source first, then extract only passing stereo regions."""
     from .source_scanner import (
@@ -2194,7 +2519,12 @@ def _acquire_scanned_source_group_locked(
     )
 
     base = candidates[0]
+    retrieval_base = {
+        **base,
+        "_youtube_proxy_attempt": max(0, youtube_proxy_attempt),
+    }
     video_id = str(base["video_id"])
+    source_platform = str(base.get("source_platform") or "youtube")
     stats = guidance.get(video_id, {})
     attempted_starts = [float(value) for value in stats.get("attempted_starts", [])]
     accepted_starts = [float(value) for value in stats.get("accepted_starts", [])]
@@ -2235,7 +2565,7 @@ def _acquire_scanned_source_group_locked(
             source_format: dict[str, Any] | None = None
             if cached is None:
                 try:
-                    target_info = _preflight_source_for_scan(base)
+                    target_info = _preflight_source_for_scan(retrieval_base)
                 except subprocess.CalledProcessError as error:
                     if not _permanent_media_error(error):
                         raise
@@ -2283,9 +2613,11 @@ def _acquire_scanned_source_group_locked(
                         rejection_reasons=cached["rejection_reasons"],
                     )
                 download_started = time.perf_counter()
-                source, info = _download_full_source_for_scan(base, root)
+                source, info = _download_full_source_for_scan(retrieval_base, root)
                 download_seconds = time.perf_counter() - download_started
-                source_format = _source_format(source, info, "dailymotion-source-scan")
+                source_format = _source_format(
+                    source, info, f"{source_platform}-source-scan"
+                )
                 source_rejections = []
                 if int(source_format.get("channels") or 0) != 2:
                     source_rejections.append("source_not_stereo")
@@ -2366,7 +2698,9 @@ def _acquire_scanned_source_group_locked(
                     probe = _proxy_asr_from_guidance(stats)
                 if probe is None:
                     if proxy is None:
-                        probe_source, _ = _download_full_source_for_scan(base, root)
+                        probe_source, _ = _download_full_source_for_scan(
+                            retrieval_base, root
+                        )
                         proxy = root / "probe-proxy.flac"
                         scanner.create_proxy(probe_source, proxy)
                     try:
@@ -2419,7 +2753,9 @@ def _acquire_scanned_source_group_locked(
                     rejection_reasons=cached.get("rejection_reasons", []),
                 )
             extraction_download_started = time.perf_counter()
-            selected_sections = _download_scanned_sections(base, available, root)
+            selected_sections = _download_scanned_sections(
+                retrieval_base, available, root
+            )
             extraction_download_seconds = (
                 time.perf_counter() - extraction_download_started
             )
@@ -2456,7 +2792,7 @@ def _acquire_scanned_source_group_locked(
                             candidate,
                             selected_source,
                             selected_info,
-                            "dailymotion-source-scan-section",
+                            f"{source_platform}-source-scan-section",
                             output_dir,
                             root,
                             started=started,
@@ -2489,9 +2825,7 @@ def _acquire_scanned_source_group_locked(
                 _atomic_json(cache_path, cached)
             return results
     except Exception as error:
-        return status_result(
-            "source_scan_unavailable", error=_exception_text(error)
-        )
+        return status_result("source_scan_unavailable", error=_exception_text(error))
 
 
 def _runtime_worker_limit(path: Path | None, *, maximum: int, default: int) -> int:
@@ -2958,7 +3292,7 @@ def acquire_dataset(
 
 
 def main() -> None:
-    global CLIP_SECONDS, YTDLP_PYTHON
+    global CLIP_SECONDS, YTDLP_PYTHON, YOUTUBE_PROXY_CONFIG
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--total", type=int, default=1000)
@@ -3012,6 +3346,11 @@ def main() -> None:
     parser.add_argument("--source-asr-probe-results", type=Path)
     parser.add_argument("--source-asr-probe-timeout", type=float, default=120.0)
     parser.add_argument("--yt-dlp-python", type=Path)
+    parser.add_argument(
+        "--youtube-proxy-config",
+        type=Path,
+        help="Protected yt-dlp config containing the proxy for YouTube only",
+    )
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument(
         "--discover-only",
@@ -3030,6 +3369,7 @@ def main() -> None:
     CLIP_SECONDS = float(args.clip_seconds)
     if args.yt_dlp_python:
         YTDLP_PYTHON = str(args.yt_dlp_python)
+    YOUTUBE_PROXY_CONFIG = args.youtube_proxy_config
     clips_per_video = args.clips_per_video or (3 if args.profile == "cinematic" else 1)
     if clips_per_video < 1:
         parser.error("--clips-per-video must be positive")

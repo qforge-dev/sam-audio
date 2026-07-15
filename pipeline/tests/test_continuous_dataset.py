@@ -188,6 +188,7 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
     workspace = tmp_path / "workspace"
 
     assert promote_once(runs, workspace) == 1
+    assert not run.exists()
     assert promote_once(runs, workspace) == 0
     filename = f"{digest}.wav"
     windows = [
@@ -230,6 +231,7 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
     )
 
     assert assemble_once(workspace) == 1
+    assert not (workspace / "raw-audio" / filename).exists()
     assert assemble_once(workspace) == 0
     manifest = json.loads((workspace / "accepted" / "manifest.json").read_text())
     assert manifest["continuous"] is True
@@ -258,7 +260,7 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
     assert progress["counts"]["downloaded"] == 1
     assert progress["counts"]["accepted"] == 1
     assert progress["counts"]["rejected_total"] == 0
-    assert progress["next_snapshot"]["remaining"] == 4999
+    assert progress["next_snapshot"]["remaining"] == 2499
     assert progress["throughput"]["download"]["audio_minutes_per_minute"] > 0
     assert progress["flow"]["state"] == "healthy"
     assert progress["flow"]["processed_audio_hours_per_wall_hour"] > 0
@@ -267,3 +269,37 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
     assert progress["flow"]["stalled_stages"] == []
     assert progress["goal"]["target_audio_hours"] == 10_000
     assert progress["goal"]["estimated_completion_at"] is not None
+
+
+def test_promoter_waits_for_staged_run_seal(tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    run = runs / "run-staged-0-000001"
+    audio = run / "audio"
+    audio.mkdir(parents=True)
+    _wav(audio / "source.wav")
+    digest = hashlib.sha256((audio / "source.wav").read_bytes()).hexdigest()
+    record = {
+        "candidate_id": "movie:0",
+        "video_id": "movie",
+        "source_platform": "dailymotion",
+        "title": "English Movie Scene HD",
+        "duration_seconds": 600,
+        "clip_start_seconds": 0,
+        "retrieval_status": "success",
+        "quality_rejections": [],
+        "source_format": {
+            "sample_rate_hz": 48_000,
+            "channels": 2,
+            "bitrate_kbps": 160,
+        },
+        "local_path": "audio/source.wav",
+        "sha256": digest,
+    }
+    (run / "manifest.json").write_text(json.dumps({"records": [record]}))
+    workspace = tmp_path / "workspace"
+
+    assert promote_once(runs, workspace) == 0
+    assert run.is_dir()
+    (run / ".sealed.json").write_text("{}\n")
+    assert promote_once(runs, workspace) == 1
+    assert not run.exists()

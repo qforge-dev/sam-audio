@@ -280,7 +280,7 @@ heartbeat_loop snapshot_publisher &
 restart_worker snapshot_publisher "$PIPELINE_PYTHON" \
   -m sam_audio_pipeline.continuous_dataset publish-due \
   --workspace "$WORKSPACE" --bucket "$BUCKET" --prefix "$S3_PREFIX" \
-  --snapshot-size 5000 --upload-concurrency "$UPLOAD_CONCURRENCY" \
+  --snapshot-size 2500 --upload-concurrency "$UPLOAD_CONCURRENCY" \
   --follow --poll-seconds 30 &
 
 wait -n

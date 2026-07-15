@@ -194,14 +194,18 @@ uv run sam-pipeline-youtube-random \
 Acquisition publishes quality-gated files atomically; resident M2D and ASR
 workers consume independent deterministic shards; the assembler writes the
 append-only accepted catalog; and the publisher releases an exhaustive,
-immutable S3 snapshot at every 5,000 accepted clips. Manual review is diagnostic
+immutable S3 snapshot at every 2,500 accepted clips. Manual review is diagnostic
 feedback and never blocks acceptance.
 
 The SQLite/WAL catalog is authoritative; the live JSON manifest is intentionally
 constant-size. Review queries the newest 5,000 accepted records directly from
 the catalog so the page stays responsive while the global count grows into the
-millions. Each S3 snapshot contains only its new 5,000-record sequence range
-(for example `v2-00000001-00005000`), avoiding quadratic cumulative manifests.
+millions. Each S3 snapshot contains only its new 2,500-record sequence range
+(for example `v2-00000001-00002500`), avoiding quadratic cumulative manifests.
+After S3 publishes `READY.json`, the local snapshot staging directory is removed.
+Completed acquisition runs and terminal raw-audio copies are pruned continuously,
+and accepted audio older than the newest 5,000-record review window is removed
+only after its snapshot is durable in S3.
 
 The live dataset is under `/home/ubuntu/cinematic-continuous-30s`. Review it at
 `http://127.0.0.1:18081/` and inspect queues, worker health, rolling throughput,
@@ -278,9 +282,57 @@ uv run sam-pipeline-youtube-random \
   --max-attempts 6000
 ```
 
-If YouTube rejects the downloader host's public address, use the same gated
-acquisition pipeline against Dailymotion rather than weakening the selection
-policy or using account cookies:
+If YouTube rejects the downloader host's public address, put the proxy in a
+root- or service-user-readable `yt-dlp` config rather than an environment value
+or command-line argument. The config must not be committed:
+
+```bash
+install -d -m 700 /home/ubuntu/.config/sam-audio
+install -m 600 /dev/null /home/ubuntu/.config/sam-audio/youtube-proxy.conf
+# Write this line through your secret manager, with the actual credentials:
+# --proxy http://USERNAME:PASSWORD@p.webshare.io:80/
+```
+
+Use it with the one-shot builder via `--youtube-proxy-config`. The independent
+source services use these non-secret environment settings:
+
+```text
+SAM_CONTINUOUS_DISCOVERY_SOURCES=youtube,dailymotion,vimeo,tiktok,soundcloud,bilibili,internet_archive
+SAM_CONTINUOUS_DISCOVERED_HIGH_WATER=8000
+SAM_CONTINUOUS_PLATFORM_DISCOVERED_HIGH_WATER=600
+SAM_YOUTUBE_PROXY_CONFIG=/home/ubuntu/.config/sam-audio/youtube-proxy.conf
+```
+
+Discovery rotates durably through the seven-source pool instead of letting the
+first provider fill the frontier. The global high-water mark bounds total
+metadata, while the per-provider active quota keeps the queue balanced.
+Dailymotion uses its public API; YouTube, SoundCloud, and Bilibili use native
+yt-dlp search extractors; Vimeo, TikTok, and Internet Archive use site-scoped
+Yahoo Video discovery followed by yt-dlp metadata hydration. Every source then
+passes the same stereo, source-quality, M2D, ASR, and diversity gates. The
+progress dashboard reports recent attempts, success percentage, transfer MB/s,
+source-audio hours/hour, and terminal outcomes for each provider.
+
+`SAM_YOUTUBE_PROXY_CONFIG` may name one config file or a directory containing
+one mode-0600 `.conf` file per direct proxy. The service deterministically pins
+all requests for a source to one config. A stage retry changes the affinity key
+and therefore fails over through the pool without putting credentials in the
+frontier or manifests. Search queries are pinned independently.
+
+For a direct pool, create a mode-0700 directory, write one `--proxy ...` line
+to each mode-0600 `.conf`, and point `SAM_YOUTUBE_PROXY_CONFIG` at the directory.
+
+The config is applied only to YouTube discovery, full-source audio transfer,
+and selected-section retrieval. All other providers remain direct. Worker logs and
+frontier errors redact URL user information, while child process arguments
+contain only a selected config path. Test the credential before switching
+discovery; an HTTP 407 response means Webshare rejected the proxy
+username/password, while `Invalid download token` means a proxy-list export URL
+must be regenerated in Webshare.
+
+When a YouTube proxy is unavailable, the round-robin service continues through
+the other six providers rather than weakening the selection policy or using
+account cookies. A one-shot Dailymotion-only run remains available:
 
 ```bash
 uv run sam-pipeline-youtube-random \

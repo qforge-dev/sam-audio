@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,9 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 CATALOG_FILENAME = "catalog.sqlite3"
 MANIFEST_FILENAME = "manifest.json"
+DEFAULT_SNAPSHOT_SIZE = 2500
+LOCAL_REVIEW_RETENTION_RECORDS = 5000
+STAGED_RUN_SEAL_FILENAME = ".sealed.json"
 
 
 def _now() -> str:
@@ -170,6 +174,13 @@ def promote_once(runs_dir: Path, workspace: Path) -> int:
     added = 0
     manifests = sorted(runs_dir.glob("run-*/manifest.json"))
     for manifest_path in manifests:
+        run_dir = manifest_path.parent
+        staged_run = run_dir.name.startswith("run-staged-")
+        run_closed = not staged_run or (run_dir / STAGED_RUN_SEAL_FILENAME).is_file()
+        if not run_closed:
+            # Staged writers publish the seal only after attempts and manifest
+            # data are durable. Never read or prune a directory still in use.
+            continue
         try:
             stat = manifest_path.stat()
         except FileNotFoundError:
@@ -181,11 +192,13 @@ def promote_once(runs_dir: Path, workspace: Path) -> int:
             (manifest_key,),
         ).fetchone()
         if cached and cached["signature"] == signature:
+            if run_closed:
+                shutil.rmtree(run_dir, ignore_errors=True)
             continue
         manifest = _safe_manifest(manifest_path)
         if not manifest:
             continue
-        run_dir = manifest_path.parent
+        prune_run = True
         for source_record in manifest.get("records", []):
             if source_record.get("retrieval_status") != "success":
                 continue
@@ -195,6 +208,7 @@ def promote_once(runs_dir: Path, workspace: Path) -> int:
                 continue
             source = run_dir / str(source_record.get("local_path", ""))
             if not source.is_file():
+                prune_run = False
                 continue
             start_milliseconds = round(
                 float(source_record.get("clip_start_seconds", 0)) * 1000
@@ -214,6 +228,7 @@ def promote_once(runs_dir: Path, workspace: Path) -> int:
             digest = declared_digest or actual_digest
             if len(digest) != 64 or actual_digest != digest:
                 logger.warning("Skipping hash mismatch: %s", source)
+                prune_run = False
                 continue
             filename = f"{digest}.wav"
             destination = raw_dir / filename
@@ -263,6 +278,11 @@ def promote_once(runs_dir: Path, workspace: Path) -> int:
                     _now(),
                 ),
             )
+        if prune_run and run_closed:
+            # Every useful WAV now has a hard link in raw-audio and all
+            # provenance is in SQLite. Retaining the acquisition copy made the
+            # completed-run directory grow without bound.
+            shutil.rmtree(run_dir, ignore_errors=True)
     total = connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]
     _heartbeat(connection, "promoter", manifests=len(manifests), raw_records=total)
     connection.close()
@@ -447,6 +467,7 @@ def assemble_once(
                     "INSERT OR IGNORE INTO rejected VALUES(?,?,?)",
                     (row["sha256"], "automated_model_gate", _now()),
                 )
+            (workspace / "raw-audio" / row["filename"]).unlink(missing_ok=True)
             continue
         count = connection.execute(
             """SELECT COUNT(*) FROM accepted a JOIN records r USING(sha256)
@@ -473,6 +494,7 @@ def assemble_once(
                     "INSERT OR IGNORE INTO rejected VALUES(?,?,?)",
                     (row["sha256"], reason, _now()),
                 )
+            (workspace / "raw-audio" / row["filename"]).unlink(missing_ok=True)
             continue
         source = workspace / "raw-audio" / row["filename"]
         destination = workspace / "accepted" / "audio" / row["filename"]
@@ -484,6 +506,7 @@ def assemble_once(
                 "INSERT OR IGNORE INTO accepted(sha256,accepted_at) VALUES(?,?)",
                 (row["sha256"], _now()),
             )
+        source.unlink(missing_ok=True)
         added += 1
     current_manifest = _safe_manifest(workspace / "accepted" / MANIFEST_FILENAME)
     current_diversity = (current_manifest or {}).get("source_diversity", {})
@@ -761,7 +784,7 @@ def _source_scan_status(workspace: Path) -> dict[str, Any]:
 
 def progress_snapshot(
     workspace: Path,
-    snapshot_size: int = 5000,
+    snapshot_size: int = DEFAULT_SNAPSHOT_SIZE,
     *,
     throughput_window_minutes: float = 60.0,
     target_hours: float = 10_000.0,
@@ -1571,7 +1594,7 @@ def publish_snapshot(
     if not audit["all_requirements_pass"]:
         raise RuntimeError("Refusing to publish a snapshot that failed verification")
     s3 = boto3.client("s3")
-    transfer_config = TransferConfig(max_concurrency=max(1, upload_concurrency))
+    transfer_config = TransferConfig(max_concurrency=1, use_threads=False)
     root = prefix.strip("/")
     snapshot_prefix = f"{root}/snapshots/{snapshot_id}"
     ready_key = f"{snapshot_prefix}/READY.json"
@@ -1582,17 +1605,21 @@ def publish_snapshot(
         if error.response.get("Error", {}).get("Code") not in {"NoSuchKey", "404"}:
             raise
     records = json.loads((dataset_dir / MANIFEST_FILENAME).read_text())["records"]
-    uploaded = 0
-    for record in records:
+
+    def upload_record(record: dict[str, Any]) -> int:
         source = dataset_dir / str(record["local_path"])
         key = f"{root}/audio/{record['sha256']}.wav"
         try:
             s3.head_object(Bucket=bucket, Key=key)
+            return 0
         except ClientError as error:
             if error.response.get("Error", {}).get("Code") not in {"404", "NoSuchKey"}:
                 raise
-            s3.upload_file(str(source), bucket, key, Config=transfer_config)
-            uploaded += 1
+        s3.upload_file(str(source), bucket, key, Config=transfer_config)
+        return 1
+
+    with ThreadPoolExecutor(max_workers=max(1, upload_concurrency)) as executor:
+        uploaded = sum(executor.map(upload_record, records))
     manifest_path = dataset_dir / MANIFEST_FILENAME
     manifest_digest = _sha256(manifest_path)
     (dataset_dir / "manifest.sha256").write_text(
@@ -1628,7 +1655,7 @@ def publish_due_once(
     *,
     bucket: str,
     prefix: str,
-    snapshot_size: int = 5000,
+    snapshot_size: int = DEFAULT_SNAPSHOT_SIZE,
     upload_concurrency: int = 10,
 ) -> int:
     """Publish every newly completed immutable snapshot boundary."""
@@ -1670,16 +1697,72 @@ def publish_due_once(
                     ready["snapshot_uri"],
                 ),
             )
+        # READY.json is now the durable commit marker. Local snapshot hard
+        # links and manifests are staging artifacts, not another permanent
+        # copy of the dataset.
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
         completed += 1
+    pruned = prune_published_local_state(workspace, connection)
     _heartbeat(
         connection,
         "snapshot_publisher",
         accepted=accepted,
         last_published=max(published | set(due), default=0),
         next_snapshot=(accepted // snapshot_size + 1) * snapshot_size,
+        **pruned,
     )
     connection.close()
     return completed
+
+
+def prune_published_local_state(
+    workspace: Path,
+    connection: sqlite3.Connection,
+    *,
+    retain_records: int = LOCAL_REVIEW_RETENTION_RECORDS,
+) -> dict[str, int]:
+    """Prune only audio already durable in S3 or terminal in the catalog."""
+    published_through = int(
+        connection.execute(
+            "SELECT COALESCE(MAX(record_count),0) FROM snapshots"
+        ).fetchone()[0]
+    )
+    accepted_count = int(
+        connection.execute("SELECT COUNT(*) FROM accepted").fetchone()[0]
+    )
+    cutoff = min(published_through, max(0, accepted_count - retain_records))
+    accepted_pruned = 0
+    if cutoff:
+        rows = connection.execute(
+            """SELECT r.filename FROM accepted a JOIN records r USING(sha256)
+            WHERE a.sequence<=?""",
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            path = workspace / "accepted" / "audio" / row["filename"]
+            accepted_pruned += int(path.exists())
+            path.unlink(missing_ok=True)
+    raw_rows = connection.execute(
+        """SELECT r.filename FROM records r
+        LEFT JOIN accepted a USING(sha256) LEFT JOIN rejected x USING(sha256)
+        WHERE a.sha256 IS NOT NULL OR x.sha256 IS NOT NULL"""
+    ).fetchall()
+    raw_pruned = 0
+    for row in raw_rows:
+        path = workspace / "raw-audio" / row["filename"]
+        raw_pruned += int(path.exists())
+        path.unlink(missing_ok=True)
+    snapshot_dirs_pruned = 0
+    for row in connection.execute("SELECT snapshot_id FROM snapshots"):
+        path = workspace / "snapshots" / row["snapshot_id"]
+        snapshot_dirs_pruned += int(path.exists())
+        shutil.rmtree(path, ignore_errors=True)
+    return {
+        "local_review_records_retained": retain_records,
+        "accepted_audio_pruned": accepted_pruned,
+        "terminal_raw_audio_pruned": raw_pruned,
+        "snapshot_staging_dirs_pruned": snapshot_dirs_pruned,
+    }
 
 
 def _loop(action: Any, poll_seconds: float, worker: str) -> None:
@@ -1788,7 +1871,7 @@ def main() -> None:
     publish_due.add_argument("--workspace", type=Path, required=True)
     publish_due.add_argument("--bucket", required=True)
     publish_due.add_argument("--prefix", default="cinematic-continuous")
-    publish_due.add_argument("--snapshot-size", type=int, default=5000)
+    publish_due.add_argument("--snapshot-size", type=int, default=DEFAULT_SNAPSHOT_SIZE)
     publish_due.add_argument("--upload-concurrency", type=int, default=10)
     publish_due.add_argument("--follow", action="store_true")
     publish_due.add_argument("--poll-seconds", type=float, default=30.0)

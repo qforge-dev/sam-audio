@@ -13,6 +13,9 @@ from sam_audio_pipeline.source_frontier import (
     frontier_counts,
     frontier_snapshot,
     heartbeat_worker,
+    provider_circuit_record_failure,
+    provider_circuit_record_success,
+    provider_circuit_snapshot,
     release_worker_leases,
     retry_source,
 )
@@ -25,6 +28,7 @@ def candidate(video_id: str) -> list[dict[str, object]]:
             "video_id": video_id,
             "source_platform": "dailymotion",
             "source_url": f"https://example.test/{video_id}",
+            "duration_seconds": 600.0,
             "clip_start_seconds": 0.0,
         }
     ]
@@ -84,6 +88,122 @@ def test_claims_are_exclusive_and_expired_leases_recover(tmp_path: Path) -> None
             next_state="downloaded",
             now=32,
         )
+
+
+def test_claims_balance_in_flight_workers_across_platforms(tmp_path: Path) -> None:
+    connection = connect_frontier(tmp_path)
+    youtube = candidate("youtube-high")
+    youtube[0]["source_platform"] = "youtube"
+    vimeo = candidate("vimeo-low")
+    vimeo[0]["source_platform"] = "vimeo"
+    enqueue_source(connection, youtube, priority=100, now=10)
+    enqueue_source(connection, vimeo, priority=1, now=11)
+
+    first = claim_source(
+        connection, "discovered", worker="download-0", lease_seconds=100, now=20
+    )
+    second = claim_source(
+        connection, "discovered", worker="download-1", lease_seconds=100, now=20
+    )
+
+    assert first is not None
+    assert first["platform"] == "youtube"
+    assert second is not None
+    assert second["platform"] == "vimeo"
+
+
+def test_claims_use_provider_weights_for_active_leases(tmp_path: Path) -> None:
+    connection = connect_frontier(tmp_path)
+    for index in range(4):
+        dailymotion = candidate(f"dm-{index}")
+        youtube = candidate(f"yt-{index}")
+        youtube[0]["source_platform"] = "youtube"
+        enqueue_source(connection, dailymotion, now=10 + index)
+        enqueue_source(connection, youtube, now=20 + index)
+
+    claimed = [
+        claim_source(
+            connection,
+            "discovered",
+            worker=f"download-{index}",
+            lease_seconds=100,
+            now=30,
+            provider_weights={"dailymotion": 4, "youtube": 1},
+        )
+        for index in range(5)
+    ]
+
+    assert all(item is not None for item in claimed)
+    assert [item["platform"] for item in claimed].count("dailymotion") == 4
+    assert [item["platform"] for item in claimed].count("youtube") == 1
+
+
+def test_provider_circuit_skips_open_provider_and_allows_one_recovery_probe(
+    tmp_path: Path,
+) -> None:
+    connection = connect_frontier(tmp_path)
+    youtube = candidate("youtube")
+    youtube[0]["source_platform"] = "youtube"
+    dailymotion = candidate("dailymotion")
+    enqueue_source(connection, youtube, priority=100, now=10)
+    enqueue_source(connection, dailymotion, priority=1, now=11)
+    opened = provider_circuit_record_failure(
+        connection,
+        "youtube",
+        "HTTP 402",
+        failure_threshold=1,
+        cooldown_seconds=300,
+        now=20,
+    )
+    assert opened["state"] == "open"
+
+    healthy = claim_source(
+        connection,
+        "discovered",
+        worker="download-0",
+        lease_seconds=30,
+        respect_provider_circuits=True,
+        now=21,
+    )
+    assert healthy is not None
+    assert healthy["platform"] == "dailymotion"
+    finish_source(
+        connection,
+        healthy["source_key"],
+        worker="download-0",
+        expected_state="discovered",
+        next_state="downloaded",
+        now=22,
+    )
+
+    probe = claim_source(
+        connection,
+        "discovered",
+        worker="download-1",
+        lease_seconds=30,
+        respect_provider_circuits=True,
+        now=321,
+    )
+    assert probe is not None
+    assert probe["platform"] == "youtube"
+    assert provider_circuit_snapshot(connection, now=321)["youtube"]["state"] == (
+        "half_open"
+    )
+    assert (
+        claim_source(
+            connection,
+            "discovered",
+            worker="download-2",
+            lease_seconds=30,
+            respect_provider_circuits=True,
+            now=322,
+        )
+        is None
+    )
+    provider_circuit_record_success(connection, "youtube", now=323)
+    circuit = provider_circuit_snapshot(connection, now=323)["youtube"]
+    assert circuit["state"] == "closed"
+    assert circuit["consecutive_failures"] == 0
 
 
 def test_restarted_worker_reclaims_its_own_unexpired_lease(tmp_path: Path) -> None:
@@ -188,7 +308,7 @@ def test_transition_and_snapshot_report_stage_timing(tmp_path: Path) -> None:
         worker="downloader",
         expected_state="discovered",
         next_state="downloaded",
-        details={"bytes": 123},
+        details={"bytes": 12_000_000, "download_seconds": 2.0},
         now=122,
     )
     snapshot = frontier_snapshot(tmp_path, window_minutes=15, now=130)
@@ -206,6 +326,17 @@ def test_transition_and_snapshot_report_stage_timing(tmp_path: Path) -> None:
         "duration_p50_seconds": 12.0,
         "duration_p95_seconds": 12.0,
     }
+    platform = snapshot["platforms"]["dailymotion"]
+    assert platform["states"]["downloaded"] == 1
+    assert platform["download_attempts"] == 1
+    assert platform["download_success_percent"] == 100.0
+    assert platform["download_megabytes_per_second"] == 6.0
+    assert platform["source_audio_hours_per_wall_hour"] > 0
+    throughput = snapshot["download_throughput"]
+    assert throughput["completed_file_megabytes_per_second"] == pytest.approx(
+        12 / 900, abs=0.001
+    )
+    assert throughput["host_network"]["receive_megabytes_per_second"] is None
 
 
 def test_snapshot_excludes_cache_bookkeeping_from_work_latency(tmp_path: Path) -> None:
@@ -227,9 +358,7 @@ def test_snapshot_excludes_cache_bookkeeping_from_work_latency(tmp_path: Path) -
         ),
     )
 
-    stage = frontier_snapshot(tmp_path, window_minutes=15, now=130)["stages"][
-        "scan"
-    ]
+    stage = frontier_snapshot(tmp_path, window_minutes=15, now=130)["stages"]["scan"]
 
     assert stage["events"] == 1
     assert stage["active_events"] == 0

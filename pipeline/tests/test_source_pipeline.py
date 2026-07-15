@@ -104,6 +104,38 @@ def test_discovery_does_not_search_when_frontier_is_full(
     assert not searched
 
 
+def test_discovery_enforces_each_platform_high_water(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    connection = connect_frontier(workspace)
+    enqueue_source(connection, [_candidate("one", 0)])
+    connection.close()
+    searched = False
+
+    def discover(*args, **kwargs):
+        nonlocal searched
+        searched = True
+        return []
+
+    monkeypatch.setattr(source_pipeline, "discover_candidates", discover)
+    settings = DiscoverySettings(
+        workspace=workspace,
+        discovery_dir=tmp_path / "discovery",
+        source="dailymotion",
+        minimum_candidates=1,
+        discovered_high_water=10,
+        platform_high_water=1,
+    )
+
+    result = discover_into_frontier_once(settings, seed=8)
+
+    assert result["status"] == "high_water"
+    assert result["platform"] == "dailymotion"
+    assert result["platform_counts"]["discovered"] == 1
+    assert not searched
+
+
 def test_discovery_refresh_does_not_reset_existing_sources(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -149,6 +181,7 @@ def test_one_shot_discovery_advances_past_a_poison_seed(
         source_content_minutes_per_hour=10.0,
         max_clips_per_video=60,
         discovered_high_water=10,
+        platform_high_water=10,
         scan_cache=None,
         cached_scan_high_water=4,
         seed_file=seed_file,
@@ -393,6 +426,7 @@ def test_download_stage_atomically_publishes_a_valid_source(
 
     assert result is not None
     assert result["status"] == "downloaded"
+    assert result["source_format"]["client"] == "dailymotion-source-frontier"
     assert Path(result["downloaded_path"]).read_bytes() == b"media"
     connection = connect_frontier(workspace)
     row = connection.execute("SELECT * FROM source_jobs").fetchone()
@@ -470,9 +504,7 @@ def test_download_stage_does_not_retry_unavailable_formats(
     ).fetchone()
     assert tuple(row) == ("rejected", 0, None)
     details = json.loads(
-        connection.execute(
-            "SELECT details_json FROM source_stage_events"
-        ).fetchone()[0]
+        connection.execute("SELECT details_json FROM source_stage_events").fetchone()[0]
     )
     assert "Requested format is not available" in details["error"]
 
@@ -673,8 +705,12 @@ def test_extract_stage_writes_rotating_manifest_and_completes_source(
     assert result is not None
     assert result["status"] == "complete"
     assert result["clips_published"] == 1
-    manifest = json.loads((writer.run_dir / "manifest.json").read_text())
+    sealed_runs = list(settings.runs_dir.glob("run-staged-*/.sealed.json"))
+    assert len(sealed_runs) == 1
+    sealed_run = sealed_runs[0].parent
+    manifest = json.loads((sealed_run / "manifest.json").read_text())
     assert len(manifest["records"]) == 1
+    assert writer.run_dir != sealed_run
     connection = connect_frontier(settings.workspace)
     row = connection.execute("SELECT * FROM source_jobs").fetchone()
     assert row["state"] == "complete"

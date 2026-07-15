@@ -16,6 +16,12 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ["*"]
@@ -139,12 +145,14 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
                 Resource: !GetAtt ArtifactBucket.Arn
               - Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:GetObjectVersion
                   - s3:PutObject
+                  - s3:AbortMultipartUpload
                 Resource: !Sub "${ArtifactBucket.Arn}/*"
               - Effect: Allow
                 Action:

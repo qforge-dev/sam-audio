@@ -88,6 +88,8 @@
     <section class="funnel" id="autoscaler" hidden></section>
     <div class="section-head" id="throughputHeading" hidden><div><h2>Rolling throughput</h2><p>Use 5 minutes for immediate movement, 15 for tuning, and 60 for the stable trend.</p></div></div>
     <div class="table-wrap" id="throughputWrap" hidden><table><thead><tr><th>Window / stage</th><th>Clips</th><th>Clips/min</th><th>Audio min/min</th><th>Audio hours/hour</th></tr></thead><tbody id="throughput"></tbody></table></div>
+    <div class="section-head" id="sourceHeading" hidden><div><h2>Downloader by source</h2><p>Recent transfer speed and source-audio throughput, plus the current queue outcome.</p></div></div>
+    <div class="table-wrap" id="sourceWrap" hidden><table><thead><tr><th>Source</th><th>Circuit</th><th>Queued</th><th>Attempts</th><th>Success</th><th>Transfer MB/s</th><th>Source audio h/h</th><th>Complete</th><th>Rejected</th></tr></thead><tbody id="sourcePlatforms"></tbody></table></div>
     <div class="section-head" id="batchHeading"><div><h2>Acquisition batches</h2><p>Counts update every five seconds.</p></div></div>
     <div class="table-wrap"><table><thead><tr><th>Batch</th><th>Status</th><th>Attempts</th><th>Downloaded</th><th>M2D scored</th><th>M2D pass</th><th>Speech scored</th><th>Speech pass</th><th>Combined</th></tr></thead><tbody id="batches"></tbody></table></div>
     <div class="section-head" id="workerHeading" hidden><div><h2>Independent workers</h2><p>Each producer and consumer advances at its own rate.</p></div></div>
@@ -196,6 +198,8 @@
             const counts = frontier.counts || {};
             const ages = frontier.oldest_ready_minutes || {};
             const stages = frontier.stages || {};
+            const downloadThroughput = frontier.download_throughput || {};
+            const hostNetwork = downloadThroughput.host_network || {};
             const sourceWorkers = frontier.workers || [];
             const healthySourceWorkers = sourceWorkers.filter(worker => worker.state === 'running').length;
             const stageText = stage => {
@@ -206,6 +210,7 @@
             $('sourceFrontierHeading').hidden = false;
             $('sourceFrontier').hidden = false;
             $('sourceFrontier').innerHTML = [
+              ['Host receive', hostNetwork.receive_megabytes_per_second == null ? 'warming up' : `${Number(hostNetwork.receive_megabytes_per_second).toFixed(1)} MB/s`, `${Number(downloadThroughput.completed_file_megabytes_per_second || 0).toFixed(1)} MB/s in completed source files over ${Number(frontier.window_minutes || 0).toFixed(0)} min · host sample ${Number(hostNetwork.observed_seconds || 0).toFixed(0)} s`],
               ['Ready to download', number(counts.discovered), ages.discovered == null ? 'No ready source' : `oldest ${Number(ages.discovered).toFixed(1)} min · ${stageText('download')}`],
               ['Ready to scan', number(counts.downloaded), `${(Number(frontier.downloaded_queue_bytes || 0) / 1073741824).toFixed(2)} GiB queued · ${ages.downloaded == null ? stageText('scan') : `oldest ${Number(ages.downloaded).toFixed(1)} min · ${stageText('scan')}`}`],
               ['Ready to extract', number(counts.scanned), ages.scanned == null ? stageText('extract') : `oldest ${Number(ages.scanned).toFixed(1)} min · ${stageText('extract')}`],
@@ -251,6 +256,16 @@
           $('throughputHeading').hidden = false; $('throughputWrap').hidden = false;
           const windows = data.throughput_windows || {'60': data.throughput};
           $('throughput').innerHTML = Object.entries(windows).flatMap(([window,rates]) => Object.entries(rates).map(([stage,rate]) => `<tr><td><strong>${window} min · ${label(stage)}</strong><br><small class="muted">${Number(rate.observed_minutes).toFixed(1)} min observed</small></td><td>${number(rate.clips)}</td><td>${Number(rate.clips_per_minute).toFixed(2)}</td><td>${Number(rate.audio_minutes_per_minute).toFixed(2)}</td><td>${Number(rate.audio_hours_per_hour).toFixed(2)}</td></tr>`)).join('');
+          const sourcePlatforms = (data.source_frontier || {}).platforms || {};
+          $('sourceHeading').hidden = false;
+          $('sourceWrap').hidden = false;
+          $('sourcePlatforms').innerHTML = Object.entries(sourcePlatforms).map(([source,metrics]) => {
+            const states = metrics.states || {};
+            const circuit = metrics.circuit || {state: 'closed'};
+            const circuitHelp = circuit.state === 'open' ? `${Math.ceil(Number(circuit.retry_in_seconds || 0))}s cooldown` : circuit.state === 'half_open' ? 'one recovery probe' : `${number(circuit.consecutive_failures || 0)} recent failures`;
+            const queued = Number(states.discovered || 0) + Number(states.downloaded || 0) + Number(states.scanned || 0);
+            return `<tr><td><strong>${label(source)}</strong></td><td><strong>${label(circuit.state)}</strong><br><small class="muted">${circuitHelp}</small></td><td>${number(queued)}</td><td>${number(metrics.download_attempts)}<br><small class="muted">${Number(metrics.download_attempts_per_minute || 0).toFixed(2)}/min</small></td><td>${Number(metrics.download_success_percent || 0).toFixed(1)}%<br><small class="muted">${number(metrics.download_successes)} sources</small></td><td>${Number(metrics.download_megabytes_per_second || 0).toFixed(2)}</td><td>${Number(metrics.source_audio_hours_per_wall_hour || 0).toFixed(2)}</td><td>${number(states.complete)}</td><td>${number(states.rejected)}</td></tr>`;
+          }).join('') || '<tr><td colspan="9" class="muted">Waiting for source discovery.</td></tr>';
           $('batchHeading').hidden = true;
           $('batches').closest('.table-wrap').hidden = true;
           $('workerHeading').hidden = false; $('workerWrap').hidden = false;
@@ -261,7 +276,7 @@
           const diversityText = diversity.policy ? ` · source budget ${number(diversity.base_clips_per_source)} base, ${number(diversity.content_minutes_per_source_hour)} min/hour, max ${number(diversity.maximum_clips_per_source)}` : '';
           $('workers').innerHTML = data.workers.map(worker => `<tr><td><strong>${label(worker.worker)}</strong></td><td><span class="status ${worker.state}">${label(worker.state)}</span></td><td>${new Date(worker.updated_at).toLocaleTimeString()}</td><td>${Object.entries(worker.details || {}).map(([key,value]) => `${label(key)} ${number(value)}`).join(' · ')}</td></tr>`).join('') + `<tr><td><strong>Configured pools</strong></td><td><span class="status running">${configured.autoscaling_enabled ? 'autoscaling' : 'fixed'}</span></td><td>service environment</td><td>download ${number(downloadBounds[0])}–${number(downloadBounds[1])} across ${number(configured.acquisition_producers || 1)} acquisition producers · M2D processes ${number(configured.m2d_workers)} · ASR processes ${number(configured.asr_workers)} / inference slots ${number(asrBounds[0])}–${number(asrBounds[1])} · S3 concurrency ${number(configured.upload_concurrency)}${diversityText}</td></tr>`;
           $('snapshotHeading').hidden = false; $('snapshotWrap').hidden = false;
-          $('snapshots').innerHTML = data.published_snapshots.length ? data.published_snapshots.map(snapshot => `<tr><td><strong>${snapshot.snapshot_id}</strong></td><td>${number(snapshot.record_count)}</td><td>${new Date(snapshot.published_at).toLocaleString()}</td><td>${snapshot.s3_prefix}</td></tr>`).join('') : '<tr><td colspan="4" class="muted">The first snapshot will publish automatically at 5,000 accepted clips.</td></tr>';
+          $('snapshots').innerHTML = data.published_snapshots.length ? data.published_snapshots.map(snapshot => `<tr><td><strong>${snapshot.snapshot_id}</strong></td><td>${number(snapshot.record_count)}</td><td>${new Date(snapshot.published_at).toLocaleString()}</td><td>${snapshot.s3_prefix}</td></tr>`).join('') : '<tr><td colspan="4" class="muted">The first snapshot will publish automatically at 2,500 accepted clips.</td></tr>';
           $('combinedNote').textContent = 'Every accepted clip passes stereo/source quality, metadata exclusions, duration-scaled M2D voice + instrumental music + SFX overlap, English foreground speech, deduplication, and source diversity. Manual review is diagnostic only.';
           $('error').textContent = '';
           return;

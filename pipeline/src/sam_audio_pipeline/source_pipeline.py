@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -25,8 +26,11 @@ from .source_frontier import (
     enqueue_sources,
     finish_source,
     frontier_counts,
+    frontier_platform_counts,
     frontier_snapshot,
     heartbeat_worker,
+    provider_circuit_record_failure,
+    provider_circuit_record_success,
     release_worker_leases,
     retry_source,
 )
@@ -58,12 +62,17 @@ from .youtube_random import (
 )
 
 logger = logging.getLogger(__name__)
+STAGED_RUN_SEAL_FILENAME = ".sealed.json"
 
 
 def _called_process_error_text(error: subprocess.CalledProcessError) -> str:
     """Return a bounded failure description that keeps the useful tool output."""
-    output = "\n".join(
-        part.strip() for part in (error.stdout, error.stderr) if part and part.strip()
+    output = youtube_random._redact_proxy_credentials(
+        "\n".join(
+            part.strip()
+            for part in (error.stdout, error.stderr)
+            if part and part.strip()
+        )
     )
     if len(output) > 2_000:
         output = output[-2_000:]
@@ -84,19 +93,38 @@ def _heartbeat(
     state: str = "running",
     details: dict[str, Any] | None = None,
 ) -> None:
-    connection = connect_frontier(workspace)
-    heartbeat_worker(
-        connection, worker, stage=stage, state=state, details=details or {}
-    )
-    connection.close()
+    connection = None
+    try:
+        connection = connect_frontier(workspace)
+        heartbeat_worker(
+            connection, worker, stage=stage, state=state, details=details or {}
+        )
+    except sqlite3.OperationalError as error:
+        if "locked" not in str(error).lower():
+            raise
+        # Telemetry is best effort. A synchronized heartbeat burst must never
+        # terminate a producer or consumer worker that is otherwise healthy.
+        logger.warning("%s heartbeat lock contention; continuing", worker)
+    finally:
+        if connection is not None:
+            connection.close()
 
 
-def _release_previous_worker_leases(
-    workspace: Path, worker: str, state: str
-) -> None:
-    connection = connect_frontier(workspace)
-    released = release_worker_leases(connection, worker=worker, state=state)
-    connection.close()
+def _release_previous_worker_leases(workspace: Path, worker: str, state: str) -> None:
+    connection = None
+    try:
+        connection = connect_frontier(workspace)
+        released = release_worker_leases(connection, worker=worker, state=state)
+    except sqlite3.OperationalError as error:
+        if "locked" not in str(error).lower():
+            raise
+        # claim_source can reclaim an unexpired lease owned by the same stable
+        # worker ID, so startup cleanup is safe to skip during lock contention.
+        logger.warning("%s lease cleanup lock contention; continuing", worker)
+        return
+    finally:
+        if connection is not None:
+            connection.close()
     if released:
         logger.info("%s released %d previous %s leases", worker, released, state)
 
@@ -138,6 +166,7 @@ class DiscoverySettings:
     source_content_minutes_per_hour: float = 10.0
     max_clips_per_video: int = 60
     discovered_high_water: int = 4000
+    platform_high_water: int = 600
     scan_cache: Path | None = None
     cached_scan_high_water: int = 64
 
@@ -146,11 +175,16 @@ class DiscoverySettings:
 class DownloadSettings:
     workspace: Path
     source_cache: Path
+    staging_dir: Path | None = None
     downloaded_high_water: int = 64
     downloaded_high_water_bytes: int = 8 * 1024**3
     lease_seconds: float = 7200.0
     max_attempts: int = 4
     retry_backoff_seconds: float = 15.0
+    circuit_failure_threshold: int = 5
+    circuit_cooldown_seconds: float = 300.0
+    circuit_max_cooldown_seconds: float = 3600.0
+    provider_weights: dict[str, float] | None = None
     control_file: Path | None = None
 
 
@@ -272,9 +306,7 @@ def adopt_cached_scans(
                         ),
                     )
                 continue
-            elif regions and not blocked and (
-                not require_proxy_asr or probe_accepted
-            ):
+            elif regions and not blocked and (not require_proxy_asr or probe_accepted):
                 if passing_capacity <= 0:
                     continue
                 state = "scanned"
@@ -365,7 +397,22 @@ def discover_into_frontier_once(
             guidance=guidance,
         )
     before = frontier_counts(connection)
-    capacity = max(0, settings.discovered_high_water - before["discovered"])
+    before_platforms = frontier_platform_counts(connection)
+    platform_counts = before_platforms.get(
+        settings.source,
+        {
+            state: 0
+            for state in ("discovered", "downloaded", "scanned", "complete", "rejected")
+        },
+    )
+    platform_active = sum(
+        platform_counts.get(state, 0)
+        for state in ("discovered", "downloaded", "scanned")
+    )
+    capacity = min(
+        max(0, settings.discovered_high_water - before["discovered"]),
+        max(0, settings.platform_high_water - platform_active),
+    )
     if capacity == 0:
         connection.close()
         return {
@@ -373,6 +420,8 @@ def discover_into_frontier_once(
             "status": "high_water",
             "inserted_sources": 0,
             "frontier": before,
+            "platform": settings.source,
+            "platform_counts": platform_counts,
             "cache_adoption": cache_adoption,
             "duration_seconds": round(time.perf_counter() - started, 3),
         }
@@ -428,6 +477,7 @@ def discover_into_frontier_once(
         priority=lambda group: _cinematic_candidate_priority(group[0]),
     )
     after = frontier_counts(connection)
+    after_platform = frontier_platform_counts(connection).get(settings.source, {})
     connection.close()
     result = {
         "seed": seed,
@@ -439,6 +489,8 @@ def discover_into_frontier_once(
         "selected_source_count": len(selected),
         "inserted_sources": inserted,
         "frontier": after,
+        "platform": settings.source,
+        "platform_counts": after_platform,
         "cache_adoption": cache_adoption,
         "duration_seconds": round(time.perf_counter() - started, 3),
     }
@@ -447,6 +499,7 @@ def discover_into_frontier_once(
 
 
 def run_discovery(args: argparse.Namespace) -> None:
+    youtube_random.YOUTUBE_PROXY_CONFIG = getattr(args, "youtube_proxy_config", None)
     settings = DiscoverySettings(
         workspace=args.workspace,
         discovery_dir=args.discovery_dir,
@@ -462,12 +515,18 @@ def run_discovery(args: argparse.Namespace) -> None:
         source_content_minutes_per_hour=args.source_content_minutes_per_hour,
         max_clips_per_video=args.max_clips_per_video,
         discovered_high_water=args.discovered_high_water,
+        platform_high_water=args.platform_high_water,
         scan_cache=args.scan_cache,
         cached_scan_high_water=args.cached_scan_high_water,
     )
     seed_file = args.seed_file or args.workspace / "source-discovery-next-seed"
     seed = _read_seed(seed_file, args.seed)
-    _heartbeat(args.workspace, "discovery", "discovery", details={"seed": seed})
+    _heartbeat(
+        args.workspace,
+        "discovery",
+        "discovery",
+        details={"seed": seed, "source": args.source},
+    )
     while True:
         try:
             result = discover_into_frontier_once(settings, seed=seed)
@@ -484,7 +543,9 @@ def run_discovery(args: argparse.Namespace) -> None:
                 args.workspace / "source-discovery-status.json",
                 {**result, "observed_at": time.time()},
             )
-            logger.exception("Discovery seed %d failed; retrying", seed)
+            logger.exception(
+                "Discovery source %s seed %d failed; retrying", args.source, seed
+            )
             if args.once:
                 # The service controller runs one fresh child per batch. Do not
                 # let one deterministically empty/rate-limited seed poison the
@@ -503,12 +564,14 @@ def run_discovery(args: argparse.Namespace) -> None:
             "discovery",
             details={
                 "seed": seed,
+                "source": args.source,
                 "status": result["status"],
                 "inserted_sources": result["inserted_sources"],
             },
         )
         logger.info(
-            "Discovery seed %d: %s; inserted=%d frontier=%s in %.1fs",
+            "Discovery source %s seed %d: %s; inserted=%d frontier=%s in %.1fs",
+            args.source,
             seed,
             result["status"],
             result["inserted_sources"],
@@ -559,6 +622,23 @@ def _existing_download(target_dir: Path) -> dict[str, Any] | None:
     return {**metadata, "downloaded_path": str(source)}
 
 
+def _publish_download(staging: Path, target: Path) -> None:
+    """Atomically publish a download, including across staging filesystems."""
+    if staging.stat().st_dev == target.parent.stat().st_dev:
+        os.replace(staging, target)
+        return
+    publishing = Path(
+        tempfile.mkdtemp(prefix=".source-publish-", dir=target.parent)
+    )
+    shutil.rmtree(publishing)
+    try:
+        shutil.copytree(staging, publishing)
+        os.replace(publishing, target)
+        shutil.rmtree(staging)
+    finally:
+        shutil.rmtree(publishing, ignore_errors=True)
+
+
 def _reject_download(
     connection: Any,
     job: dict[str, Any],
@@ -598,17 +678,25 @@ def download_source_once(
         "discovered",
         worker=worker,
         lease_seconds=settings.lease_seconds,
+        respect_provider_circuits=True,
+        provider_weights=settings.provider_weights,
     )
     if job is None:
         connection.close()
         return None
     base = job["candidates"][0]
+    source_platform = str(base.get("source_platform") or "unknown")
+    retrieval_base = {
+        **base,
+        "_youtube_proxy_attempt": max(0, int(job["stage_attempts"]) - 1),
+    }
     target_dir = settings.source_cache / _source_cache_key(job["source_key"])
     settings.source_cache.mkdir(parents=True, exist_ok=True)
     staging: Path | None = None
     try:
         existing = _existing_download(target_dir)
         if existing is not None:
+            provider_circuit_record_success(connection, source_platform)
             finish_source(
                 connection,
                 job["source_key"],
@@ -626,8 +714,9 @@ def download_source_once(
             return {"status": "recovered", **existing}
         if target_dir.exists():
             shutil.rmtree(target_dir)
-        target_info = _preflight_source_for_scan(base)
+        target_info = _preflight_source_for_scan(retrieval_base)
         if not target_info.get("quality_format_available", True):
+            provider_circuit_record_success(connection, source_platform)
             result = _reject_download(
                 connection,
                 job,
@@ -637,14 +726,17 @@ def download_source_once(
             )
             connection.close()
             return result
-        staging = Path(
-            tempfile.mkdtemp(prefix=".source-download-", dir=settings.source_cache)
-        )
+        staging_root = settings.staging_dir or settings.source_cache
+        staging_root.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".source-download-", dir=staging_root))
         transfer_started = time.perf_counter()
-        source, info = _download_full_source_for_scan(base, staging)
+        source, info = _download_full_source_for_scan(retrieval_base, staging)
         transfer_seconds = time.perf_counter() - transfer_started
-        source_format = _source_format(source, info, "dailymotion-source-frontier")
+        source_format = _source_format(
+            source, info, f"{source_platform}-source-frontier"
+        )
         if int(source_format.get("channels") or 0) != 2:
+            provider_circuit_record_success(connection, source_platform)
             result = _reject_download(
                 connection,
                 job,
@@ -655,6 +747,7 @@ def download_source_once(
             connection.close()
             return result
         if int(source_format.get("sample_rate_hz") or 0) < MIN_SOURCE_SAMPLE_RATE:
+            provider_circuit_record_success(connection, source_platform)
             result = _reject_download(
                 connection,
                 job,
@@ -676,10 +769,11 @@ def download_source_once(
             "downloaded_at": time.time(),
         }
         _atomic_json(staging / "metadata.json", metadata)
-        os.replace(staging, target_dir)
+        _publish_download(staging, target_dir)
         staging = None
         downloaded_path = str(target_dir / source.name)
         persisted = {**metadata, "downloaded_path": downloaded_path}
+        provider_circuit_record_success(connection, source_platform)
         finish_source(
             connection,
             job["source_key"],
@@ -699,6 +793,7 @@ def download_source_once(
         return {"status": "downloaded", **persisted}
     except subprocess.CalledProcessError as error:
         if _permanent_media_error(error):
+            provider_circuit_record_success(connection, source_platform)
             result = _reject_download(
                 connection,
                 job,
@@ -708,6 +803,7 @@ def download_source_once(
             connection.close()
             return result
         if _format_unavailable(error):
+            provider_circuit_record_success(connection, source_platform)
             result = _reject_download(
                 connection,
                 job,
@@ -724,6 +820,14 @@ def download_source_once(
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
     attempt = int(job["stage_attempts"])
+    circuit = provider_circuit_record_failure(
+        connection,
+        source_platform,
+        message,
+        failure_threshold=settings.circuit_failure_threshold,
+        cooldown_seconds=settings.circuit_cooldown_seconds,
+        max_cooldown_seconds=settings.circuit_max_cooldown_seconds,
+    )
     state = retry_source(
         connection,
         job["source_key"],
@@ -736,7 +840,12 @@ def download_source_once(
         max_attempts=settings.max_attempts,
     )
     connection.close()
-    return {"status": state, "error": message, "source_key": job["source_key"]}
+    return {
+        "status": state,
+        "error": message,
+        "source_key": job["source_key"],
+        "provider_circuit": circuit,
+    }
 
 
 def _download_loop(
@@ -767,7 +876,13 @@ def _download_loop(
                 last_heartbeat = time.monotonic()
             time.sleep(poll_seconds)
             continue
-        result = download_source_once(settings, worker=worker)
+        try:
+            result = download_source_once(settings, worker=worker)
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error).lower():
+                raise
+            logger.warning("%s frontier lock contention; retrying", worker)
+            result = {"status": "frontier_locked"}
         if time.monotonic() - last_heartbeat >= 10.0:
             _heartbeat(
                 settings.workspace,
@@ -785,14 +900,20 @@ def _download_loop(
 def run_downloaders(args: argparse.Namespace) -> None:
     youtube_random.CLIP_SECONDS = args.clip_seconds
     youtube_random.YTDLP_PYTHON = str(args.yt_dlp_python)
+    youtube_random.YOUTUBE_PROXY_CONFIG = getattr(args, "youtube_proxy_config", None)
     settings = DownloadSettings(
         workspace=args.workspace,
         source_cache=args.source_cache,
+        staging_dir=args.staging_dir,
         downloaded_high_water=args.downloaded_high_water,
         downloaded_high_water_bytes=args.downloaded_high_water_bytes,
         lease_seconds=args.lease_seconds,
         max_attempts=args.max_attempts,
         retry_backoff_seconds=args.retry_backoff_seconds,
+        circuit_failure_threshold=args.circuit_failure_threshold,
+        circuit_cooldown_seconds=args.circuit_cooldown_seconds,
+        circuit_max_cooldown_seconds=args.circuit_max_cooldown_seconds,
+        provider_weights=args.provider_weights,
         control_file=args.control_file,
     )
     threads = [
@@ -1086,7 +1207,13 @@ def _scan_loop(
                 last_heartbeat = time.monotonic()
             time.sleep(poll_seconds)
             continue
-        result = scan_source_once(settings, scanner, worker=worker)
+        try:
+            result = scan_source_once(settings, scanner, worker=worker)
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error).lower():
+                raise
+            logger.warning("%s frontier lock contention; retrying", worker)
+            result = {"status": "frontier_locked"}
         if time.monotonic() - last_heartbeat >= 10.0:
             _heartbeat(
                 settings.workspace,
@@ -1170,28 +1297,37 @@ class ExtractRunWriter:
         return max(values, default=0)
 
     def _open_sequence(self) -> None:
-        self.run_dir = (
-            self.settings.runs_dir
-            / f"run-staged-{self.worker_index}-{self.sequence:06d}"
-        )
+        while True:
+            self.run_dir = (
+                self.settings.runs_dir
+                / f"run-staged-{self.worker_index}-{self.sequence:06d}"
+            )
+            if not (self.run_dir / STAGED_RUN_SEAL_FILENAME).exists():
+                break
+            self.sequence += 1
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.attempts_path = self.run_dir / "attempts.jsonl"
         self.attempts, _ = _load_attempts(self.attempts_path, self.run_dir)
-        if self.success_count > self.settings.run_target - 8:
-            self.sequence += 1
-            self._open_sequence()
 
     @property
     def success_count(self) -> int:
         return sum(item.get("retrieval_status") == "success" for item in self.attempts)
 
     def prepare(self) -> Path:
+        if (
+            not self.run_dir.is_dir()
+            or (self.run_dir / STAGED_RUN_SEAL_FILENAME).exists()
+        ):
+            if (self.run_dir / STAGED_RUN_SEAL_FILENAME).exists():
+                self.sequence += 1
+            self._open_sequence()
         if self.success_count > self.settings.run_target - 8:
             self.sequence += 1
             self._open_sequence()
         return self.run_dir
 
-    def append(self, results: list[dict[str, Any]]) -> None:
+    def append(self, results: list[dict[str, Any]]) -> Path:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         with self.attempts_path.open("a", encoding="utf-8") as output:
             for result in results:
                 output.write(json.dumps(result, separators=(",", ":")) + "\n")
@@ -1207,8 +1343,22 @@ class ExtractRunWriter:
                 self.settings.source_content_minutes_per_hour
             ),
             max_clips_per_video=self.settings.max_clips_per_video,
-            source="dailymotion",
+            source="source_frontier",
         )
+        sealed_run = self.run_dir
+        _atomic_json(
+            sealed_run / STAGED_RUN_SEAL_FILENAME,
+            {
+                "schema_version": 1,
+                "sealed_at": datetime.now(UTC).isoformat(),
+                "worker_index": self.worker_index,
+                "sequence": self.sequence,
+                "record_count": len(self.attempts),
+            },
+        )
+        self.sequence += 1
+        self._open_sequence()
+        return sealed_run
 
 
 def _commit_extraction_claims(
@@ -1252,7 +1402,8 @@ def extract_source_once(
         connection.close()
         return None
     group = job["candidates"]
-    guidance = load_catalog_source_guidance(settings.catalog, platform="dailymotion")
+    source_platform = str(group[0].get("source_platform") or "youtube")
+    guidance = load_catalog_source_guidance(settings.catalog, platform=source_platform)
     try:
         results = acquire_scanned_source_group(
             group,
@@ -1265,6 +1416,7 @@ def extract_source_once(
             proxy_asr_result_dir=settings.proxy_asr_result_dir,
             proxy_asr_timeout_seconds=settings.proxy_asr_timeout_seconds,
             defer_claim_commit=True,
+            youtube_proxy_attempt=max(0, int(job["stage_attempts"]) - 1),
         )
         statuses = {str(item.get("retrieval_status")) for item in results}
         if not results or "source_scan_unavailable" in statuses:
@@ -1281,7 +1433,7 @@ def extract_source_once(
                 "source scan lease was unavailable",
             )
             raise RuntimeError(error)
-        writer.append(results)
+        sealed_run_dir = writer.append(results)
         _commit_extraction_claims(settings.scan_cache, group, results)
         successful = sum(item.get("retrieval_status") == "success" for item in results)
         remaining = _scan_group_has_remaining_work(
@@ -1301,7 +1453,7 @@ def extract_source_once(
                 "clips_published": successful,
                 "result_statuses": sorted(statuses),
                 "remaining_regions": remaining,
-                "run_dir": str(writer.run_dir),
+                "run_dir": str(sealed_run_dir),
             },
         )
         connection.close()
@@ -1358,7 +1510,13 @@ def _extract_loop(
                 last_heartbeat = time.monotonic()
             time.sleep(poll_seconds)
             continue
-        result = extract_source_once(settings, writer, worker=worker)
+        try:
+            result = extract_source_once(settings, writer, worker=worker)
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error).lower():
+                raise
+            logger.warning("%s frontier lock contention; retrying", worker)
+            result = {"status": "frontier_locked"}
         if time.monotonic() - last_heartbeat >= 10.0:
             _heartbeat(
                 settings.workspace,
@@ -1376,6 +1534,7 @@ def _extract_loop(
 def run_extractors(args: argparse.Namespace) -> None:
     youtube_random.CLIP_SECONDS = args.clip_seconds
     youtube_random.YTDLP_PYTHON = str(args.yt_dlp_python)
+    youtube_random.YOUTUBE_PROXY_CONFIG = getattr(args, "youtube_proxy_config", None)
     settings = ExtractSettings(
         workspace=args.workspace,
         runs_dir=args.runs_dir,
@@ -1538,6 +1697,28 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _provider_weights(value: str) -> dict[str, float]:
+    """Parse provider=weight pairs used for weighted download concurrency."""
+    weights: dict[str, float] = {}
+    if not value.strip():
+        return weights
+    for item in value.split(","):
+        try:
+            platform, raw_weight = item.split("=", 1)
+            weight = float(raw_weight)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                "provider weights must use platform=positive_number"
+            ) from error
+        platform = platform.strip()
+        if not platform or weight <= 0:
+            raise argparse.ArgumentTypeError(
+                "provider weights must use platform=positive_number"
+            )
+        weights[platform] = weight
+    return weights
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1548,7 +1729,12 @@ def main() -> None:
     discover.add_argument("--catalog", type=Path)
     discover.add_argument("--seed-file", type=Path)
     discover.add_argument("--seed", type=int, default=20260714)
-    discover.add_argument("--source", default="dailymotion")
+    discover.add_argument(
+        "--source",
+        choices=youtube_random.SUPPORTED_DISCOVERY_SOURCES,
+        default="dailymotion",
+    )
+    discover.add_argument("--youtube-proxy-config", type=Path)
     discover.add_argument("--profile", default="cinematic")
     discover.add_argument("--clip-seconds", type=float, default=30)
     discover.add_argument("--query-count", type=_positive_int, default=500)
@@ -1559,6 +1745,7 @@ def main() -> None:
     discover.add_argument("--source-content-minutes-per-hour", type=float, default=10)
     discover.add_argument("--max-clips-per-video", type=_positive_int, default=60)
     discover.add_argument("--discovered-high-water", type=_positive_int, default=4000)
+    discover.add_argument("--platform-high-water", type=_positive_int, default=600)
     discover.add_argument("--scan-cache", type=Path)
     discover.add_argument("--cached-scan-high-water", type=_positive_int, default=64)
     discover.add_argument("--poll-seconds", type=float, default=2)
@@ -1569,6 +1756,7 @@ def main() -> None:
     download = commands.add_parser("download")
     download.add_argument("--workspace", type=Path, required=True)
     download.add_argument("--source-cache", type=Path, required=True)
+    download.add_argument("--staging-dir", type=Path)
     download.add_argument("--workers", type=_positive_int, default=8)
     download.add_argument("--downloaded-high-water", type=_positive_int, default=64)
     download.add_argument(
@@ -1577,9 +1765,19 @@ def main() -> None:
     download.add_argument("--lease-seconds", type=float, default=7200)
     download.add_argument("--max-attempts", type=_positive_int, default=4)
     download.add_argument("--retry-backoff-seconds", type=float, default=15)
+    download.add_argument("--circuit-failure-threshold", type=_positive_int, default=5)
+    download.add_argument("--circuit-cooldown-seconds", type=float, default=300)
+    download.add_argument("--circuit-max-cooldown-seconds", type=float, default=3600)
+    download.add_argument(
+        "--provider-weights",
+        type=_provider_weights,
+        default={},
+        help="Comma-separated provider=weight concurrency shares",
+    )
     download.add_argument("--poll-seconds", type=float, default=1)
     download.add_argument("--clip-seconds", type=float, default=30)
     download.add_argument("--yt-dlp-python", type=Path, required=True)
+    download.add_argument("--youtube-proxy-config", type=Path)
     download.add_argument("--control-file", type=Path)
 
     scan = commands.add_parser("scan")
@@ -1629,6 +1827,7 @@ def main() -> None:
     extract.add_argument("--source-content-minutes-per-hour", type=float, default=10)
     extract.add_argument("--max-clips-per-video", type=_positive_int, default=60)
     extract.add_argument("--yt-dlp-python", type=Path, required=True)
+    extract.add_argument("--youtube-proxy-config", type=Path)
     extract.add_argument("--control-file", type=Path)
 
     autoscale = commands.add_parser("autoscale")

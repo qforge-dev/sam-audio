@@ -3,11 +3,13 @@ from __future__ import annotations
 import fcntl
 import json
 import math
+import signal
 import subprocess
 import wave
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import sam_audio_pipeline.youtube_random as youtube_random
 from sam_audio_pipeline.youtube_random import (
@@ -32,6 +34,7 @@ from sam_audio_pipeline.youtube_random import (
     _runtime_worker_limit,
     _sample_clip_starts,
     _scan_group_has_remaining_work,
+    _search_ytdlp_provider,
     _use_full_source_for_group,
     acquire_scanned_source_group,
     analyze_wav,
@@ -56,6 +59,209 @@ def write_stereo(path: Path, *, dual_mono: bool = False) -> None:
 
 def source_format() -> dict[str, object]:
     return {"sample_rate_hz": 48_000, "channels": 2, "bitrate_kbps": 130.0}
+
+
+def test_run_terminates_the_entire_process_group_on_timeout(monkeypatch) -> None:
+    class FakeProcess:
+        pid = 1234
+        returncode = None
+        stdout = None
+        stderr = None
+
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+
+        def communicate(self, timeout=None):
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise subprocess.TimeoutExpired(["downloader"], timeout)
+            self.returncode = -signal.SIGTERM
+            return "partial stdout", "partial stderr"
+
+    process = FakeProcess()
+    popen_kwargs: dict[str, object] = {}
+    signals: list[tuple[int, signal.Signals]] = []
+
+    def fake_popen(command, **kwargs):
+        popen_kwargs.update(kwargs)
+        return process
+
+    monkeypatch.setattr(youtube_random.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        youtube_random.os, "killpg", lambda pid, sent: signals.append((pid, sent))
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        youtube_random._run(["downloader"], timeout=0.1)
+
+    assert popen_kwargs["start_new_session"] is True
+    assert signals == [(1234, signal.SIGTERM)]
+    assert process.communicate_calls == 2
+
+
+def test_proxy_config_is_secret_backed_and_applies_to_all_providers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = tmp_path / "youtube-proxy.conf"
+    config.write_text("--proxy http://user:secret@proxy.example:80\n")
+    config.chmod(0o600)
+    monkeypatch.setattr(youtube_random, "YOUTUBE_PROXY_CONFIG", config)
+
+    args = youtube_random._yt_dlp_proxy_args("youtube")
+
+    assert args == ["--config-locations", str(config)]
+    assert "http://user:secret@" not in " ".join(args)
+    assert youtube_random._yt_dlp_proxy_args("dailymotion") == [
+        "--config-locations",
+        str(config),
+    ]
+
+
+def test_yt_dlp_transfer_args_use_bounded_fragment_concurrency(monkeypatch) -> None:
+    monkeypatch.setattr(youtube_random, "YTDLP_CONCURRENT_FRAGMENTS", 4)
+
+    assert youtube_random._yt_dlp_transfer_args() == ["--concurrent-fragments", "4"]
+
+
+def test_missing_youtube_proxy_config_fails_before_download(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        youtube_random, "YOUTUBE_PROXY_CONFIG", tmp_path / "missing.conf"
+    )
+
+    try:
+        youtube_random._yt_dlp_proxy_args("youtube")
+    except FileNotFoundError as error:
+        assert "missing.conf" in str(error)
+    else:
+        raise AssertionError("missing proxy config should fail closed")
+
+
+def test_site_search_hydrates_vimeo_results(monkeypatch) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command, *, timeout):
+        commands.append(command)
+        if "--flat-playlist" in command:
+            stdout = json.dumps(
+                {"entries": [{"url": "https://vimeo.com/123456"}]}
+            )
+        else:
+            stdout = json.dumps(
+                {
+                    "id": "123456",
+                    "title": "English cinematic movie scene dialogue",
+                    "duration": 180,
+                    "webpage_url": "https://vimeo.com/123456",
+                    "uploader": "short-film-studio",
+                }
+            )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(youtube_random, "_run", fake_run)
+
+    items = _search_ytdlp_provider(
+        "cinematic dialogue -reaction", 100, "cinematic", "vimeo"
+    )
+
+    assert len(items) == 1
+    assert items[0]["source_url"] == "https://vimeo.com/123456"
+    search_target = commands[0][-1]
+    assert search_target.startswith("yvsearch8:site:vimeo.com ")
+    assert "-reaction" not in search_target
+    assert "--skip-download" in commands[1]
+
+
+def test_youtube_preflight_uses_proxy_config_and_audio_only_selector(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = tmp_path / "youtube-proxy.conf"
+    config.write_text("--proxy http://user:secret@proxy.example:80\n")
+    config.chmod(0o600)
+    monkeypatch.setattr(youtube_random, "YOUTUBE_PROXY_CONFIG", config)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], *, timeout: float):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"id": "video", "format_id": "251"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(youtube_random, "_run", run)
+
+    result = youtube_random._preflight_source_for_scan(
+        {
+            "source_platform": "youtube",
+            "source_url": "https://www.youtube.com/watch?v=video",
+        }
+    )
+
+    assert result["quality_format_available"] is True
+    assert ["--config-locations", str(config)] == commands[0][
+        commands[0].index("--config-locations") : commands[0].index(
+            "--config-locations"
+        )
+        + 2
+    ]
+    assert youtube_random.HIGH_QUALITY_AUDIO_SELECTOR in commands[0]
+    assert "youtube:player_client=tv" in commands[0]
+    assert "secret" not in " ".join(commands[0])
+
+
+def test_proxy_pool_pins_a_source_and_changes_across_retries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    pool = tmp_path / "proxy-pool"
+    pool.mkdir(mode=0o700)
+    for index in range(10):
+        config = pool / f"proxy-{index:02d}.conf"
+        config.write_text(f"--proxy http://user:secret-{index}@proxy-{index}:80\n")
+        config.chmod(0o600)
+    monkeypatch.setattr(youtube_random, "YOUTUBE_PROXY_CONFIG", pool)
+
+    first = youtube_random._yt_dlp_proxy_args("youtube", "video:0")
+    repeated = youtube_random._yt_dlp_proxy_args("youtube", "video:0")
+    retries = {
+        tuple(youtube_random._yt_dlp_proxy_args("youtube", f"video:{attempt}"))
+        for attempt in range(10)
+    }
+
+    assert first == repeated
+    assert len(retries) > 1
+    assert all("secret" not in " ".join(args) for args in retries)
+
+
+def test_proxy_config_rejects_readable_secret_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = tmp_path / "youtube-proxy.conf"
+    config.write_text("--proxy http://user:secret@proxy.example:80\n")
+    config.chmod(0o644)
+    monkeypatch.setattr(youtube_random, "YOUTUBE_PROXY_CONFIG", config)
+
+    try:
+        youtube_random._yt_dlp_proxy_args("youtube", "video:0")
+    except PermissionError as error:
+        assert "group/world accessible" in str(error)
+    else:
+        raise AssertionError("readable proxy credentials should fail closed")
+
+
+def test_proxy_credentials_are_redacted_from_failures() -> None:
+    error = subprocess.CalledProcessError(
+        1,
+        ["yt-dlp"],
+        stderr="proxy http://user:secret@proxy.example:80 failed",
+    )
+
+    message = youtube_random._exception_text(error)
+
+    assert "secret" not in message
+    assert "http://***:***@proxy.example:80" in message
 
 
 def test_runtime_download_limit_is_bounded_and_failure_safe(tmp_path: Path) -> None:
@@ -178,6 +384,7 @@ def test_remaining_work_uses_explicit_clip_duration_for_cache(tmp_path: Path) ->
         guidance={},
         clip_seconds=30.0,
     )
+
 
 def test_unseen_scan_group_is_kept_for_exploration(tmp_path: Path) -> None:
     group = [
@@ -520,37 +727,37 @@ def test_cinematic_queries_and_metadata_filter_target_raw_scenes() -> None:
 
     assert all("-reaction" in query and "-Bollywood" in query for query in queries)
     assert all(
-            any(
-                hint in query
-                for hint in (
-                    "English",
-                    "HD",
-                    "dialogue",
-                    "soundtrack",
-                    "cinematic",
-                    "story",
-                )
+        any(
+            hint in query
+            for hint in (
+                "English",
+                "HD",
+                "dialogue",
+                "soundtrack",
+                "cinematic",
+                "story",
             )
+        )
         for query in queries
     )
     assert all(
         any(
-                kind in query
-                for kind in (
-                    "scene",
-                    "clip",
-                    "cutscene",
-                    "short film",
-                    "package",
-                    "gameplay",
-                    "episode",
-                    "dialogue",
-                    "banter",
-                    "story mode",
-                    "walkthrough",
-                    "game movie",
-                    "web series",
-                )
+            kind in query
+            for kind in (
+                "scene",
+                "clip",
+                "cutscene",
+                "short film",
+                "package",
+                "gameplay",
+                "episode",
+                "dialogue",
+                "banter",
+                "story mode",
+                "walkthrough",
+                "game movie",
+                "web series",
+            )
         )
         for query in queries
     )

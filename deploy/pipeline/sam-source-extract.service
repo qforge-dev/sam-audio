@@ -12,6 +12,8 @@ EnvironmentFile=/etc/sam-cinematic-continuous.env
 ExecStart=/home/ubuntu/sam-audio-deploy/deploy/pipeline/run-source-extract.sh
 Restart=always
 RestartSec=5
+# Bound any deleted-open storage retained by yt-dlp/ffmpeg between retries.
+RuntimeMaxSec=1h
 TimeoutStopSec=30
 KillMode=control-group
 
