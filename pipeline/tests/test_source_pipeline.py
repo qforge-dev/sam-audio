@@ -839,3 +839,27 @@ def test_source_autoscaler_reduces_upstream_first_under_cpu_pressure() -> None:
 
     assert result["limits"] == {"download": 7, "scan": 2, "extract": 4}
     assert result["actions"] == ["reduce_download_for_cpu"]
+
+
+def test_source_autoscaler_preserves_offloaded_download_workers() -> None:
+    pressured = _source_scale(
+        cpu_percent=92.0,
+        cpu_exempt_stages=frozenset({"download"}),
+    )
+    replenished = _source_scale(
+        cpu_percent=70.0,
+        limits={"download": 7, "scan": 2, "extract": 4},
+        counts={
+            "discovered": 100,
+            "downloaded": 0,
+            "scanned": 0,
+            "complete": 0,
+            "rejected": 0,
+        },
+        cpu_exempt_stages=frozenset({"download"}),
+    )
+
+    assert pressured["limits"] == {"download": 8, "scan": 1, "extract": 4}
+    assert pressured["actions"] == ["reduce_scan_for_cpu"]
+    assert replenished["limits"]["download"] == 8
+    assert replenished["actions"] == ["increase_download"]

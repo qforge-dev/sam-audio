@@ -1584,6 +1584,7 @@ def source_autoscale_decision(
     scan_backlog_high: int,
     extract_backlog_high: int,
     download_backlog_low: int,
+    cpu_exempt_stages: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Take one conservative stage-concurrency step from frontier pressure."""
     result = {
@@ -1593,7 +1594,10 @@ def source_autoscale_decision(
     actions: list[str] = []
     if cpu_percent >= cpu_high:
         for stage in ("download", "scan", "extract"):
-            if result[stage] > bounds[stage][0]:
+            if (
+                stage not in cpu_exempt_stages
+                and result[stage] > bounds[stage][0]
+            ):
                 result[stage] -= 1
                 actions.append(f"reduce_{stage}_for_cpu")
                 break
@@ -1611,7 +1615,7 @@ def source_autoscale_decision(
     elif (
         counts["discovered"] > 0
         and counts["downloaded"] <= download_backlog_low
-        and cpu_percent < cpu_low
+        and ("download" in cpu_exempt_stages or cpu_percent < cpu_low)
         and result["download"] < bounds["download"][1]
     ):
         result["download"] += 1
@@ -1652,6 +1656,7 @@ def run_source_autoscaler_once(args: argparse.Namespace) -> dict[str, Any]:
         scan_backlog_high=args.scan_backlog_high,
         extract_backlog_high=args.extract_backlog_high,
         download_backlog_low=args.download_backlog_low,
+        cpu_exempt_stages=frozenset(args.cpu_exempt_stage),
     )
     payload = {
         "schema_version": 1,
@@ -1848,6 +1853,13 @@ def main() -> None:
     autoscale.add_argument("--extract-backlog-high", type=_positive_int, default=16)
     autoscale.add_argument("--download-backlog-low", type=int, default=4)
     autoscale.add_argument("--cpu-sample-seconds", type=float, default=0.25)
+    autoscale.add_argument(
+        "--cpu-exempt-stage",
+        action="append",
+        choices=("download", "scan", "extract"),
+        default=[],
+        help="Stage whose workers execute off-host and do not consume local CPU",
+    )
     autoscale.add_argument("--interval-seconds", type=float, default=10)
     autoscale.add_argument("--once", action="store_true")
 
