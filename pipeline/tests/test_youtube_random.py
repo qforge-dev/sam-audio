@@ -117,6 +117,24 @@ def test_proxy_config_is_secret_backed_and_applies_to_all_providers(
     ]
 
 
+def test_direct_platform_bypasses_proxy_pool(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "proxy.conf"
+    config.write_text("--proxy http://user:secret@proxy.example:80\n")
+    config.chmod(0o600)
+    monkeypatch.setattr(youtube_random, "YOUTUBE_PROXY_CONFIG", config)
+    monkeypatch.setattr(
+        youtube_random,
+        "YTDLP_DIRECT_PLATFORMS",
+        frozenset({"dailymotion"}),
+    )
+
+    assert youtube_random._yt_dlp_proxy_args("dailymotion") == []
+    assert youtube_random._yt_dlp_proxy_args("youtube") == [
+        "--config-locations",
+        str(config),
+    ]
+
+
 def test_yt_dlp_transfer_args_use_bounded_fragment_concurrency(monkeypatch) -> None:
     monkeypatch.setattr(youtube_random, "YTDLP_CONCURRENT_FRAGMENTS", 4)
 

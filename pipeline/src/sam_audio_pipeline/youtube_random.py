@@ -50,6 +50,11 @@ CLIP_SECONDS = 10.0
 YTDLP_CONCURRENT_FRAGMENTS = max(
     1, int(os.environ.get("SAM_YTDLP_CONCURRENT_FRAGMENTS", "4"))
 )
+YTDLP_DIRECT_PLATFORMS = frozenset(
+    value.strip().lower()
+    for value in os.environ.get("SAM_YTDLP_DIRECT_PLATFORMS", "").split(",")
+    if value.strip()
+)
 OUTPUT_SAMPLE_RATE = 48_000
 MIN_SOURCE_SAMPLE_RATE = 44_100
 MIN_SOURCE_BITRATE_KBPS = 120.0
@@ -551,6 +556,8 @@ def _protected_proxy_configs(path: Path) -> list[Path]:
 
 def _yt_dlp_proxy_args(source_platform: str, affinity_key: str = "") -> list[str]:
     """Select a protected all-provider proxy without credentials in argv."""
+    if source_platform.strip().lower() in YTDLP_DIRECT_PLATFORMS:
+        return []
     if YOUTUBE_PROXY_CONFIG is None:
         return []
     path = Path(YOUTUBE_PROXY_CONFIG)
