@@ -1614,7 +1614,12 @@ def source_autoscale_decision(
         actions.append("increase_scan")
     elif (
         counts["discovered"] > 0
-        and counts["downloaded"] <= download_backlog_low
+        and counts["downloaded"]
+        <= (
+            scan_backlog_high
+            if "download" in cpu_exempt_stages
+            else download_backlog_low
+        )
         and ("download" in cpu_exempt_stages or cpu_percent < cpu_low)
         and result["download"] < bounds["download"][1]
     ):

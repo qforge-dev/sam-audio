@@ -851,7 +851,7 @@ def test_source_autoscaler_preserves_offloaded_download_workers() -> None:
         limits={"download": 7, "scan": 2, "extract": 4},
         counts={
             "discovered": 100,
-            "downloaded": 0,
+            "downloaded": 8,
             "scanned": 0,
             "complete": 0,
             "rejected": 0,
