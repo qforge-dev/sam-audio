@@ -35,6 +35,8 @@ def test_media_command_wraps_only_enabled_tasks_and_quotes_arguments(monkeypatch
     )
 
     assert command[0] == "ssh"
+    assert "ControlMaster=no" in command
+    assert not any(value.startswith("ControlPath=") for value in command)
     assert command[-2] == "ubuntu@172.31.0.10"
     assert command[command.index("-i") + 1] == "/home/ubuntu/.ssh/media"
     remote = command[-1]

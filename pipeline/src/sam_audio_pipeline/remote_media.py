@@ -60,11 +60,13 @@ def command_for_media_worker(
         "-o",
         "ServerAliveCountMax=3",
         "-o",
-        "ControlMaster=auto",
-        "-o",
-        "ControlPersist=300",
-        "-o",
-        "ControlPath=/tmp/sam-media-%C",
+        # Every media command can be long-lived. Sharing all downloader and
+        # ffmpeg workers through one OpenSSH control connection hits sshd's
+        # per-connection MaxSessions limit (10 by default), leaving most of
+        # the remote CPU idle and intermittently failing work with
+        # "session open refused". Independent connections let worker
+        # concurrency map cleanly to remote systemd units.
+        "ControlMaster=no",
     ]
     identity = os.environ.get("SAM_MEDIA_WORKER_SSH_IDENTITY", "").strip()
     if identity:
