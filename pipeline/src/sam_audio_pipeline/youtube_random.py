@@ -36,6 +36,7 @@ from typing import Any
 import numpy as np
 
 from .audio import sha256_file
+from .remote_media import command_for_media_worker
 from .source_diversity import (
     DEFAULT_MAX_CLIPS_PER_SOURCE,
     record_source_clip_budget,
@@ -2227,7 +2228,8 @@ def _download_full_source_for_scan(
         if source_platform == "dailymotion"
         else HIGH_QUALITY_AUDIO_SELECTOR
     )
-    response = _run(
+    timeout = max(900.0, min(3600.0, 600.0 + duration / 10.0))
+    command, command_timeout = command_for_media_worker(
         [
             YTDLP_PYTHON,
             "-m",
@@ -2253,8 +2255,10 @@ def _download_full_source_for_scan(
             str(root / "source.%(ext)s"),
             str(candidate["source_url"]),
         ],
-        timeout=max(900.0, min(3600.0, 600.0 + duration / 10.0)),
+        task="download",
+        timeout=timeout,
     )
+    response = _run(command, timeout=command_timeout)
     return _source_file(root), _download_json(response.stdout)
 
 
@@ -2280,16 +2284,22 @@ def _preflight_source_for_scan(candidate: dict[str, Any]) -> dict[str, Any]:
         *_yt_dlp_youtube_client_args(source_platform),
         "-f",
     ]
-    try:
-        response = _run(
+
+    def run_preflight(selector: str) -> subprocess.CompletedProcess[str]:
+        command, timeout = command_for_media_worker(
             [
                 *base_command,
                 selector,
                 "--print-json",
                 str(candidate["source_url"]),
             ],
+            task="download",
             timeout=90,
         )
+        return _run(command, timeout=timeout)
+
+    try:
+        response = run_preflight(selector)
         return {**_download_json(response.stdout), "quality_format_available": True}
     except subprocess.CalledProcessError:
         if source_platform != "dailymotion":
@@ -2297,15 +2307,7 @@ def _preflight_source_for_scan(candidate: dict[str, Any]) -> dict[str, Any]:
         # Distinguish a live source that only exposes the low-bitrate 380p
         # variant from a transient extraction/network failure. The former can
         # be cached permanently and skipped before proxy transfer on every run.
-        response = _run(
-            [
-                *base_command,
-                DAILYMOTION_SCAN_PROXY_SELECTOR,
-                "--print-json",
-                str(candidate["source_url"]),
-            ],
-            timeout=90,
-        )
+        response = run_preflight(DAILYMOTION_SCAN_PROXY_SELECTOR)
         return {**_download_json(response.stdout), "quality_format_available": False}
 
 

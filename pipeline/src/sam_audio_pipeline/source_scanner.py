@@ -19,6 +19,7 @@ from .m2d_validator import (
     evaluate_probabilities,
     load_label_families,
 )
+from .remote_media import command_for_media_worker
 
 SCAN_POLICY_VERSION = "whole_source_proxy_m2d_v1"
 PROXY_SAMPLE_RATE = 16_000
@@ -159,7 +160,7 @@ class M2DSourceScanner:
 
     def create_proxy(self, source: Path, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
+        command, timeout = command_for_media_worker(
             [
                 "ffmpeg",
                 "-hide_banner",
@@ -184,8 +185,13 @@ class M2DSourceScanner:
                 "2",
                 str(destination),
             ],
-            check=True,
+            task="ffmpeg",
             timeout=1800,
+        )
+        subprocess.run(
+            command,
+            check=True,
+            timeout=timeout,
         )
 
     def stereo_metrics(self, proxy: Path) -> dict[str, float]:

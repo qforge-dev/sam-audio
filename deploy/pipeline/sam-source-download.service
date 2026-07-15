@@ -10,6 +10,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
 EnvironmentFile=/etc/sam-cinematic-continuous.env
 ExecStart=/home/ubuntu/sam-audio-deploy/deploy/pipeline/run-source-download.sh
+ExecStopPost=/home/ubuntu/sam-audio-deploy/pipeline/.venv/bin/python -m sam_audio_pipeline.remote_media cleanup download
 Restart=always
 RestartSec=5
 # A bounded recycle is a final safety net for third-party downloader children
