@@ -507,6 +507,18 @@ def _run(command: list[str], *, timeout: float) -> subprocess.CompletedProcess[s
     return completed
 
 
+def _run_search_command(
+    command: list[str], *, timeout: float
+) -> subprocess.CompletedProcess[str]:
+    """Run yt-dlp discovery work on the media host when one is configured."""
+    wrapped, wrapped_timeout = command_for_media_worker(
+        command,
+        task="search",
+        timeout=timeout,
+    )
+    return _run(wrapped, timeout=wrapped_timeout)
+
+
 def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
     """Stop and reap a downloader plus every ffmpeg/ffprobe descendant."""
     try:
@@ -709,7 +721,7 @@ def _cinematic_candidate_priority(item: dict[str, Any]) -> int:
 
 
 def _search_youtube(query: str, results: int, profile: str) -> list[dict[str, Any]]:
-    response = _run(
+    response = _run_search_command(
         [
             YTDLP_PYTHON,
             "-m",
@@ -749,7 +761,7 @@ def _hydrate_search_result(
     affinity_key: str,
     timeout: float = 90,
 ) -> dict[str, Any]:
-    response = _run(
+    response = _run_search_command(
         [
             YTDLP_PYTHON,
             "-m",
@@ -786,7 +798,7 @@ def _search_ytdlp_provider(
     if provider.get("site"):
         provider_query = f"site:{provider['site']} {provider_query}"
     target = f"{provider['search_key']}{limited_results}:{provider_query}"
-    response = _run(
+    response = _run_search_command(
         [
             YTDLP_PYTHON,
             "-m",

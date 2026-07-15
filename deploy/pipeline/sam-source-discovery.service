@@ -10,6 +10,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
 EnvironmentFile=/etc/sam-cinematic-continuous.env
 ExecStart=/home/ubuntu/sam-audio-deploy/deploy/pipeline/run-source-discovery.sh
+ExecStopPost=/home/ubuntu/sam-audio-deploy/pipeline/.venv/bin/python -m sam_audio_pipeline.remote_media cleanup search
 Restart=always
 RestartSec=5
 TimeoutStopSec=15
