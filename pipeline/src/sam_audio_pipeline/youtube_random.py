@@ -1372,9 +1372,10 @@ def discover_candidates(
         found_videos.add(video_id)
         strategy = str(discovery.get("strategy") or "query_v1")
         family = str(discovery.get("family") or "general_v1")
-        quality_key = (
+        quality_lane = (
             f"query_family:{family}" if strategy.startswith("query_") else strategy
         )
+        quality_key = f"{source}:{quality_lane}"
         strategy_counts[quality_key] = strategy_counts.get(quality_key, 0) + 1
         duration = float(item["duration"])
         starts = _sample_clip_starts(

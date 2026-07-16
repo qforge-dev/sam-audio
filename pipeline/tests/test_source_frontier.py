@@ -52,6 +52,14 @@ def test_new_discovery_lane_is_probe_limited_then_suspended_on_zero_yield() -> N
     }
     assert suspended["state"] == "suspended"
     assert suspended["reason"] == "low_scan_pass_rate"
+    weak_query = discovery_strategy_admission(
+        {
+            "key": "bilibili:query_family:cinematic_broad_v1",
+            "scan_evaluated_sources": 12,
+            "scan_passed_sources": 0,
+        }
+    )
+    assert weak_query["state"] == "suspended"
 
 
 def test_discovery_strategy_snapshot_attributes_frontier_sources(
@@ -59,7 +67,7 @@ def test_discovery_strategy_snapshot_attributes_frontier_sources(
 ) -> None:
     connection = connect_frontier(tmp_path)
     item = candidate("deep")
-    item[0]["discovery_quality_key"] = "deep_page_v1"
+    item[0]["discovery_quality_key"] = "dailymotion:deep_page_v1"
     enqueue_source(connection, item)
     connection.execute(
         """UPDATE source_jobs SET state='rejected',scan_json='{}' """
@@ -68,9 +76,10 @@ def test_discovery_strategy_snapshot_attributes_frontier_sources(
 
     snapshot = discovery_strategy_snapshot(connection, platform="dailymotion")
 
-    assert snapshot["deep_page_v1"]["scan_evaluated_sources"] == 1
-    assert snapshot["deep_page_v1"]["scan_passed_sources"] == 0
-    assert snapshot["deep_page_v1"]["scan_pass_rate_percent"] == 0.0
+    metrics = snapshot["dailymotion:deep_page_v1"]
+    assert metrics["scan_evaluated_sources"] == 1
+    assert metrics["scan_passed_sources"] == 0
+    assert metrics["scan_pass_rate_percent"] == 0.0
     connection.close()
 
 

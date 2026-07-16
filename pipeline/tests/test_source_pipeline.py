@@ -36,14 +36,14 @@ def test_discovery_admission_caps_each_new_lane_independently() -> None:
     groups = []
     for index in range(12):
         group = _candidate(f"deep-{index}", 0)
-        group["discovery_quality_key"] = "deep_page_v1"
+        group["discovery_quality_key"] = "dailymotion:deep_page_v1"
         groups.append([group])
 
     admitted, admission = _admit_discovery_groups(groups, {})
 
     assert len(admitted) == 8
-    assert admission["deep_page_v1"]["state"] == "probing"
-    assert admission["deep_page_v1"]["admitted_this_batch"] == 8
+    assert admission["dailymotion:deep_page_v1"]["state"] == "probing"
+    assert admission["dailymotion:deep_page_v1"]["admitted_this_batch"] == 8
 
 
 def _candidate(video: str, segment: int, priority_word: str = "movie") -> dict:

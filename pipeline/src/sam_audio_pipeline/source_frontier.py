@@ -44,12 +44,9 @@ def source_key(platform: str, video_id: str) -> str:
 
 
 def _is_quality_gated_discovery(key: str) -> bool:
-    return key in {
-        "deep_page_v1",
-        "accepted_related_v1",
-        "accepted_channel_v1",
-        "query_family:cinematic_gameplay_context_v2",
-    }
+    return "query_family:" in key or key.endswith(
+        ("deep_page_v1", "accepted_related_v1", "accepted_channel_v1")
+    )
 
 
 def discovery_strategy_admission(metrics: Mapping[str, Any]) -> dict[str, Any]:
