@@ -26,6 +26,11 @@ MUTABLE_COLUMNS = {"downloaded_path", "download_json", "scan_json"}
 _NETWORK_WINDOW_SECONDS = 60.0
 _network_samples: deque[tuple[float, int]] = deque()
 _network_samples_lock = threading.Lock()
+_discovery_snapshot_cache: dict[
+    tuple[str, str], tuple[float, dict[str, dict[str, Any]]]
+] = {}
+_discovery_snapshot_cache_lock = threading.Lock()
+_DISCOVERY_SNAPSHOT_CACHE_SECONDS = 30.0
 DISCOVERY_PROBE_ACTIVE_SOURCES = 8
 DISCOVERY_MIN_SCAN_SOURCES = 12
 DISCOVERY_MIN_FINAL_RECORDS = 20
@@ -189,6 +194,28 @@ def discovery_strategy_snapshot(
         }
         normalized["admission"] = discovery_strategy_admission(normalized)
         result[key] = normalized
+    return result
+
+
+def _cached_discovery_strategy_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    workspace: Path,
+    catalog_path: Path | None,
+) -> dict[str, dict[str, Any]]:
+    """Keep frequent dashboard polls from repeatedly aggregating history."""
+    key = (str(workspace), str(catalog_path or ""))
+    now = time.monotonic()
+    with _discovery_snapshot_cache_lock:
+        cached = _discovery_snapshot_cache.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+    result = discovery_strategy_snapshot(connection, catalog_path=catalog_path)
+    with _discovery_snapshot_cache_lock:
+        _discovery_snapshot_cache[key] = (
+            now + _DISCOVERY_SNAPSHOT_CACHE_SECONDS,
+            result,
+        )
     return result
 
 
@@ -927,8 +954,10 @@ def frontier_snapshot(
     platform_metrics: dict[str, dict[str, Any]] = {}
     platform_counts = frontier_platform_counts(connection)
     circuits = provider_circuit_snapshot(connection, now=timestamp)
-    discovery_strategies = discovery_strategy_snapshot(
-        connection, catalog_path=catalog_path
+    discovery_strategies = _cached_discovery_strategy_snapshot(
+        connection,
+        workspace=workspace,
+        catalog_path=catalog_path,
     )
     for platform in sorted(platform_counts):
         downloads = [
