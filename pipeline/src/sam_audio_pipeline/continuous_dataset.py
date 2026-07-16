@@ -1077,7 +1077,9 @@ def progress_snapshot(
         "throughput_windows": throughput_windows,
         "strategy": strategy,
         "source_frontier": frontier_snapshot(
-            workspace, window_minutes=min(15.0, throughput_window_minutes)
+            workspace,
+            window_minutes=min(15.0, throughput_window_minutes),
+            catalog_path=workspace / CATALOG_FILENAME,
         ),
         "goal": {
             "target_audio_hours": target_hours,

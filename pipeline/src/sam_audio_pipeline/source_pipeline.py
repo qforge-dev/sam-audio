@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import shutil
 import sqlite3
 import subprocess
@@ -22,6 +23,8 @@ from . import youtube_random
 from .source_frontier import (
     claim_source,
     connect_frontier,
+    discovery_strategy_admission,
+    discovery_strategy_snapshot,
     downloaded_queue_bytes,
     enqueue_sources,
     finish_source,
@@ -63,6 +66,66 @@ from .youtube_random import (
 
 logger = logging.getLogger(__name__)
 STAGED_RUN_SEAL_FILENAME = ".sealed.json"
+
+
+def _productive_expansion_seeds(
+    guidance: dict[str, dict[str, Any]], *, seed: int, limit: int = 8
+) -> list[dict[str, Any]]:
+    """Rotate through proven sources instead of crawling arbitrary channels."""
+    productive = [item for item in guidance.values() if int(item.get("accepted", 0))]
+    productive.sort(
+        key=lambda item: (
+            int(item.get("accepted", 0)),
+            int(item.get("asr_accepted", 0)),
+            int(item.get("scored", 0)),
+        ),
+        reverse=True,
+    )
+    # Keep a productive pool but rotate parents so graph traversal does not
+    # repeatedly rediscover the same first page around the all-time best source.
+    pool = productive[: max(limit * 8, limit)]
+    randomizer = random.Random(f"{seed}:accepted-parent-expansion")
+    randomizer.shuffle(pool)
+    return [dict(item["record"]) for item in pool[:limit]]
+
+
+def _admit_discovery_groups(
+    groups: list[list[dict[str, Any]]],
+    metrics: dict[str, dict[str, Any]],
+) -> tuple[list[list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """Apply per-lane probe limits and quality circuit breakers."""
+    admissions: dict[str, dict[str, Any]] = {}
+    remaining: dict[str, int | None] = {}
+    admitted: list[list[dict[str, Any]]] = []
+    for group in groups:
+        key = str(group[0].get("discovery_quality_key") or "legacy")
+        if key not in admissions:
+            item = metrics.get(
+                key,
+                {
+                    "key": key,
+                    "active_sources": 0,
+                    "scan_evaluated_sources": 0,
+                    "scan_passed_sources": 0,
+                    "final_records": 0,
+                    "final_accepted": 0,
+                },
+            )
+            admissions[key] = discovery_strategy_admission(item)
+            remaining[key] = admissions[key].get("new_source_allowance")
+        allowance = remaining[key]
+        if allowance is not None and allowance <= 0:
+            continue
+        admitted.append(group)
+        if allowance is not None:
+            remaining[key] = allowance - 1
+    for key, admission in admissions.items():
+        admission["admitted_this_batch"] = sum(
+            1
+            for group in admitted
+            if str(group[0].get("discovery_quality_key") or "legacy") == key
+        )
+    return admitted, admissions
 
 
 def _called_process_error_text(error: subprocess.CalledProcessError) -> str:
@@ -387,6 +450,12 @@ def discover_into_frontier_once(
         if settings.catalog
         else {}
     )
+    expansion_seeds = _productive_expansion_seeds(guidance, seed=seed)
+    strategy_metrics = discovery_strategy_snapshot(
+        connection,
+        catalog_path=settings.catalog,
+        platform=settings.source,
+    )
     cache_adoption = {"promoted": 0, "rejected": 0, "completed": 0}
     if settings.scan_cache is not None:
         cache_adoption = adopt_cached_scans(
@@ -445,6 +514,7 @@ def discover_into_frontier_once(
             source_content_minutes_per_hour=settings.source_content_minutes_per_hour,
             max_clips_per_video=settings.max_clips_per_video,
             source=settings.source,
+            expansion_seeds=expansion_seeds,
         )
     finally:
         youtube_random.CLIP_SECONDS = previous_clip_seconds
@@ -470,7 +540,8 @@ def discover_into_frontier_once(
             )
         )
     ]
-    selected = unseen[:capacity]
+    admitted, strategy_admission = _admit_discovery_groups(unseen, strategy_metrics)
+    selected = admitted[:capacity]
     inserted = enqueue_sources(
         connection,
         selected,
@@ -486,12 +557,15 @@ def discover_into_frontier_once(
         "minimum_candidates": minimum_candidates,
         "unique_source_count": len(groups),
         "unseen_source_count": len(unseen),
+        "admitted_source_count": len(admitted),
         "selected_source_count": len(selected),
         "inserted_sources": inserted,
         "frontier": after,
         "platform": settings.source,
         "platform_counts": after_platform,
         "cache_adoption": cache_adoption,
+        "expansion_seed_count": len(expansion_seeds),
+        "strategy_admission": strategy_admission,
         "duration_seconds": round(time.perf_counter() - started, 3),
     }
     _atomic_json(batch_dir / "frontier-result.json", result)
@@ -627,9 +701,7 @@ def _publish_download(staging: Path, target: Path) -> None:
     if staging.stat().st_dev == target.parent.stat().st_dev:
         os.replace(staging, target)
         return
-    publishing = Path(
-        tempfile.mkdtemp(prefix=".source-publish-", dir=target.parent)
-    )
+    publishing = Path(tempfile.mkdtemp(prefix=".source-publish-", dir=target.parent))
     shutil.rmtree(publishing)
     try:
         shutil.copytree(staging, publishing)
@@ -1594,10 +1666,7 @@ def source_autoscale_decision(
     actions: list[str] = []
     if cpu_percent >= cpu_high:
         for stage in ("download", "scan", "extract"):
-            if (
-                stage not in cpu_exempt_stages
-                and result[stage] > bounds[stage][0]
-            ):
+            if stage not in cpu_exempt_stages and result[stage] > bounds[stage][0]:
                 result[stage] -= 1
                 actions.append(f"reduce_{stage}_for_cpu")
                 break

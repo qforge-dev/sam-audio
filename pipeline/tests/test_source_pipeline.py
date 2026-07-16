@@ -20,6 +20,7 @@ from sam_audio_pipeline.source_pipeline import (
     ExtractRunWriter,
     ExtractSettings,
     ScanSettings,
+    _admit_discovery_groups,
     _commit_extraction_claims,
     adopt_cached_scans,
     discover_into_frontier_once,
@@ -29,6 +30,20 @@ from sam_audio_pipeline.source_pipeline import (
     scan_source_once,
     source_autoscale_decision,
 )
+
+
+def test_discovery_admission_caps_each_new_lane_independently() -> None:
+    groups = []
+    for index in range(12):
+        group = _candidate(f"deep-{index}", 0)
+        group["discovery_quality_key"] = "deep_page_v1"
+        groups.append([group])
+
+    admitted, admission = _admit_discovery_groups(groups, {})
+
+    assert len(admitted) == 8
+    assert admission["deep_page_v1"]["state"] == "probing"
+    assert admission["deep_page_v1"]["admitted_this_batch"] == 8
 
 
 def _candidate(video: str, segment: int, priority_word: str = "movie") -> dict:

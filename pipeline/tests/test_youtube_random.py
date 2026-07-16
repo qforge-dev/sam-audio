@@ -15,6 +15,7 @@ import sam_audio_pipeline.youtube_random as youtube_random
 from sam_audio_pipeline.youtube_random import (
     CANDIDATE_DURATION_POLICY,
     DAILYMOTION_SEARCH_POLICY,
+    DISCOVERY_EXPANSION_POLICY,
     MAX_SOURCE_DURATION_SECONDS,
     _accepted,
     _candidate_allowed,
@@ -39,6 +40,7 @@ from sam_audio_pipeline.youtube_random import (
     acquire_scanned_source_group,
     analyze_wav,
     build_queries,
+    build_query_specs,
     discover_candidates,
     quality_rejections,
 )
@@ -162,9 +164,7 @@ def test_site_search_hydrates_vimeo_results(monkeypatch) -> None:
     def fake_run(command, *, timeout):
         commands.append(command)
         if "--flat-playlist" in command:
-            stdout = json.dumps(
-                {"entries": [{"url": "https://vimeo.com/123456"}]}
-            )
+            stdout = json.dumps({"entries": [{"url": "https://vimeo.com/123456"}]})
         else:
             stdout = json.dumps(
                 {
@@ -960,6 +960,7 @@ def test_cached_candidates_are_refiltered_under_current_metadata_policy(
                 "source": "dailymotion",
                 "candidate_duration_policy": CANDIDATE_DURATION_POLICY,
                 "search_page_policy": DAILYMOTION_SEARCH_POLICY,
+                "discovery_expansion_policy": DISCOVERY_EXPANSION_POLICY,
             }
         )
     )
@@ -978,6 +979,20 @@ def test_cached_candidates_are_refiltered_under_current_metadata_policy(
 
     assert [item["video_id"] for item in filtered] == ["good"]
     assert json.loads((metadata / "search.json").read_text())["unique_candidates"] == 1
+
+
+def test_cinematic_query_specs_include_attributable_gameplay_context_family() -> None:
+    specs = build_query_specs(20260716, 100, profile="cinematic")
+
+    gameplay = [
+        item for item in specs if item["family"] == "cinematic_gameplay_context_v2"
+    ]
+    assert gameplay
+    assert all(
+        any(term in item["query"].lower() for term in ("gameplay", "game", "mission"))
+        for item in gameplay
+    )
+    assert all("-lyrics" in item["query"] for item in gameplay)
 
 
 def test_accepted_records_follow_current_metadata_policy() -> None:

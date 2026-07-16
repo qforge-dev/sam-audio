@@ -62,8 +62,10 @@ MIN_SOURCE_DURATION_SECONDS = 30.0
 MIN_DISCOVERY_SOURCE_DURATION_SECONDS = 2 * 60.0
 MAX_SOURCE_DURATION_SECONDS = 12 * 3600.0
 CANDIDATE_DURATION_POLICY = "source_duration_2m_to_12h_v3"
-DAILYMOTION_SEARCH_POLICY = "seeded_relevance_pages_1_to_10_gameplay_v4"
-MULTI_SOURCE_SEARCH_POLICY = "yt_dlp_native_and_yahoo_site_search_v1"
+DAILYMOTION_SEARCH_POLICY = "seeded_relevance_pages_1_to_50_gameplay_v5"
+MULTI_SOURCE_SEARCH_POLICY = "yt_dlp_native_related_and_channel_v2"
+DISCOVERY_EXPANSION_POLICY = "accepted_parent_graph_and_deep_search_v1"
+DISCOVERY_EXPANSION_SEEDS_PER_BATCH = 8
 SUPPORTED_DISCOVERY_SOURCES = (
     "youtube",
     "dailymotion",
@@ -78,6 +80,8 @@ SUPPORTED_DISCOVERY_SOURCES = (
 def _yt_dlp_transfer_args() -> list[str]:
     """Bound parallel HLS/DASH fragments while leaving direct files unchanged."""
     return ["--concurrent-fragments", str(YTDLP_CONCURRENT_FRAGMENTS)]
+
+
 YTDLP_SEARCH_PROVIDERS: dict[str, dict[str, Any]] = {
     "soundcloud": {"search_key": "scsearch", "max_results": 20},
     "bilibili": {
@@ -316,6 +320,39 @@ CINEMATIC_BROAD_QUERIES = (
     "web series",
     "movie scene",
     "short film",
+)
+
+# These target the exact audiobook-background use case: diegetic conversation
+# while gameplay, ambience, effects, and non-vocal score continue underneath.
+# They deliberately avoid generic "music" searches, which tend to return songs.
+CINEMATIC_GAMEPLAY_SITUATIONS = (
+    "open world NPC encounter gameplay",
+    "RPG companion banter gameplay",
+    "story mission gameplay dialogue",
+    "combat mission radio dialogue gameplay",
+    "stealth mission radio chatter gameplay",
+    "adventure game exploration dialogue",
+    "horror game exploration dialogue",
+    "gameplay quest conversation",
+    "cinematic gameplay full chapter",
+    "gameplay longplay story dialogue",
+    "in game vehicle dialogue mission",
+    "party conversation during gameplay",
+    "gameplay environmental dialogue scene",
+    "walkthrough cutscene to gameplay transition",
+    "gameplay dialogue during combat",
+    "gameplay dialogue during exploration",
+)
+
+CINEMATIC_GAMEPLAY_AUDIO_CONTEXTS = (
+    "ambient soundtrack sound effects",
+    "background score environmental sound",
+    "cinematic ambience game audio",
+    "music underscore combat sounds",
+    "environmental ambience soundtrack",
+    "diegetic sound background score",
+    "game ambience sound effects",
+    "cinematic soundscape dialogue",
 )
 
 CINEMATIC_TITLE_TERMS = (
@@ -585,9 +622,7 @@ def _yt_dlp_javascript_args(source_platform: str) -> list[str]:
     return ["--js-runtimes", f"deno:{deno}"] if Path(deno).is_file() else []
 
 
-def _yt_dlp_youtube_client_args(
-    source_platform: str, client: str = "tv"
-) -> list[str]:
+def _yt_dlp_youtube_client_args(source_platform: str, client: str = "tv") -> list[str]:
     """Use the client that succeeds most often on authenticated proxy exits."""
     if source_platform != "youtube":
         return []
@@ -634,14 +669,18 @@ def _permanent_media_error(error: subprocess.CalledProcessError) -> bool:
     )
 
 
-def build_queries(seed: int, count: int, *, profile: str = "general") -> list[str]:
-    """Create reproducible YouTube queries for a general or cinematic mix."""
+def build_query_specs(
+    seed: int, count: int, *, profile: str = "general"
+) -> list[dict[str, str]]:
+    """Create reproducible queries with an attributable query family."""
     generator = random.Random(seed)
-    queries: list[str] = []
+    specs: list[dict[str, str]] = []
     seen: set[str] = set()
-    while len(queries) < count:
+    while len(specs) < count:
+        family = "general_v1"
         if profile == "cinematic":
-            if generator.random() < 0.4:
+            lane = generator.random()
+            if lane < 0.30:
                 query = " ".join(
                     (
                         generator.choice(CINEMATIC_BROAD_QUERIES),
@@ -649,6 +688,17 @@ def build_queries(seed: int, count: int, *, profile: str = "general") -> list[st
                         CINEMATIC_SEARCH_EXCLUSIONS,
                     )
                 )
+                family = "cinematic_broad_v1"
+            elif lane < 0.65:
+                query = " ".join(
+                    (
+                        generator.choice(CINEMATIC_GAMEPLAY_SITUATIONS),
+                        generator.choice(CINEMATIC_GAMEPLAY_AUDIO_CONTEXTS),
+                        "English HD",
+                        CINEMATIC_SEARCH_EXCLUSIONS,
+                    )
+                )
+                family = "cinematic_gameplay_context_v2"
             else:
                 query = " ".join(
                     (
@@ -659,6 +709,7 @@ def build_queries(seed: int, count: int, *, profile: str = "general") -> list[st
                         CINEMATIC_SEARCH_EXCLUSIONS,
                     )
                 )
+                family = "cinematic_composed_v1"
         else:
             query = " ".join(
                 (
@@ -673,8 +724,13 @@ def build_queries(seed: int, count: int, *, profile: str = "general") -> list[st
         if query in seen:
             continue
         seen.add(query)
-        queries.append(query)
-    return queries
+        specs.append({"query": query, "family": family})
+    return specs
+
+
+def build_queries(seed: int, count: int, *, profile: str = "general") -> list[str]:
+    """Create reproducible YouTube queries for a general or cinematic mix."""
+    return [spec["query"] for spec in build_query_specs(seed, count, profile=profile)]
 
 
 def _query_for_source(query: str, source: str) -> str:
@@ -857,6 +913,11 @@ def _dailymotion_search_page(seed: int, query: str, *, pages: int = 10) -> int:
     return random.Random(f"{seed}:{query}:dailymotion-page").randrange(1, pages + 1)
 
 
+def _dailymotion_deep_search_page(seed: int, query: str) -> int:
+    """Explore beyond the ten pages covered by the normal search lane."""
+    return random.Random(f"{seed}:{query}:dailymotion-deep-page").randrange(11, 51)
+
+
 def _dailymotion_has_high_quality_format(item: dict[str, Any]) -> bool:
     return any(
         str(value).lower().startswith(("hd", "uhd", "4k"))
@@ -868,7 +929,7 @@ def _search_dailymotion(
     query: str, results: int, profile: str, *, page: int = 1
 ) -> list[dict[str, Any]]:
     fields = (
-        "id,title,description,duration,owner.screenname,url,language,tags,"
+        "id,title,description,duration,owner,owner.screenname,url,language,tags,"
         "created_time,available_formats"
     )
     parameters = urllib.parse.urlencode(
@@ -892,6 +953,7 @@ def _search_dailymotion(
         item = {
             **value,
             "uploader": value.get("owner.screenname"),
+            "uploader_id": value.get("owner"),
             "source_url": value.get("url"),
         }
         if str(item.get("language") or "").lower() not in {"", "en"}:
@@ -901,6 +963,160 @@ def _search_dailymotion(
         if _discovery_candidate_allowed(item, profile=profile, source="dailymotion"):
             items.append(item)
     return items
+
+
+def _dailymotion_connection(
+    path: str,
+    *,
+    profile: str,
+    results: int,
+    page: int = 1,
+) -> list[dict[str, Any]]:
+    """Read a Dailymotion related/channel connection with search-equivalent gates."""
+    fields = (
+        "id,title,description,duration,owner,owner.screenname,url,language,tags,"
+        "created_time,available_formats"
+    )
+    parameters = urllib.parse.urlencode(
+        {"fields": fields, "limit": min(results, 100), "page": max(1, page)}
+    )
+    request = urllib.request.Request(
+        f"https://api.dailymotion.com/{path}?{parameters}",
+        headers={"User-Agent": "sam-audio-dataset-builder/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+    items: list[dict[str, Any]] = []
+    for value in payload.get("list", []):
+        item = {
+            **value,
+            "uploader": value.get("owner.screenname"),
+            "uploader_id": value.get("owner"),
+            "source_url": value.get("url"),
+            "source_platform": "dailymotion",
+        }
+        if str(item.get("language") or "").lower() not in {"", "en"}:
+            continue
+        if not _dailymotion_has_high_quality_format(item):
+            continue
+        if _discovery_candidate_allowed(item, profile=profile, source="dailymotion"):
+            items.append(item)
+    return items
+
+
+def _expand_dailymotion_seed(
+    seed: int,
+    parent: dict[str, Any],
+    *,
+    profile: str,
+    results: int,
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    video_id = str(parent.get("video_id") or "").strip()
+    uploader_id = str(
+        parent.get("uploader_id") or parent.get("channel_id") or ""
+    ).strip()
+    if video_id and not uploader_id:
+        try:
+            parameters = urllib.parse.urlencode({"fields": "owner"})
+            request = urllib.request.Request(
+                "https://api.dailymotion.com/video/"
+                f"{urllib.parse.quote(video_id)}?{parameters}",
+                headers={"User-Agent": "sam-audio-dataset-builder/1.0"},
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                uploader_id = str(json.load(response).get("owner") or "").strip()
+        except Exception:
+            logger.debug("Could not resolve Dailymotion owner for %s", video_id)
+    expanded: list[tuple[str, list[dict[str, Any]]]] = []
+    if video_id:
+        try:
+            expanded.append(
+                (
+                    "accepted_related_v1",
+                    _dailymotion_connection(
+                        f"video/{urllib.parse.quote(video_id)}/related",
+                        profile=profile,
+                        results=max(results, 50),
+                    ),
+                )
+            )
+        except Exception:
+            logger.debug("Could not expand Dailymotion related for %s", video_id)
+    if uploader_id:
+        page = random.Random(
+            f"{seed}:{video_id}:{uploader_id}:dailymotion-channel"
+        ).randrange(1, 6)
+        try:
+            expanded.append(
+                (
+                    "accepted_channel_v1",
+                    _dailymotion_connection(
+                        f"user/{urllib.parse.quote(uploader_id)}/videos",
+                        profile=profile,
+                        results=max(results, 50),
+                        page=page,
+                    ),
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Could not expand Dailymotion channel %s page %d",
+                uploader_id,
+                page,
+            )
+    return expanded
+
+
+def _expand_bilibili_seed(
+    parent: dict[str, Any],
+    *,
+    profile: str,
+    results: int,
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Use Bilibili's related graph; same-owner results form the channel lane."""
+    video_id = str(parent.get("video_id") or "").strip()
+    if not video_id:
+        return []
+    parameters = urllib.parse.urlencode({"bvid": video_id})
+    request = urllib.request.Request(
+        f"https://api.bilibili.com/x/web-interface/archive/related?{parameters}",
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+    parent_uploader = str(
+        parent.get("uploader_id") or parent.get("channel_id") or ""
+    ).strip()
+    buckets: dict[str, list[dict[str, Any]]] = {
+        "accepted_related_v1": [],
+        "accepted_channel_v1": [],
+    }
+    for value in (payload.get("data") or [])[: max(results * 2, results)]:
+        owner = value.get("owner") or {}
+        bvid = str(value.get("bvid") or "").strip()
+        if not bvid:
+            continue
+        uploader_id = str(owner.get("mid") or "").strip()
+        item = {
+            **value,
+            "id": bvid,
+            "duration": value.get("duration"),
+            "uploader": owner.get("name"),
+            "uploader_id": uploader_id,
+            "channel_id": uploader_id,
+            "source_url": f"https://www.bilibili.com/video/{bvid}",
+            "source_platform": "bilibili",
+        }
+        if not _discovery_candidate_allowed(item, profile=profile, source="bilibili"):
+            continue
+        strategy = (
+            "accepted_channel_v1"
+            if parent_uploader and uploader_id == parent_uploader
+            else "accepted_related_v1"
+        )
+        if len(buckets[strategy]) < results:
+            buckets[strategy].append(item)
+    return [(strategy, items) for strategy, items in buckets.items() if items]
 
 
 def _search(
@@ -969,6 +1185,7 @@ def discover_candidates(
     source_content_minutes_per_hour: float | None = None,
     max_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
     source: str = "youtube",
+    expansion_seeds: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     metadata_dir = output_dir / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -989,6 +1206,8 @@ def discover_candidates(
             and search_metadata.get("source", "youtube") == source
             and search_metadata.get("candidate_duration_policy")
             == CANDIDATE_DURATION_POLICY
+            and search_metadata.get("discovery_expansion_policy")
+            == DISCOVERY_EXPANSION_POLICY
             and (
                 source != "dailymotion"
                 or search_metadata.get("search_page_policy")
@@ -1020,110 +1239,209 @@ def discover_candidates(
                 logger.info("Reusing %d discovered candidates", len(filtered))
                 return filtered
 
-    queries = build_queries(seed, query_count, profile=profile)
+    query_specs = build_query_specs(seed, query_count, profile=profile)
+    queries = [spec["query"] for spec in query_specs]
     found: dict[str, dict[str, Any]] = {}
-    found_videos: set[str] = set()
     failures: list[dict[str, str]] = []
+    discoveries: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        pending = {
-            executor.submit(
+        pending: dict[Future[Any], dict[str, Any]] = {}
+        for spec in query_specs:
+            query = spec["query"]
+            page = (
+                _dailymotion_search_page(seed, query) if source == "dailymotion" else 1
+            )
+            future = executor.submit(
                 _search,
                 query,
                 results_per_query,
                 profile,
                 source,
-                search_page=(
-                    _dailymotion_search_page(seed, query)
-                    if source == "dailymotion"
-                    else 1
+                search_page=page,
+            )
+            pending[future] = {
+                "kind": "search",
+                "query": query,
+                "family": spec["family"],
+                "strategy": (
+                    "query_expanded_v2"
+                    if spec["family"] == "cinematic_gameplay_context_v2"
+                    else "query_v1"
                 ),
-            ): query
-            for query in queries
-        }
+                "page": page,
+            }
+            if source == "dailymotion":
+                deep_page = _dailymotion_deep_search_page(seed, query)
+                future = executor.submit(
+                    _search,
+                    query,
+                    results_per_query,
+                    profile,
+                    source,
+                    search_page=deep_page,
+                )
+                pending[future] = {
+                    "kind": "search",
+                    "query": query,
+                    "family": spec["family"],
+                    "strategy": "deep_page_v1",
+                    "page": deep_page,
+                }
+        productive_seeds = (expansion_seeds or [])[:DISCOVERY_EXPANSION_SEEDS_PER_BATCH]
+        for parent in productive_seeds:
+            if source == "dailymotion":
+                future = executor.submit(
+                    _expand_dailymotion_seed,
+                    seed,
+                    parent,
+                    profile=profile,
+                    results=results_per_query,
+                )
+            elif source == "bilibili":
+                future = executor.submit(
+                    _expand_bilibili_seed,
+                    parent,
+                    profile=profile,
+                    results=results_per_query,
+                )
+            else:
+                continue
+            pending[future] = {
+                "kind": "expansion",
+                "parent": parent,
+                "query": str(parent.get("search_query") or ""),
+            }
         for index, future in enumerate(as_completed(pending), start=1):
-            query = pending[future]
+            task = pending[future]
             try:
-                items = future.result()
+                result = future.result()
             except Exception as error:
                 failures.append(
-                    {"query": query, "error": f"{type(error).__name__}: {error}"}
+                    {
+                        "query": str(task.get("query") or ""),
+                        "strategy": str(task.get("strategy") or task["kind"]),
+                        "error": f"{type(error).__name__}: {error}",
+                    }
                 )
                 continue
-            for item in items:
-                video_id = str(item["id"])
-                if video_id in found_videos:
-                    continue
-                found_videos.add(video_id)
-                duration = float(item["duration"])
-                starts = _sample_clip_starts(
-                    seed=seed,
-                    video_id=video_id,
-                    duration=duration,
-                    clips_per_video=clips_per_video,
-                    source_content_minutes_per_hour=(source_content_minutes_per_hour),
-                    max_clips_per_video=max_clips_per_video,
-                )
-                source_budget = (
-                    source_clip_budget(
-                        duration,
-                        clip_seconds=CLIP_SECONDS,
-                        base_clips=clips_per_video,
-                        content_minutes_per_hour=source_content_minutes_per_hour,
-                        max_clips=max_clips_per_video,
-                    )
-                    if source_content_minutes_per_hour is not None
-                    else clips_per_video
-                )
-                for segment_index, start in enumerate(starts):
-                    candidate_id = f"{video_id}:{round(start * 1000)}"
-                    found[candidate_id] = {
-                        "candidate_id": candidate_id,
-                        "video_id": video_id,
-                        "source_url": (
-                            item.get("source_url")
-                            or item.get("webpage_url")
-                            or item.get("original_url")
-                            or (
-                                f"https://www.dailymotion.com/video/{video_id}"
-                                if source == "dailymotion"
-                                else (
-                                    f"https://www.youtube.com/watch?v={video_id}"
-                                    if source == "youtube"
-                                    else item.get("url")
-                                )
-                            )
-                        ),
-                        "source_platform": source,
-                        "title": item.get("title"),
-                        "duration_seconds": duration,
-                        "uploader": item.get("uploader") or item.get("channel"),
-                        "description": item.get("description"),
-                        "tags": item.get("tags"),
-                        "channel_id": item.get("channel_id"),
-                        "view_count": item.get("view_count"),
-                        "search_query": query,
-                        "clip_start_seconds": round(start, 3),
-                        "clip_end_seconds": round(start + CLIP_SECONDS, 3),
-                        "segment_index": segment_index,
-                        "source_clip_budget": source_budget,
-                        "selection": f"seeded_{profile}_{source}_search",
-                        "selection_seed": seed,
-                        "mixture_bias": [
-                            "dialogue",
-                            "music",
-                            "environmental_sfx",
-                        ],
-                        "source_audio_rights": (
-                            "Underlying media remains subject to its source terms."
-                        ),
-                    }
+            if task["kind"] == "expansion":
+                parent = task["parent"]
+                for strategy, items in result:
+                    for item in items:
+                        discoveries.append(
+                            {
+                                "item": item,
+                                "query": task["query"],
+                                "family": "accepted_parent_graph_v1",
+                                "strategy": strategy,
+                                "page": None,
+                                "parent_video_id": parent.get("video_id"),
+                                "parent_uploader": parent.get("uploader"),
+                            }
+                        )
+            else:
+                for item in result:
+                    discoveries.append({"item": item, **task})
             if index % 25 == 0:
                 logger.info(
-                    "Searches %d/%d; %d unique candidates",
+                    "Discovery tasks %d/%d; %d raw sources",
                     index,
-                    len(queries),
-                    len(found),
+                    len(pending),
+                    len(discoveries),
                 )
+    strategy_order = {
+        "accepted_channel_v1": 0,
+        "accepted_related_v1": 1,
+        "query_expanded_v2": 2,
+        "deep_page_v1": 3,
+        "query_v1": 4,
+    }
+    discoveries.sort(
+        key=lambda value: (
+            strategy_order.get(str(value.get("strategy")), 99),
+            str(value["item"].get("id") or ""),
+        )
+    )
+    found_videos: set[str] = set()
+    strategy_counts: dict[str, int] = {}
+    for discovery in discoveries:
+        item = discovery["item"]
+        video_id = str(item["id"])
+        if video_id in found_videos:
+            continue
+        found_videos.add(video_id)
+        strategy = str(discovery.get("strategy") or "query_v1")
+        family = str(discovery.get("family") or "general_v1")
+        quality_key = (
+            f"query_family:{family}" if strategy.startswith("query_") else strategy
+        )
+        strategy_counts[quality_key] = strategy_counts.get(quality_key, 0) + 1
+        duration = float(item["duration"])
+        starts = _sample_clip_starts(
+            seed=seed,
+            video_id=video_id,
+            duration=duration,
+            clips_per_video=clips_per_video,
+            source_content_minutes_per_hour=source_content_minutes_per_hour,
+            max_clips_per_video=max_clips_per_video,
+        )
+        source_budget = (
+            source_clip_budget(
+                duration,
+                clip_seconds=CLIP_SECONDS,
+                base_clips=clips_per_video,
+                content_minutes_per_hour=source_content_minutes_per_hour,
+                max_clips=max_clips_per_video,
+            )
+            if source_content_minutes_per_hour is not None
+            else clips_per_video
+        )
+        for segment_index, start in enumerate(starts):
+            candidate_id = f"{video_id}:{round(start * 1000)}"
+            found[candidate_id] = {
+                "candidate_id": candidate_id,
+                "video_id": video_id,
+                "source_url": (
+                    item.get("source_url")
+                    or item.get("webpage_url")
+                    or item.get("original_url")
+                    or (
+                        f"https://www.dailymotion.com/video/{video_id}"
+                        if source == "dailymotion"
+                        else (
+                            f"https://www.youtube.com/watch?v={video_id}"
+                            if source == "youtube"
+                            else item.get("url")
+                        )
+                    )
+                ),
+                "source_platform": source,
+                "title": item.get("title"),
+                "duration_seconds": duration,
+                "uploader": item.get("uploader") or item.get("channel"),
+                "uploader_id": item.get("uploader_id"),
+                "description": item.get("description"),
+                "tags": item.get("tags"),
+                "channel_id": item.get("channel_id"),
+                "view_count": item.get("view_count"),
+                "search_query": discovery.get("query"),
+                "discovery_strategy": strategy,
+                "discovery_quality_key": quality_key,
+                "discovery_query_family": family,
+                "discovery_page": discovery.get("page"),
+                "discovery_parent_video_id": discovery.get("parent_video_id"),
+                "discovery_parent_uploader": discovery.get("parent_uploader"),
+                "clip_start_seconds": round(start, 3),
+                "clip_end_seconds": round(start + CLIP_SECONDS, 3),
+                "segment_index": segment_index,
+                "source_clip_budget": source_budget,
+                "selection": f"seeded_{profile}_{source}_search",
+                "selection_seed": seed,
+                "mixture_bias": ["dialogue", "music", "environmental_sfx"],
+                "source_audio_rights": (
+                    "Underlying media remains subject to its source terms."
+                ),
+            }
     candidates = list(found.values())
     random.Random(seed).shuffle(candidates)
     candidates_path.write_text(json.dumps(candidates, indent=2) + "\n")
@@ -1137,6 +1455,7 @@ def discover_candidates(
                 "source_content_minutes_per_hour": (source_content_minutes_per_hour),
                 "max_clips_per_video": max_clips_per_video,
                 "candidate_duration_policy": CANDIDATE_DURATION_POLICY,
+                "discovery_expansion_policy": DISCOVERY_EXPANSION_POLICY,
                 "search_page_policy": (
                     DAILYMOTION_SEARCH_POLICY if source == "dailymotion" else None
                 ),
@@ -1147,6 +1466,9 @@ def discover_candidates(
                 ),
                 "seed": seed,
                 "queries": queries,
+                "query_specs": query_specs,
+                "expansion_seed_count": len(expansion_seeds or []),
+                "discovery_strategy_counts": strategy_counts,
                 "results_per_query": results_per_query,
                 "unique_candidates": len(candidates),
                 "failures": failures,
@@ -1313,9 +1635,7 @@ def _download_section(
     source_platform = candidate.get("source_platform", "youtube")
     if source_platform == "youtube":
         clients = (
-            ("tv", "mweb", "default")
-            if youtube_client == "auto"
-            else (youtube_client,)
+            ("tv", "mweb", "default") if youtube_client == "auto" else (youtube_client,)
         )
     else:
         clients = (str(source_platform),)

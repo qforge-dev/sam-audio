@@ -90,6 +90,8 @@
     <div class="table-wrap" id="throughputWrap" hidden><table><thead><tr><th>Window / stage</th><th>Clips</th><th>Clips/min</th><th>Audio min/min</th><th>Audio hours/hour</th></tr></thead><tbody id="throughput"></tbody></table></div>
     <div class="section-head" id="sourceHeading" hidden><div><h2>Downloader by source</h2><p>Recent transfer speed and source-audio throughput, plus the current queue outcome.</p></div></div>
     <div class="table-wrap" id="sourceWrap" hidden><table><thead><tr><th>Source</th><th>Circuit</th><th>Queued</th><th>Attempts</th><th>Success</th><th>Transfer MB/s</th><th>Source audio h/h</th><th>Complete</th><th>Rejected</th></tr></thead><tbody id="sourcePlatforms"></tbody></table></div>
+    <div class="section-head" id="discoveryHeading" hidden><div><h2>Discovery quality by lane</h2><p>New query families, deep pages, related videos, and channel traversal stay probe-limited until downstream acceptance validates them.</p></div></div>
+    <div class="table-wrap" id="discoveryWrap" hidden><table><thead><tr><th>Discovery lane</th><th>Admission</th><th>Sources</th><th>Active</th><th>Scan evaluated</th><th>Scan pass</th><th>Final records</th><th>Final accepted</th><th>Final acceptance</th></tr></thead><tbody id="discoveryStrategies"></tbody></table></div>
     <div class="section-head" id="batchHeading"><div><h2>Acquisition batches</h2><p>Counts update every five seconds.</p></div></div>
     <div class="table-wrap"><table><thead><tr><th>Batch</th><th>Status</th><th>Attempts</th><th>Downloaded</th><th>M2D scored</th><th>M2D pass</th><th>Speech scored</th><th>Speech pass</th><th>Combined</th></tr></thead><tbody id="batches"></tbody></table></div>
     <div class="section-head" id="workerHeading" hidden><div><h2>Independent workers</h2><p>Each producer and consumer advances at its own rate.</p></div></div>
@@ -266,6 +268,16 @@
             const queued = Number(states.discovered || 0) + Number(states.downloaded || 0) + Number(states.scanned || 0);
             return `<tr><td><strong>${label(source)}</strong></td><td><strong>${label(circuit.state)}</strong><br><small class="muted">${circuitHelp}</small></td><td>${number(queued)}</td><td>${number(metrics.download_attempts)}<br><small class="muted">${Number(metrics.download_attempts_per_minute || 0).toFixed(2)}/min</small></td><td>${Number(metrics.download_success_percent || 0).toFixed(1)}%<br><small class="muted">${number(metrics.download_successes)} sources</small></td><td>${Number(metrics.download_megabytes_per_second || 0).toFixed(2)}</td><td>${Number(metrics.source_audio_hours_per_wall_hour || 0).toFixed(2)}</td><td>${number(states.complete)}</td><td>${number(states.rejected)}</td></tr>`;
           }).join('') || '<tr><td colspan="9" class="muted">Waiting for source discovery.</td></tr>';
+          const discoveryStrategies = (data.source_frontier || {}).discovery_strategies || {};
+          $('discoveryHeading').hidden = false;
+          $('discoveryWrap').hidden = false;
+          $('discoveryStrategies').innerHTML = Object.entries(discoveryStrategies).map(([key,metrics]) => {
+            const admission = metrics.admission || {state:'unrestricted'};
+            const allowance = admission.new_source_allowance == null ? 'uncapped' : `${number(admission.new_source_allowance)} probe slots`;
+            const scanRate = metrics.scan_pass_rate_percent == null ? 'warming up' : `${Number(metrics.scan_pass_rate_percent).toFixed(1)}%`;
+            const finalRate = metrics.final_acceptance_percent == null ? 'warming up' : `${Number(metrics.final_acceptance_percent).toFixed(1)}%`;
+            return `<tr><td><strong>${label(key)}</strong></td><td><strong>${label(admission.state)}</strong><br><small class="muted">${label(admission.reason || allowance)}</small></td><td>${number(metrics.sources)}</td><td>${number(metrics.active_sources)}</td><td>${number(metrics.scan_evaluated_sources)}</td><td>${scanRate}<br><small class="muted">${number(metrics.scan_passed_sources)} sources</small></td><td>${number(metrics.final_records)}</td><td>${number(metrics.final_accepted)}</td><td>${finalRate}</td></tr>`;
+          }).join('') || '<tr><td colspan="9" class="muted">New labeled discovery lanes are warming up.</td></tr>';
           $('batchHeading').hidden = true;
           $('batches').closest('.table-wrap').hidden = true;
           $('workerHeading').hidden = false; $('workerWrap').hidden = false;

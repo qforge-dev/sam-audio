@@ -26,6 +26,11 @@ MUTABLE_COLUMNS = {"downloaded_path", "download_json", "scan_json"}
 _NETWORK_WINDOW_SECONDS = 60.0
 _network_samples: deque[tuple[float, int]] = deque()
 _network_samples_lock = threading.Lock()
+DISCOVERY_PROBE_ACTIVE_SOURCES = 8
+DISCOVERY_MIN_SCAN_SOURCES = 12
+DISCOVERY_MIN_FINAL_RECORDS = 20
+DISCOVERY_MIN_SCAN_PASS_RATE = 0.08
+DISCOVERY_MIN_FINAL_ACCEPTANCE_RATE = 0.35
 
 
 def _now_iso(timestamp: float | None = None) -> str:
@@ -36,6 +41,156 @@ def _now_iso(timestamp: float | None = None) -> str:
 
 def source_key(platform: str, video_id: str) -> str:
     return f"{platform}:{video_id}"
+
+
+def _is_quality_gated_discovery(key: str) -> bool:
+    return key in {
+        "deep_page_v1",
+        "accepted_related_v1",
+        "accepted_channel_v1",
+        "query_family:cinematic_gameplay_context_v2",
+    }
+
+
+def discovery_strategy_admission(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Bound new discovery lanes until downstream evidence proves their yield."""
+    key = str(metrics.get("key") or "legacy")
+    active = int(metrics.get("active_sources") or 0)
+    scanned = int(metrics.get("scan_evaluated_sources") or 0)
+    scan_passed = int(metrics.get("scan_passed_sources") or 0)
+    records = int(metrics.get("final_records") or 0)
+    accepted = int(metrics.get("final_accepted") or 0)
+    scan_rate = scan_passed / scanned if scanned else None
+    final_rate = accepted / records if records else None
+    if not _is_quality_gated_discovery(key):
+        return {"state": "unrestricted", "new_source_allowance": None}
+    reason = None
+    if records >= 10 and accepted == 0:
+        reason = "no_final_accepts"
+    elif (
+        records >= DISCOVERY_MIN_FINAL_RECORDS
+        and final_rate is not None
+        and final_rate < DISCOVERY_MIN_FINAL_ACCEPTANCE_RATE
+    ):
+        reason = "low_final_acceptance"
+    elif (
+        scanned >= DISCOVERY_MIN_SCAN_SOURCES
+        and scan_rate is not None
+        and scan_rate < DISCOVERY_MIN_SCAN_PASS_RATE
+    ):
+        reason = "low_scan_pass_rate"
+    if reason:
+        return {
+            "state": "suspended",
+            "reason": reason,
+            "new_source_allowance": 0,
+        }
+    if records >= DISCOVERY_MIN_FINAL_RECORDS:
+        return {"state": "healthy", "new_source_allowance": None}
+    return {
+        "state": "probing",
+        "reason": "awaiting_downstream_sample",
+        "new_source_allowance": max(0, DISCOVERY_PROBE_ACTIVE_SOURCES - active),
+    }
+
+
+def discovery_strategy_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    catalog_path: Path | None = None,
+    platform: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Attribute source-stage and final acceptance to each discovery lane."""
+    parameters: tuple[Any, ...] = (platform,) if platform else ()
+    where = "WHERE platform=?" if platform else ""
+    rows = connection.execute(
+        f"""SELECT platform,state,scan_json,candidate_json FROM source_jobs {where}""",
+        parameters,
+    ).fetchall()
+    aggregates: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            candidates = json.loads(row["candidate_json"])
+            base = candidates[0] if candidates else {}
+        except (json.JSONDecodeError, TypeError):
+            base = {}
+        key = str(base.get("discovery_quality_key") or "legacy")
+        item = aggregates.setdefault(
+            key,
+            {
+                "key": key,
+                "sources": 0,
+                "active_sources": 0,
+                "scan_evaluated_sources": 0,
+                "scan_passed_sources": 0,
+                "final_records": 0,
+                "final_accepted": 0,
+                "platforms": Counter(),
+                "states": Counter(),
+            },
+        )
+        state = str(row["state"])
+        item["sources"] += 1
+        item["platforms"][str(row["platform"])] += 1
+        item["states"][state] += 1
+        if state in ACTIVE_STATES:
+            item["active_sources"] += 1
+        if row["scan_json"]:
+            item["scan_evaluated_sources"] += 1
+            if state in {"scanned", "complete"}:
+                item["scan_passed_sources"] += 1
+    if catalog_path and catalog_path.exists():
+        catalog = sqlite3.connect(f"file:{catalog_path}?mode=ro", uri=True, timeout=30)
+        query = (
+            """SELECT COALESCE(json_extract(r.record_json,"""
+            """'$.discovery_quality_key'),'legacy') AS quality_key,"""
+            """COUNT(*) AS records,SUM(CASE WHEN a.sha256 IS NULL THEN 0 ELSE 1 END) """
+            """AS accepted FROM records r LEFT JOIN accepted a USING(sha256)"""
+        )
+        values: tuple[Any, ...] = ()
+        if platform:
+            query += " WHERE r.platform=?"
+            values = (platform,)
+        query += " GROUP BY quality_key"
+        for quality_key, records, accepted in catalog.execute(query, values):
+            key = str(quality_key or "legacy")
+            item = aggregates.setdefault(
+                key,
+                {
+                    "key": key,
+                    "sources": 0,
+                    "active_sources": 0,
+                    "scan_evaluated_sources": 0,
+                    "scan_passed_sources": 0,
+                    "final_records": 0,
+                    "final_accepted": 0,
+                    "platforms": Counter(),
+                    "states": Counter(),
+                },
+            )
+            item["final_records"] += int(records)
+            item["final_accepted"] += int(accepted)
+        catalog.close()
+    result: dict[str, dict[str, Any]] = {}
+    for key, item in sorted(aggregates.items()):
+        scanned = int(item["scan_evaluated_sources"])
+        records = int(item["final_records"])
+        normalized = {
+            **item,
+            "platforms": dict(item["platforms"]),
+            "states": dict(item["states"]),
+            "scan_pass_rate_percent": (
+                round(100.0 * item["scan_passed_sources"] / scanned, 2)
+                if scanned
+                else None
+            ),
+            "final_acceptance_percent": (
+                round(100.0 * item["final_accepted"] / records, 2) if records else None
+            ),
+        }
+        normalized["admission"] = discovery_strategy_admission(normalized)
+        result[key] = normalized
+    return result
 
 
 def connect_frontier(workspace: Path) -> sqlite3.Connection:
@@ -699,9 +854,7 @@ def _host_receive_rate(timestamp: float) -> dict[str, float | None]:
         else None
     )
     return {
-        "receive_megabytes_per_second": round(rate, 3)
-        if rate is not None
-        else None,
+        "receive_megabytes_per_second": round(rate, 3) if rate is not None else None,
         "observed_seconds": round(observed, 1),
     }
 
@@ -711,6 +864,7 @@ def frontier_snapshot(
     *,
     window_minutes: float = 15.0,
     now: float | None = None,
+    catalog_path: Path | None = None,
 ) -> dict[str, Any]:
     """Return queue and recent-stage health without mutating frontier state."""
     path = workspace / FRONTIER_FILENAME
@@ -770,6 +924,9 @@ def frontier_snapshot(
     platform_metrics: dict[str, dict[str, Any]] = {}
     platform_counts = frontier_platform_counts(connection)
     circuits = provider_circuit_snapshot(connection, now=timestamp)
+    discovery_strategies = discovery_strategy_snapshot(
+        connection, catalog_path=catalog_path
+    )
     for platform in sorted(platform_counts):
         downloads = [
             row
@@ -866,6 +1023,7 @@ def frontier_snapshot(
         "oldest_ready_minutes": oldest,
         "stages": stage_metrics,
         "platforms": platform_metrics,
+        "discovery_strategies": discovery_strategies,
         "workers": workers,
         "autoscaler": autoscaler,
     }

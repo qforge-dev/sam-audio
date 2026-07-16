@@ -8,6 +8,8 @@ import pytest
 from sam_audio_pipeline.source_frontier import (
     claim_source,
     connect_frontier,
+    discovery_strategy_admission,
+    discovery_strategy_snapshot,
     enqueue_source,
     finish_source,
     frontier_counts,
@@ -19,6 +21,86 @@ from sam_audio_pipeline.source_frontier import (
     release_worker_leases,
     retry_source,
 )
+
+
+def test_new_discovery_lane_is_probe_limited_then_suspended_on_zero_yield() -> None:
+    probing = discovery_strategy_admission(
+        {
+            "key": "deep_page_v1",
+            "active_sources": 3,
+            "scan_evaluated_sources": 4,
+            "scan_passed_sources": 1,
+            "final_records": 0,
+            "final_accepted": 0,
+        }
+    )
+    suspended = discovery_strategy_admission(
+        {
+            "key": "deep_page_v1",
+            "active_sources": 0,
+            "scan_evaluated_sources": 12,
+            "scan_passed_sources": 0,
+            "final_records": 0,
+            "final_accepted": 0,
+        }
+    )
+
+    assert probing == {
+        "state": "probing",
+        "reason": "awaiting_downstream_sample",
+        "new_source_allowance": 5,
+    }
+    assert suspended["state"] == "suspended"
+    assert suspended["reason"] == "low_scan_pass_rate"
+
+
+def test_discovery_strategy_snapshot_attributes_frontier_sources(
+    tmp_path: Path,
+) -> None:
+    connection = connect_frontier(tmp_path)
+    item = candidate("deep")
+    item[0]["discovery_quality_key"] = "deep_page_v1"
+    enqueue_source(connection, item)
+    connection.execute(
+        """UPDATE source_jobs SET state='rejected',scan_json='{}' """
+        """WHERE source_key='dailymotion:deep'"""
+    )
+
+    snapshot = discovery_strategy_snapshot(connection, platform="dailymotion")
+
+    assert snapshot["deep_page_v1"]["scan_evaluated_sources"] == 1
+    assert snapshot["deep_page_v1"]["scan_passed_sources"] == 0
+    assert snapshot["deep_page_v1"]["scan_pass_rate_percent"] == 0.0
+    connection.close()
+
+
+def test_discovery_strategy_snapshot_includes_final_acceptance(tmp_path: Path) -> None:
+    connection = connect_frontier(tmp_path)
+    catalog_path = tmp_path / "catalog.sqlite3"
+    catalog = sqlite3.connect(catalog_path)
+    catalog.executescript(
+        """
+        CREATE TABLE records(sha256 TEXT,platform TEXT,record_json TEXT);
+        CREATE TABLE accepted(sha256 TEXT);
+        """
+    )
+    record = '{"discovery_quality_key":"accepted_related_v1"}'
+    catalog.executemany(
+        "INSERT INTO records VALUES(?,?,?)",
+        (("one", "dailymotion", record), ("two", "dailymotion", record)),
+    )
+    catalog.execute("INSERT INTO accepted VALUES('one')")
+    catalog.commit()
+    catalog.close()
+
+    snapshot = discovery_strategy_snapshot(
+        connection, catalog_path=catalog_path, platform="dailymotion"
+    )
+
+    assert snapshot["accepted_related_v1"]["final_records"] == 2
+    assert snapshot["accepted_related_v1"]["final_accepted"] == 1
+    assert snapshot["accepted_related_v1"]["final_acceptance_percent"] == 50.0
+    connection.close()
 
 
 def candidate(video_id: str) -> list[dict[str, object]]:
