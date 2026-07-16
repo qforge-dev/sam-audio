@@ -324,7 +324,9 @@ def enqueue_sources(
     initial_state: Any | None = None,
 ) -> int:
     inserted = 0
-    connection.execute("BEGIN IMMEDIATE")
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
     try:
         for group in groups:
             inserted += int(
@@ -337,9 +339,11 @@ def enqueue_sources(
                     ),
                 )
             )
-        connection.commit()
+        if owns_transaction:
+            connection.commit()
     except Exception:
-        connection.rollback()
+        if owns_transaction:
+            connection.rollback()
         raise
     return inserted
 

@@ -451,11 +451,6 @@ def discover_into_frontier_once(
         else {}
     )
     expansion_seeds = _productive_expansion_seeds(guidance, seed=seed)
-    strategy_metrics = discovery_strategy_snapshot(
-        connection,
-        catalog_path=settings.catalog,
-        platform=settings.source,
-    )
     cache_adoption = {"promoted": 0, "rejected": 0, "completed": 0}
     if settings.scan_cache is not None:
         cache_adoption = adopt_cached_scans(
@@ -520,35 +515,50 @@ def discover_into_frontier_once(
         youtube_random.CLIP_SECONDS = previous_clip_seconds
     groups = _group_candidates_by_video(candidates, grouped=True)
     groups.sort(key=lambda group: _cinematic_candidate_priority(group[0]), reverse=True)
-    # Capacity is source based, not candidate-region based.
-    known = {
-        str(row["source_key"])
-        for row in connection.execute("SELECT source_key FROM source_jobs")
-    }
-    unseen = [
+    eligible = [
         group
         for group in groups
-        if f"{group[0].get('source_platform') or 'unknown'}:{group[0]['video_id']}"
-        not in known
-        and (
-            settings.scan_cache is None
-            or _scan_group_has_remaining_work(
-                group,
-                cache_dir=settings.scan_cache,
-                guidance=guidance,
-                clip_seconds=settings.clip_seconds,
-            )
+        if settings.scan_cache is None
+        or _scan_group_has_remaining_work(
+            group,
+            cache_dir=settings.scan_cache,
+            guidance=guidance,
+            clip_seconds=settings.clip_seconds,
         )
     ]
-    admitted, strategy_admission = _admit_discovery_groups(unseen, strategy_metrics)
-    selected = admitted[:capacity]
-    inserted = enqueue_sources(
-        connection,
-        selected,
-        priority=lambda group: _cinematic_candidate_priority(group[0]),
-    )
-    after = frontier_counts(connection)
-    after_platform = frontier_platform_counts(connection).get(settings.source, {})
+    # Serialize the final capacity/admission decision. Multiple discovery
+    # processes run concurrently, so a read-then-enqueue sequence would allow
+    # every process to consume the same per-strategy probe allowance.
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        known = {
+            str(row["source_key"])
+            for row in connection.execute("SELECT source_key FROM source_jobs")
+        }
+        unseen = [
+            group
+            for group in eligible
+            if f"{group[0].get('source_platform') or 'unknown'}:{group[0]['video_id']}"
+            not in known
+        ]
+        strategy_metrics = discovery_strategy_snapshot(
+            connection,
+            catalog_path=settings.catalog,
+            platform=settings.source,
+        )
+        admitted, strategy_admission = _admit_discovery_groups(unseen, strategy_metrics)
+        selected = admitted[:capacity]
+        inserted = enqueue_sources(
+            connection,
+            selected,
+            priority=lambda group: _cinematic_candidate_priority(group[0]),
+        )
+        after = frontier_counts(connection)
+        after_platform = frontier_platform_counts(connection).get(settings.source, {})
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     connection.close()
     result = {
         "seed": seed,
