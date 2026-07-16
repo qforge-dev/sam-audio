@@ -101,17 +101,18 @@ def discovery_strategy_snapshot(
     parameters: tuple[Any, ...] = (platform,) if platform else ()
     where = "WHERE platform=?" if platform else ""
     rows = connection.execute(
-        f"""SELECT platform,state,scan_json,candidate_json FROM source_jobs {where}""",
+        f"""SELECT platform,state,
+        COALESCE(json_extract(candidate_json,
+        '$[0].discovery_quality_key'),'legacy') AS quality_key,
+        COUNT(*) AS sources,
+        SUM(CASE WHEN scan_json IS NULL THEN 0 ELSE 1 END) AS scan_evaluated
+        FROM source_jobs {where}
+        GROUP BY platform,state,quality_key""",
         parameters,
     ).fetchall()
     aggregates: dict[str, dict[str, Any]] = {}
     for row in rows:
-        try:
-            candidates = json.loads(row["candidate_json"])
-            base = candidates[0] if candidates else {}
-        except (json.JSONDecodeError, TypeError):
-            base = {}
-        key = str(base.get("discovery_quality_key") or "legacy")
+        key = str(row["quality_key"] or "legacy")
         item = aggregates.setdefault(
             key,
             {
@@ -127,15 +128,16 @@ def discovery_strategy_snapshot(
             },
         )
         state = str(row["state"])
-        item["sources"] += 1
-        item["platforms"][str(row["platform"])] += 1
-        item["states"][state] += 1
+        sources = int(row["sources"])
+        evaluated = int(row["scan_evaluated"] or 0)
+        item["sources"] += sources
+        item["platforms"][str(row["platform"])] += sources
+        item["states"][state] += sources
         if state in ACTIVE_STATES:
-            item["active_sources"] += 1
-        if row["scan_json"]:
-            item["scan_evaluated_sources"] += 1
-            if state in {"scanned", "complete"}:
-                item["scan_passed_sources"] += 1
+            item["active_sources"] += sources
+        item["scan_evaluated_sources"] += evaluated
+        if state in {"scanned", "complete"}:
+            item["scan_passed_sources"] += evaluated
     if catalog_path and catalog_path.exists():
         catalog = sqlite3.connect(f"file:{catalog_path}?mode=ro", uri=True, timeout=30)
         query = (
