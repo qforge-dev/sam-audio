@@ -36,7 +36,7 @@ from typing import Any
 import numpy as np
 
 from .audio import sha256_file
-from .remote_media import command_for_media_worker
+from .remote_media import command_for_media_worker, shared_media_temp_root
 from .source_diversity import (
     DEFAULT_MAX_CLIPS_PER_SOURCE,
     record_source_clip_budget,
@@ -1702,21 +1702,19 @@ def _download_section(
 
 
 def _source_format(path: Path, info: dict[str, Any], client: str) -> dict[str, Any]:
-    response = _run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=codec_name,sample_rate,channels,bit_rate",
-            "-of",
-            "json",
-            str(path),
-        ],
-        timeout=30,
-    )
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name,sample_rate,channels,bit_rate",
+        "-of",
+        "json",
+        str(path),
+    ]
+    response = _run(command, timeout=30)
     streams = json.loads(response.stdout).get("streams") or []
     stream = streams[0] if streams else {}
     stream_bitrate = float(stream.get("bit_rate") or 0.0) / 1000.0
@@ -1741,6 +1739,7 @@ def _normalize_candidate_from_source(
     *,
     started: float,
     source_start_seconds: float | None = None,
+    media_task: str | None = None,
 ) -> dict[str, Any]:
     video_id = str(candidate["video_id"])
     start = float(candidate["clip_start_seconds"])
@@ -1754,33 +1753,36 @@ def _normalize_candidate_from_source(
     normalized = temporary_root / f"clip-{video_id}-{round(start * 1000)}.wav"
     result = {**candidate, "attempted_at": _now()}
     source_format = _source_format(source, info, retrieval_client)
-    _run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-ss",
-            str(trim_offset),
-            "-i",
-            str(source),
-            "-t",
-            str(CLIP_SECONDS),
-            "-vn",
-            "-threads",
-            "1",
-            "-ac",
-            "2",
-            "-ar",
-            str(OUTPUT_SAMPLE_RATE),
-            "-acodec",
-            "pcm_s16le",
-            str(normalized),
-        ],
-        timeout=45,
-    )
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-ss",
+        str(trim_offset),
+        "-i",
+        str(source),
+        "-t",
+        str(CLIP_SECONDS),
+        "-vn",
+        "-threads",
+        "1",
+        "-ac",
+        "2",
+        "-ar",
+        str(OUTPUT_SAMPLE_RATE),
+        "-acodec",
+        "pcm_s16le",
+        str(normalized),
+    ]
+    timeout = 45.0
+    if media_task is not None:
+        command, timeout = command_for_media_worker(
+            command, task=media_task, timeout=timeout
+        )
+    _run(command, timeout=timeout)
     metrics = analyze_wav(normalized)
     rejections = quality_rejections(metrics, source_format)
     result.update(
@@ -2423,7 +2425,7 @@ def _probe_source_proxy_asr(
         region_started = time.perf_counter()
         start = float(region["start_seconds"])
         probe_audio = root / f"asr-probe-{index}.wav"
-        _run(
+        command, command_timeout = command_for_media_worker(
             [
                 "ffmpeg",
                 "-hide_banner",
@@ -2445,8 +2447,10 @@ def _probe_source_proxy_asr(
                 "pcm_s16le",
                 str(probe_audio),
             ],
+            task="ffmpeg",
             timeout=30,
         )
+        _run(command, timeout=command_timeout)
         result = _request_proxy_asr(
             probe_audio,
             video_id=video_id,
@@ -2701,7 +2705,11 @@ def _download_scanned_sections(
             str(candidate["source_url"]),
         ]
     )
-    response = _run(command, timeout=90 + 30 * len(regions))
+    timeout = 90.0 + 30.0 * len(regions)
+    command, timeout = command_for_media_worker(
+        command, task="extract", timeout=timeout
+    )
+    response = _run(command, timeout=timeout)
     info_by_start = {
         round(float(info["section_start"]), 3): info
         for info in _download_jsons(response.stdout)
@@ -2899,7 +2907,10 @@ def _acquire_scanned_source_group_locked(
     if remaining_budget <= 0:
         return status_result("source_budget_exhausted")
     try:
-        with tempfile.TemporaryDirectory(prefix="sam-source-scan-") as temporary:
+        shared_root = shared_media_temp_root("extract")
+        with tempfile.TemporaryDirectory(
+            prefix="sam-source-extract-", dir=shared_root
+        ) as temporary:
             root = Path(temporary)
             source: Path | None = None
             proxy: Path | None = None
@@ -3139,6 +3150,7 @@ def _acquire_scanned_source_group_locked(
                             root,
                             started=started,
                             source_start_seconds=None,
+                            media_task="extract",
                         )
                     )
                 except Exception as error:

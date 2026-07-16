@@ -100,6 +100,45 @@ def test_assembler_accepts_more_than_24_clips_from_a_long_source(
     assert manifest["source_diversity"]["maximum_clips_per_source"] == 60
 
 
+def test_assembler_terminally_rejects_missing_source_audio(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    connection = connect(workspace)
+    digest = "a" * 64
+    filename = f"{digest}.wav"
+    timestamp = "2026-07-14T00:00:00+00:00"
+    with connection:
+        connection.execute(
+            "INSERT INTO records VALUES(?,?,?,?,?,?,?,?)",
+            (
+                digest,
+                "missing:0",
+                filename,
+                "dailymotion",
+                "missing",
+                0.0,
+                json.dumps({"duration_seconds": 60}),
+                timestamp,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO m2d_scores VALUES(?,?,?,?)",
+            (filename, 1, json.dumps({"accepted": True}), timestamp),
+        )
+        connection.execute(
+            "INSERT INTO asr_scores VALUES(?,?,?,?)",
+            (filename, 1, json.dumps({"accepted": True}), timestamp),
+        )
+    connection.close()
+
+    assert assemble_once(workspace) == 0
+    connection = connect(workspace)
+    reason = connection.execute(
+        "SELECT reason FROM rejected WHERE sha256=?", (digest,)
+    ).fetchone()[0]
+    connection.close()
+    assert reason == "missing_or_corrupt_source"
+
+
 def _autoscale(**overrides: object) -> dict[str, object]:
     settings: dict[str, object] = {
         "download_concurrency": 8,
@@ -261,6 +300,12 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
     assert progress["counts"]["accepted"] == 1
     assert progress["counts"]["rejected_total"] == 0
     assert progress["next_snapshot"]["remaining"] == 2499
+    assert progress["pipeline_stages"]["m2d"]["queue_count"] == 0
+    assert progress["pipeline_stages"]["m2d"]["active_events"] == 1
+    assert progress["pipeline_stages"]["asr"]["queue_count"] == 0
+    assert progress["pipeline_stages"]["asr"]["active_events"] == 1
+    assert progress["pipeline_stages"]["assembly"]["queue_count"] == 0
+    assert progress["pipeline_stages"]["assembly"]["active_events"] == 1
     assert progress["throughput"]["download"]["audio_minutes_per_minute"] > 0
     assert progress["flow"]["state"] == "healthy"
     assert progress["flow"]["processed_audio_hours_per_wall_hour"] > 0

@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from sam_audio_pipeline.review_app import (
+    ContinuousProgressStore,
     PipelineProgressStore,
     ReviewStore,
     create_review_app,
@@ -207,6 +208,43 @@ def test_progress_dashboard_is_optional(tmp_path: Path):
     )
     assert client.get("/progress").status_code == 404
     assert client.get("/api/progress").status_code == 404
+
+
+def test_continuous_progress_store_serves_cached_snapshot(monkeypatch, tmp_path: Path):
+    calls = 0
+
+    def snapshot(workspace: Path, snapshot_size: int) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {
+            "workspace": str(workspace),
+            "snapshot_size": snapshot_size,
+            "counts": {"accepted": 42},
+        }
+
+    monkeypatch.setattr(
+        "sam_audio_pipeline.continuous_dataset.progress_snapshot", snapshot
+    )
+    store = ContinuousProgressStore(
+        tmp_path,
+        snapshot_size=2500,
+        refresh_seconds=60,
+    )
+
+    assert store.snapshot()["snapshot_size"] == 2500
+    assert store.snapshot()["snapshot_size"] == 2500
+    assert calls == 1
+
+    review_root = tmp_path / "review"
+    review_root.mkdir()
+    dataset = _dataset(review_root)
+    client = TestClient(
+        create_review_app(
+            ReviewStore(dataset, audio_directory="balanced-audio"),
+            store,
+        )
+    )
+    assert client.get("/api/progress").json()["review_snapshot"]["materialized"] == 42
 
 
 def test_review_store_discovers_new_manifest_records_without_restart(

@@ -222,6 +222,80 @@ SAM_CONTINUOUS_ASR_WORKERS=1
 SAM_CONTINUOUS_UPLOAD_CONCURRENCY=10
 ```
 
+CPU-heavy source preparation can run on a separate media host while the
+resident M2D scan remains on the GPU host. Both machines must expose the shared
+scratch path at the same absolute location:
+
+```text
+SAM_MEDIA_WORKER_SSH_TARGET=ubuntu@MEDIA_PRIVATE_IP
+SAM_MEDIA_WORKER_SSH_IDENTITY=/home/ubuntu/.ssh/sam-media-worker
+SAM_MEDIA_WORKER_REMOTE_TASKS=download,ffmpeg,search,extract
+SAM_MEDIA_WORKER_SHARED_TMP=/home/ubuntu/cinematic-continuous-30s/source-work/.staging
+SAM_CONTINUOUS_SOURCE_SCAN_CPU_EXEMPT=true
+```
+
+`extract` offloads selected-section retrieval and clip normalization. `ffmpeg`
+offloads whole-source proxy creation and ASR probe cuts. The source autoscaler
+treats remote download and extraction concurrency independently from GPU-host
+CPU pressure, while scan concurrency remains CPU-aware because M2D and scan
+coordination are resident on the GPU host.
+
+When source proxy FFmpeg is remote, `SAM_CONTINUOUS_SOURCE_SCAN_CPU_EXEMPT=true`
+allows additional source threads to keep remote proxy work in flight. It does
+not remove the scanner's own GPU guard: `--inference-concurrency` still bounds
+resident M2D inference independently. Do not enable this setting when proxy
+creation runs locally.
+
+To run transfers independently from scan, extraction, M2D, and ASR pressure,
+enable the dedicated source-download pool:
+
+```text
+SAM_CONTINUOUS_SOURCE_DOWNLOAD_INDEPENDENT=true
+SAM_CONTINUOUS_SOURCE_DOWNLOAD_WORKERS=128
+SAM_CONTINUOUS_DOWNLOADED_HIGH_WATER=8192
+SAM_CONTINUOUS_DOWNLOADED_HIGH_WATER_BYTES=751619276800
+SAM_CONTINUOUS_DOWNLOAD_MINIMUM_FREE_BYTES=214748364800
+```
+
+Independent mode ignores the source autoscaler's downstream concurrency file.
+Provider circuit breakers still isolate failing services, and downloading stops
+at the first external storage boundary: the queue item cap, queue byte cap, or
+200 GiB free-space floor. This intentionally allows the downloaded queue to
+grow while later stages are tuned separately.
+
+For a 500-IP proxy pool, the live configuration uses a 64-consecutive-failure
+breaker threshold with a 60-second initial cooldown. This keeps circuit
+isolation while avoiding provider-wide shutdowns caused by a few bad proxy IPs
+inside a 128-transfer pool.
+
+Four independent discovery controllers maintain a 16,000-source global / 1,200
+per-provider frontier so the transfer pool does not become search-starved. Each
+controller owns its cursor and seed; this expands the feed without duplicating
+queries or coupling downloads to scan/ASR queues.
+
+ASR runs on the GPU host and consumes both final clips and prioritized source
+probes from the media host's shared NFS queue:
+
+```text
+SAM_CONTINUOUS_SOURCE_ASR_SHARED_ROOT=/home/ubuntu/cinematic-continuous-30s/source-work/.source-asr
+SAM_CONTINUOUS_ASR_DEVICE=cuda
+SAM_CONTINUOUS_ASR_COMPUTE_TYPE=float16
+SAM_CONTINUOUS_ASR_CONCURRENCY_MIN=4
+SAM_CONTINUOUS_ASR_CONCURRENCY_MAX=8
+SAM_CONTINUOUS_ASR_CUDA_LIBRARY_PATH=/home/ubuntu/whisper-venv/lib/python3.12/site-packages/nvidia/cublas/lib:/home/ubuntu/whisper-venv/lib/python3.12/site-packages/nvidia/cudnn/lib
+SAM_CONTINUOUS_SOURCE_ASR_CPU_FINAL_ENABLED=false
+SAM_CONTINUOUS_EXTERNAL_ASR=false
+```
+
+The media host writes probe JSON requests and audio under the shared root. The
+GPU ASR worker reads them before normal final-validation work and writes results
+back to the same root, so no explicit file copy or polling over SSH is needed.
+`raw-audio`, `m2d-validation`, and `asr-validation` resolve to the shared
+`continuous` directories through the existing workspace symlinks. The absolute
+offline model snapshot is recorded with the stable `small` label, preserving
+resume behavior across CPU/GPU placement changes. The CPU ASR service is a
+disabled fallback only; do not enable it while the GPU worker is active.
+
 Restart `sam-cinematic-continuous.service` after changing a count. Filename hash
 sharding prevents two M2D or ASR processes from claiming the same clip, and the
 SQLite/WAL catalog makes replay and worker-count changes idempotent. Promoter,

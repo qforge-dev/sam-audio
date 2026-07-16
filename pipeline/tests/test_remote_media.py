@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import shlex
 
-from sam_audio_pipeline.remote_media import command_for_media_worker
+from sam_audio_pipeline.remote_media import (
+    command_for_media_worker,
+    shared_media_temp_root,
+)
 
 
 def test_media_command_is_local_without_remote_configuration(monkeypatch) -> None:
@@ -19,7 +22,9 @@ def test_media_command_is_local_without_remote_configuration(monkeypatch) -> Non
     assert timeout == 30
 
 
-def test_media_command_wraps_only_enabled_tasks_and_quotes_arguments(monkeypatch) -> None:
+def test_media_command_wraps_only_enabled_tasks_and_quotes_arguments(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("SAM_MEDIA_WORKER_SSH_TARGET", "ubuntu@172.31.0.10")
     monkeypatch.setenv("SAM_MEDIA_WORKER_SSH_IDENTITY", "/home/ubuntu/.ssh/media")
     monkeypatch.setenv("SAM_MEDIA_WORKER_REMOTE_TASKS", "download,ffmpeg")
@@ -30,9 +35,7 @@ def test_media_command_wraps_only_enabled_tasks_and_quotes_arguments(monkeypatch
         "https://example.test/watch?v=one&list=two",
     ]
 
-    command, timeout = command_for_media_worker(
-        original, task="download", timeout=90.2
-    )
+    command, timeout = command_for_media_worker(original, task="download", timeout=90.2)
 
     assert command[0] == "ssh"
     assert "ControlMaster=no" in command
@@ -66,6 +69,32 @@ def test_media_command_keeps_unlisted_task_local(monkeypatch) -> None:
     assert command[0] == "yt-dlp"
 
 
+def test_shared_media_temp_root_is_only_required_for_remote_task(
+    monkeypatch, tmp_path
+) -> None:
+    shared = tmp_path / "shared"
+    monkeypatch.setenv("SAM_MEDIA_WORKER_SSH_TARGET", "ubuntu@172.31.0.10")
+    monkeypatch.setenv("SAM_MEDIA_WORKER_REMOTE_TASKS", "extract")
+    monkeypatch.setenv("SAM_MEDIA_WORKER_SHARED_TMP", str(shared))
+
+    assert shared_media_temp_root("download") is None
+    assert shared_media_temp_root("extract") == shared
+    assert shared.is_dir()
+
+
+def test_shared_media_temp_root_rejects_missing_remote_path(monkeypatch) -> None:
+    monkeypatch.setenv("SAM_MEDIA_WORKER_SSH_TARGET", "ubuntu@172.31.0.10")
+    monkeypatch.setenv("SAM_MEDIA_WORKER_REMOTE_TASKS", "extract")
+    monkeypatch.delenv("SAM_MEDIA_WORKER_SHARED_TMP", raising=False)
+
+    try:
+        shared_media_temp_root("extract")
+    except RuntimeError as error:
+        assert "SAM_MEDIA_WORKER_SHARED_TMP" in str(error)
+    else:
+        raise AssertionError("missing shared scratch path was accepted")
+
+
 def test_cleanup_stops_task_units_and_removes_download_staging(
     monkeypatch,
 ) -> None:
@@ -89,3 +118,25 @@ def test_cleanup_stops_task_units_and_removes_download_staging(
     assert observed[-2] == "ubuntu@172.31.0.10"
     assert "sam-media-download-*" in observed[-1]
     assert "/shared/.staging" in observed[-1]
+
+
+def test_cleanup_stops_extract_units_and_removes_shared_scratch(monkeypatch) -> None:
+    from sam_audio_pipeline import remote_media
+
+    monkeypatch.setenv("SAM_MEDIA_WORKER_SSH_TARGET", "ubuntu@172.31.0.10")
+    monkeypatch.setenv("SAM_MEDIA_WORKER_REMOTE_TASKS", "extract")
+    monkeypatch.setenv("SAM_MEDIA_WORKER_SHARED_TMP", "/shared/.staging")
+    observed: list[str] = []
+
+    class Result:
+        returncode = 0
+
+    def fake_run(command, **_kwargs):
+        observed.extend(command)
+        return Result()
+
+    monkeypatch.setattr(remote_media.subprocess, "run", fake_run)
+
+    assert remote_media.cleanup_remote_media("extract") == 0
+    assert "sam-media-extract-*" in observed[-1]
+    assert "sam-source-extract-*" in observed[-1]

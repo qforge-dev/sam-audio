@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import io
 import json
+import logging
 import os
 import secrets
 import sqlite3
 import threading
+import time
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +22,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+
+logger = logging.getLogger(__name__)
 
 Decision = Literal["good", "perfect", "not_ok"]
 Reason = Literal[
@@ -328,14 +333,53 @@ class PipelineProgressStore:
 class ContinuousProgressStore:
     """Expose the permanent SQLite-backed pipeline without batch semantics."""
 
-    def __init__(self, workspace: Path, *, snapshot_size: int = 2500):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        snapshot_size: int = 2500,
+        refresh_seconds: float = 10.0,
+    ):
         self.workspace = workspace.resolve()
         self.snapshot_size = snapshot_size
+        self.refresh_seconds = refresh_seconds
+        self._cache_lock = threading.Lock()
+        self._refreshing = False
+        self._cached_snapshot = self._read_snapshot()
+        self._expires_at = time.monotonic() + refresh_seconds
 
-    def snapshot(self) -> dict[str, Any]:
+    def _read_snapshot(self) -> dict[str, Any]:
         from .continuous_dataset import progress_snapshot
 
         return progress_snapshot(self.workspace, self.snapshot_size)
+
+    def _refresh_cache(self) -> None:
+        try:
+            snapshot = self._read_snapshot()
+        except Exception:
+            logger.exception("Background progress refresh failed")
+        else:
+            with self._cache_lock:
+                self._cached_snapshot = snapshot
+                self._expires_at = time.monotonic() + self.refresh_seconds
+        finally:
+            with self._cache_lock:
+                self._refreshing = False
+
+    def snapshot(self) -> dict[str, Any]:
+        start_refresh = False
+        with self._cache_lock:
+            if time.monotonic() >= self._expires_at and not self._refreshing:
+                self._refreshing = True
+                start_refresh = True
+            snapshot = copy.deepcopy(self._cached_snapshot)
+        if start_refresh:
+            threading.Thread(
+                target=self._refresh_cache,
+                name="progress-snapshot-refresh",
+                daemon=True,
+            ).start()
+        return snapshot
 
 
 class ReviewStore:
@@ -813,9 +857,13 @@ def create_review_app(
         if not progress_store:
             raise HTTPException(status_code=404, detail="Progress dashboard disabled")
         payload = progress_store.snapshot()
-        store.state()
+        if isinstance(progress_store, ContinuousProgressStore):
+            materialized = int(payload.get("counts", {}).get("accepted") or 0)
+        else:
+            store.state()
+            materialized = store.catalog_record_count or len(store.filenames)
         payload["review_snapshot"] = {
-            "materialized": store.catalog_record_count or len(store.filenames),
+            "materialized": materialized,
             "path": str(store.dataset_dir),
         }
         return payload

@@ -241,6 +241,7 @@ class DownloadSettings:
     staging_dir: Path | None = None
     downloaded_high_water: int = 64
     downloaded_high_water_bytes: int = 8 * 1024**3
+    minimum_free_bytes: int = 0
     lease_seconds: float = 7200.0
     max_attempts: int = 4
     retry_backoff_seconds: float = 15.0
@@ -749,6 +750,15 @@ def download_source_once(
 ) -> dict[str, Any] | None:
     """Claim, transfer, validate, and atomically publish one source proxy."""
     connection = connect_frontier(settings.workspace)
+    settings.source_cache.mkdir(parents=True, exist_ok=True)
+    source_free_bytes = shutil.disk_usage(settings.source_cache).free
+    if source_free_bytes <= settings.minimum_free_bytes:
+        connection.close()
+        return {
+            "status": "high_water",
+            "reason": "minimum_free_bytes",
+            "free_bytes": source_free_bytes,
+        }
     if (
         frontier_counts(connection)["downloaded"] >= settings.downloaded_high_water
         or downloaded_queue_bytes(connection) >= settings.downloaded_high_water_bytes
@@ -989,6 +999,7 @@ def run_downloaders(args: argparse.Namespace) -> None:
         staging_dir=args.staging_dir,
         downloaded_high_water=args.downloaded_high_water,
         downloaded_high_water_bytes=args.downloaded_high_water_bytes,
+        minimum_free_bytes=args.minimum_free_bytes,
         lease_seconds=args.lease_seconds,
         max_attempts=args.max_attempts,
         retry_backoff_seconds=args.retry_backoff_seconds,
@@ -1850,6 +1861,12 @@ def main() -> None:
     download.add_argument("--downloaded-high-water", type=_positive_int, default=64)
     download.add_argument(
         "--downloaded-high-water-bytes", type=_positive_int, default=8 * 1024**3
+    )
+    download.add_argument(
+        "--minimum-free-bytes",
+        type=int,
+        default=0,
+        help="Stop claiming new transfers when source storage reaches this free-space floor",
     )
     download.add_argument("--lease-seconds", type=float, default=7200)
     download.add_argument("--max-attempts", type=_positive_int, default=4)

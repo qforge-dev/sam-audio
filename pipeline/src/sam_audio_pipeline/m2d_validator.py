@@ -716,7 +716,9 @@ def _transcribe_asr_file(
         "filename": path.name,
         "scored_at": _now(),
         "asr": {
-            "model": args.model,
+            # Keep a stable identity in metadata when the runtime loads an
+            # offline snapshot by absolute path.
+            "model": getattr(args, "model_label", None) or args.model,
             "device": args.device,
             "compute_type": args.compute_type,
             "beam_size": effective_beam_size,
@@ -773,6 +775,10 @@ def score_asr_directory(args: argparse.Namespace) -> None:
         )
         for path in m2d_paths
     ]
+    model_identity = getattr(args, "model_label", None) or args.model
+    # Accept both the stable label and load path. This also makes a cutover from
+    # path-based metadata idempotent after --model-label is introduced.
+    model_identities = {str(args.model), str(model_identity)}
     existing: set[str] = set()
     if args.output.exists() and not args.overwrite:
         for line in args.output.read_text().splitlines():
@@ -782,7 +788,7 @@ def score_asr_directory(args: argparse.Namespace) -> None:
             if (
                 item.get("policy") == ASR_POLICY_VERSION
                 and item.get("detected_language") is not None
-                and item.get("asr", {}).get("model") == args.model
+                and str(item.get("asr", {}).get("model")) in model_identities
             ):
                 existing.add(str(item["filename"]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1445,6 +1451,13 @@ def _parser() -> argparse.ArgumentParser:
     asr_score.add_argument("--input-dir", type=Path, required=True)
     asr_score.add_argument("--output", type=Path, required=True)
     asr_score.add_argument("--model", default="small")
+    asr_score.add_argument(
+        "--model-label",
+        help=(
+            "Stable model identity written to metadata and used for resume "
+            "checks when --model is an offline snapshot path"
+        ),
+    )
     asr_score.add_argument("--device", default="cuda")
     asr_score.add_argument("--compute-type", default="float16")
     asr_score.add_argument("--download-root", type=Path)

@@ -452,6 +452,36 @@ def test_download_stage_atomically_publishes_a_valid_source(
     assert event["outcome"] == "success"
 
 
+def test_download_stage_respects_storage_free_space_floor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    connection = connect_frontier(workspace)
+    enqueue_source(connection, [_candidate("disk-floor", 0)])
+    connection.close()
+    monkeypatch.setattr(
+        source_pipeline.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(free=99),
+    )
+    settings = DownloadSettings(
+        workspace=workspace,
+        source_cache=tmp_path / "source-cache",
+        minimum_free_bytes=100,
+    )
+
+    result = download_source_once(settings, worker="download-0")
+
+    assert result == {
+        "status": "high_water",
+        "reason": "minimum_free_bytes",
+        "free_bytes": 99,
+    }
+    connection = connect_frontier(workspace)
+    assert frontier_counts(connection)["discovered"] == 1
+    connection.close()
+
+
 def test_download_stage_caches_permanent_quality_rejection(
     tmp_path: Path, monkeypatch
 ) -> None:

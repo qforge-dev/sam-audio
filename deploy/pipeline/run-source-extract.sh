@@ -7,6 +7,7 @@ PIPELINE_PYTHON="$PIPELINE_ROOT/.venv/bin/python"
 WORKSPACE=${SAM_CONTINUOUS_WORKSPACE:-/home/ubuntu/cinematic-continuous-30s}
 RUNS_DIR="$WORKSPACE/acquisition-runs"
 SCAN_CACHE=${SAM_CONTINUOUS_SOURCE_SCAN_CACHE:-$WORKSPACE/source-scans}
+ASR_SHARED_ROOT=${SAM_CONTINUOUS_SOURCE_ASR_SHARED_ROOT:-$WORKSPACE}
 WORKERS=${SAM_CONTINUOUS_SOURCE_EXTRACT_WORKERS:-16}
 ASR_MODE=${SAM_CONTINUOUS_SOURCE_ASR_PROBE_MODE:-enforce}
 ASR_TIMEOUT=${SAM_CONTINUOUS_SOURCE_ASR_PROBE_TIMEOUT:-120}
@@ -29,8 +30,8 @@ exec nice -n 10 "$PIPELINE_PYTHON" -m sam_audio_pipeline.source_pipeline extract
   --runs-dir "$RUNS_DIR" \
   --scan-cache "$SCAN_CACHE" \
   --catalog "$WORKSPACE/catalog.sqlite3" \
-  --proxy-asr-request-dir "$WORKSPACE/source-asr-probe-requests" \
-  --proxy-asr-result-dir "$WORKSPACE/source-asr-probe-results" \
+  --proxy-asr-request-dir "$ASR_SHARED_ROOT/source-asr-probe-requests" \
+  --proxy-asr-result-dir "$ASR_SHARED_ROOT/source-asr-probe-results" \
   --proxy-asr-mode "$ASR_MODE" \
   --proxy-asr-timeout-seconds "$ASR_TIMEOUT" \
   --workers "$WORKERS" \

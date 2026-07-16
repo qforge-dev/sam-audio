@@ -9,6 +9,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Sequence
+from pathlib import Path
 
 
 def _enabled_tasks() -> set[str]:
@@ -77,6 +78,30 @@ def command_for_media_worker(
     return wrapped, timeout + 30.0
 
 
+def shared_media_temp_root(task: str) -> Path | None:
+    """Return the shared scratch directory required by remote media commands.
+
+    Remote commands intentionally use the same absolute paths as the
+    coordinator.  Callers that need to exchange temporary outputs must create
+    them below this directory, which is mounted on both hosts.
+    """
+
+    target = os.environ.get("SAM_MEDIA_WORKER_SSH_TARGET", "").strip()
+    normalized = task.strip().lower()
+    if not target or normalized not in _enabled_tasks():
+        return None
+    configured = os.environ.get("SAM_MEDIA_WORKER_SHARED_TMP", "").strip()
+    if not configured:
+        raise RuntimeError(
+            f"SAM_MEDIA_WORKER_SHARED_TMP is required for remote {normalized} work"
+        )
+    path = Path(configured)
+    if not path.is_absolute():
+        raise ValueError("SAM_MEDIA_WORKER_SHARED_TMP must be an absolute path")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def cleanup_remote_media(task: str) -> int:
     """Stop every remote unit for one coordinator stage after service exit."""
 
@@ -96,12 +121,22 @@ def cleanup_remote_media(task: str) -> int:
     if identity:
         command.extend(["-i", identity])
     remote = f"sudo systemctl stop 'sam-media-{normalized}-*' 2>/dev/null || true"
-    if normalized == "download":
-        staging = os.environ.get("SAM_CONTINUOUS_SOURCE_STAGING_DIR", "").strip()
+    if normalized in {"download", "extract"}:
+        staging_variable = (
+            "SAM_CONTINUOUS_SOURCE_STAGING_DIR"
+            if normalized == "download"
+            else "SAM_MEDIA_WORKER_SHARED_TMP"
+        )
+        staging = os.environ.get(staging_variable, "").strip()
         if staging:
+            prefix = (
+                ".source-download-*"
+                if normalized == "download"
+                else "sam-source-extract-*"
+            )
             remote += (
                 f"; find {shlex.quote(staging)} -mindepth 1 -maxdepth 1 "
-                "-type d -name '.source-download-*' -exec rm -rf -- {} +"
+                f"-type d -name {shlex.quote(prefix)} -exec rm -rf -- {{}} +"
             )
     command.extend([target, remote])
     try:

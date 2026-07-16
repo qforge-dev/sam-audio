@@ -77,17 +77,11 @@
     <div class="section-head" id="flowHeading" hidden><div><h2>Pipeline flow</h2><p>Gross source processing versus final accepted output over the same rolling window.</p></div></div>
     <section class="funnel" id="flow" hidden></section>
     <p class="flow-note" id="flowNote" hidden></p>
-    <div class="section-head" id="strategyHeading" hidden><div><h2>Scan-before-extract experiment</h2><p>Only the post-deployment cohort is used here, so the old random sampler cannot hide the result.</p></div></div>
-    <section class="funnel" id="strategy" hidden></section>
-    <section class="funnel" id="sourceScans" hidden></section>
-    <div class="section-head" id="sourceFrontierHeading" hidden><div><h2>Independent source stages</h2><p>Persistent leased queues keep discovery, transfer, scanning, and extraction moving separately.</p></div></div>
+    <div class="section-head" id="sourceFrontierHeading" hidden><div><h2>End-to-end queue funnel</h2><p>Every stage uses the same queue depth, oldest-item age, processing-rate, latency, and event-count format.</p></div></div>
     <section class="funnel" id="sourceFrontier" hidden></section>
-    <section class="funnel" id="funnel"></section>
-    <section class="funnel" id="queues"></section>
+    <section class="funnel" id="funnel" hidden></section>
     <div class="section-head" id="autoscalerHeading" hidden><div><h2>Adaptive worker control</h2><p>Queue pressure and aggregate host resources determine live concurrency limits.</p></div></div>
     <section class="funnel" id="autoscaler" hidden></section>
-    <div class="section-head" id="throughputHeading" hidden><div><h2>Rolling throughput</h2><p>Use 5 minutes for immediate movement, 15 for tuning, and 60 for the stable trend.</p></div></div>
-    <div class="table-wrap" id="throughputWrap" hidden><table><thead><tr><th>Window / stage</th><th>Clips</th><th>Clips/min</th><th>Audio min/min</th><th>Audio hours/hour</th></tr></thead><tbody id="throughput"></tbody></table></div>
     <div class="section-head" id="sourceHeading" hidden><div><h2>Downloader by source</h2><p>Recent transfer speed and source-audio throughput, plus the current queue outcome.</p></div></div>
     <div class="table-wrap" id="sourceWrap" hidden><table><thead><tr><th>Source</th><th>Circuit</th><th>Queued</th><th>Attempts</th><th>Success</th><th>Transfer MB/s</th><th>Source audio h/h</th><th>Complete</th><th>Rejected</th></tr></thead><tbody id="sourcePlatforms"></tbody></table></div>
     <div class="section-head" id="discoveryHeading" hidden><div><h2>Discovery quality by lane</h2><p>New query families, deep pages, related videos, and channel traversal stay probe-limited until downstream acceptance validates them.</p></div></div>
@@ -161,80 +155,33 @@
           $('flowNote').hidden = false;
           $('flowNote').className = `flow-note ${flowState}`;
           $('flowNote').textContent = `${Number(flow.processed_audio_hours_per_wall_hour || 0).toFixed(2)} hours of source audio are being processed per wall-clock hour and ${Number(flow.accepted_audio_hours_per_wall_hour || 0).toFixed(2)} hours are being accepted. ${flow.explanation || ''}`;
-          const strategy = data.strategy;
-          if (strategy) {
-            const cohort = strategy.cohort || {};
-            const baseline = strategy.baseline || {};
-            const scans = strategy.source_scans || {};
-            const scan5 = (scans.recent_windows || {})['5'] || {};
-            const tuning = strategy.latest_tuning || strategy.concurrency_tuning || null;
-            const multiplier = strategy.accepted_rate_multiplier == null ? 'warming up' : `${Number(strategy.accepted_rate_multiplier).toFixed(2)}×`;
-            $('strategyHeading').hidden = false;
-            $('strategy').hidden = false;
-            const strategyCards = [
-              ['Cohort age', `${Number(cohort.observed_minutes || 0).toFixed(1)} min`, `${number(cohort.proxy_selected)} of ${number(cohort.downloaded)} downloads came from proxy-selected regions`],
-              ['M2D precision', `${Number(cohort.m2d_pass_percent || 0).toFixed(1)}%`, `${number(cohort.m2d_accepted)} / ${number(cohort.m2d_scored)} scored clips passed`],
-              ['Final cohort yield', `${Number(cohort.final_yield_percent || 0).toFixed(1)}%`, `${number(cohort.accepted)} / ${number(cohort.downloaded)} downloads reached the dataset`],
-              ['Accepted-rate change', multiplier, `${Number(baseline.accepted_audio_hours_per_hour || 0).toFixed(2)} before → ${Number(cohort.accepted_audio_hours_per_hour || 0).toFixed(2)} audio h/h now`]
-            ];
-            if (tuning) {
-              const tuningCohort = tuning.cohort || {};
-              const tuningMultiplier = tuning.accepted_rate_multiplier == null ? 'warming up' : `${Number(tuning.accepted_rate_multiplier).toFixed(2)}×`;
-              const activeText = tuning.current_download_concurrency ? `${number(tuning.current_download_concurrency)} active · ` : '';
-              strategyCards.push([tuning.label || '8→16 worker tuning', tuningMultiplier, `${activeText}${Number(tuning.baseline_accepted_audio_hours_per_hour || 0).toFixed(2)} before → ${Number(tuningCohort.accepted_audio_hours_per_hour || 0).toFixed(2)} audio h/h over ${Number(tuningCohort.observed_minutes || 0).toFixed(1)} min`]);
-            }
-            $('strategy').innerHTML = strategyCards.map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
-            $('sourceScans').hidden = false;
-            $('sourceScans').innerHTML = [
-              ['Sources scanned', number(scans.scanned_sources), `${Number(scan5.sources_per_minute || 0).toFixed(1)}/min over the last 5 min · low-bandwidth stereo 16 kHz proxy timelines`],
-              ['Sources with matches', `${number(scans.passing_sources)} · ${Number(scans.source_match_percent || 0).toFixed(1)}%`, `${Number(scan5.matching_sources_per_minute || 0).toFixed(1)} matching sources/min now · ${number(scans.no_match_sources)} no-match · ${number(scans.quality_rejected_sources)} source-quality rejects`],
-              ['Proxy English speech', `${number(scans.proxy_asr_accepted_sources)} / ${number(scans.proxy_asr_scored_sources)}`, `${Number(scans.proxy_asr_accept_percent || 0).toFixed(1)}% pass · ${number(scans.proxy_asr_rejected_sources)} rejects (${number(scans.proxy_asr_enforced_rejected_sources)} enforced) · ${number(scans.proxy_asr_live_scored_sources)} live at ${Number(scans.proxy_asr_average_seconds || 0).toFixed(2)} s/source · ${number(scans.proxy_asr_catalog_derived_sources)} derived`],
-              ['Passing regions found', number(scans.passing_regions), `${number(scans.claimed_regions)} claimed (${Number(scans.region_claim_percent || 0).toFixed(1)}%)`],
-              ['Scan phase time', `${Number(scans.model_scan_seconds || 0).toFixed(1)} s`, `${Number(scans.source_download_seconds || 0).toFixed(1)} s transfer + ${Number(scans.proxy_decode_seconds || 0).toFixed(1)} s proxy decode across ${number(scans.timed_sources)} newly timed sources`]
-            ].map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
-          } else {
-            $('strategyHeading').hidden = true; $('strategy').hidden = true; $('sourceScans').hidden = true;
-          }
           const frontier = data.source_frontier || {};
-          if (frontier.enabled) {
-            const counts = frontier.counts || {};
-            const ages = frontier.oldest_ready_minutes || {};
-            const stages = frontier.stages || {};
-            const downloadThroughput = frontier.download_throughput || {};
-            const hostNetwork = downloadThroughput.host_network || {};
-            const sourceWorkers = frontier.workers || [];
-            const healthySourceWorkers = sourceWorkers.filter(worker => worker.state === 'running').length;
-            const stageText = stage => {
-              const item = stages[stage] || {};
-              const p95 = item.duration_p95_seconds == null ? 'collecting latency' : `p95 ${Number(item.duration_p95_seconds).toFixed(1)} s`;
-              return `${Number(item.active_per_minute || 0).toFixed(2)} work/min · ${p95} · ${number(item.active_events)} work / ${number(item.events)} total events`;
-            };
-            $('sourceFrontierHeading').hidden = false;
-            $('sourceFrontier').hidden = false;
-            $('sourceFrontier').innerHTML = [
-              ['Host receive', hostNetwork.receive_megabytes_per_second == null ? 'warming up' : `${Number(hostNetwork.receive_megabytes_per_second).toFixed(1)} MB/s`, `${Number(downloadThroughput.completed_file_megabytes_per_second || 0).toFixed(1)} MB/s in completed source files over ${Number(frontier.window_minutes || 0).toFixed(0)} min · host sample ${Number(hostNetwork.observed_seconds || 0).toFixed(0)} s`],
-              ['Ready to download', number(counts.discovered), ages.discovered == null ? 'No ready source' : `oldest ${Number(ages.discovered).toFixed(1)} min · ${stageText('download')}`],
-              ['Ready to scan', number(counts.downloaded), `${(Number(frontier.downloaded_queue_bytes || 0) / 1073741824).toFixed(2)} GiB queued · ${ages.downloaded == null ? stageText('scan') : `oldest ${Number(ages.downloaded).toFixed(1)} min · ${stageText('scan')}`}`],
-              ['Ready to extract', number(counts.scanned), ages.scanned == null ? stageText('extract') : `oldest ${Number(ages.scanned).toFixed(1)} min · ${stageText('extract')}`],
-              ['Source terminal', `${number(counts.complete)} / ${number(counts.rejected)}`, `complete / rejected · ${number(healthySourceWorkers)}/${number(sourceWorkers.length)} stage workers healthy`]
-            ].map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
-          } else {
-            $('sourceFrontierHeading').hidden = true;
-            $('sourceFrontier').hidden = true;
-          }
-          const metrics = [
-            ['downloaded','Lifetime downloaded','Passed stereo/source quality'],
-            ['m2d_accepted','Lifetime M2D pass','Dialogue + instrumental music + SFX'],
-            ['asr_accepted','Lifetime speech pass','Confident English foreground dialogue'],
-            ['accepted','Lifetime accepted','All automated gates and diversity checks']
-          ];
-          $('funnel').innerHTML = metrics.map(([key,title,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${number(data.counts[key])}</strong><small>${help}</small></div>`).join('');
-          const queueMetrics = [
-            ['waiting_for_m2d','M2D queue','Downloaded clips waiting for acoustic scoring'],
-            ['waiting_for_asr','Speech queue','M2D passes waiting for ASR'],
-            ['waiting_for_assembly','Assembly queue','Full passes waiting for catalog materialization']
-          ];
-          $('queues').innerHTML = queueMetrics.map(([key,title,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${number(data.queues[key])}</strong><small>${help}</small></div>`).join('');
+          const counts = frontier.counts || {};
+          const ages = frontier.oldest_ready_minutes || {};
+          const stages = frontier.stages || {};
+          const pipelineStages = data.pipeline_stages || {};
+          const downloadThroughput = frontier.download_throughput || {};
+          const hostNetwork = downloadThroughput.host_network || {};
+          const stageText = item => {
+            const stage = item || {};
+            const p95 = stage.duration_p95_seconds == null ? 'collecting latency' : `p95 ${Number(stage.duration_p95_seconds).toFixed(1)} s`;
+            return `${Number(stage.active_per_minute || 0).toFixed(2)} work/min · ${p95} · ${number(stage.active_events)} work / ${number(stage.events)} total events`;
+          };
+          const queueText = (age, item, prefix = '') => {
+            const oldest = age == null ? 'no queued work' : `oldest ${Number(age).toFixed(1)} min`;
+            return [prefix, oldest, stageText(item)].filter(Boolean).join(' · ');
+          };
+          $('sourceFrontierHeading').hidden = false;
+          $('sourceFrontier').hidden = false;
+          $('sourceFrontier').innerHTML = [
+            ['Host receive', hostNetwork.receive_megabytes_per_second == null ? 'warming up' : `${Number(hostNetwork.receive_megabytes_per_second).toFixed(1)} MB/s`, `${Number(downloadThroughput.completed_file_megabytes_per_second || 0).toFixed(1)} MB/s in completed source files over ${Number(frontier.window_minutes || 0).toFixed(0)} min · host sample ${Number(hostNetwork.observed_seconds || 0).toFixed(0)} s`],
+            ['Download queue', number(counts.discovered), queueText(ages.discovered, stages.download)],
+            ['Scan queue', number(counts.downloaded), queueText(ages.downloaded, stages.scan, `${(Number(frontier.downloaded_queue_bytes || 0) / 1073741824).toFixed(2)} GiB queued`)],
+            ['Extraction queue', number(counts.scanned), queueText(ages.scanned, stages.extract)],
+            ['M2D queue', number(data.queues.waiting_for_m2d), queueText(pipelineStages.m2d?.oldest_ready_minutes, pipelineStages.m2d)],
+            ['Speech queue', number(data.queues.waiting_for_asr), queueText(pipelineStages.asr?.oldest_ready_minutes, pipelineStages.asr)],
+            ['Assembly queue', number(data.queues.waiting_for_assembly), queueText(pipelineStages.assembly?.oldest_ready_minutes, pipelineStages.assembly)]
+          ].map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
           const autoscaler = data.autoscaler || {};
           if (autoscaler.enabled) {
             const gpu = autoscaler.gpu || {};
@@ -255,9 +202,6 @@
             $('autoscalerHeading').hidden = true;
             $('autoscaler').hidden = true;
           }
-          $('throughputHeading').hidden = false; $('throughputWrap').hidden = false;
-          const windows = data.throughput_windows || {'60': data.throughput};
-          $('throughput').innerHTML = Object.entries(windows).flatMap(([window,rates]) => Object.entries(rates).map(([stage,rate]) => `<tr><td><strong>${window} min · ${label(stage)}</strong><br><small class="muted">${Number(rate.observed_minutes).toFixed(1)} min observed</small></td><td>${number(rate.clips)}</td><td>${Number(rate.clips_per_minute).toFixed(2)}</td><td>${Number(rate.audio_minutes_per_minute).toFixed(2)}</td><td>${Number(rate.audio_hours_per_hour).toFixed(2)}</td></tr>`)).join('');
           const sourcePlatforms = (data.source_frontier || {}).platforms || {};
           $('sourceHeading').hidden = false;
           $('sourceWrap').hidden = false;
@@ -302,6 +246,7 @@
         $('stageHelp').textContent = active.length > 1 ? 'Independent workers are producing and consuming clips at the same time.' : (stageHelp[data.stage] || '');
         $('updated').textContent = `Live · updated ${new Date(data.updated_at).toLocaleTimeString()}`;
         const metrics = {...data.totals, review_snapshot:data.review_snapshot.materialized};
+        $('funnel').hidden = false;
         $('funnel').innerHTML = metricDefinitions.map(([key,title,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${number(metrics[key])}</strong><small>${help}</small></div>`).join('');
         $('batches').innerHTML = data.batches.map(batch => `<tr><td><strong>${batch.name}</strong></td><td><span class="status ${batch.status}">${label(batch.status)}</span><div class="workers">${Object.entries(batch.workers || {}).map(([worker,status]) => `<span class="worker ${status}">${label(worker)} ${label(status)}</span>`).join('')}</div></td><td>${number(batch.attempts)}</td><td>${number(batch.downloaded)}${batch.raw_target ? ` / ${number(batch.raw_target)}` : ''}</td><td>${number(batch.m2d_scored)}</td><td>${number(batch.m2d_accepted)}</td><td>${number(batch.asr_scored)}</td><td>${number(batch.asr_accepted)}</td><td>${number(batch.combined_eligible)}</td></tr>`).join('');
         $('combinedNote').textContent = data.notes.combined_eligible; $('error').textContent = '';

@@ -10,6 +10,7 @@ CLASS_LABELS=${SAM_CONTINUOUS_CLASS_LABELS:-/home/ubuntu/m2d-validation/metadata
 ONTOLOGY=${SAM_CONTINUOUS_ONTOLOGY:-/home/ubuntu/m2d-validation/metadata/ontology.json}
 WORKSPACE=${SAM_CONTINUOUS_WORKSPACE:-/home/ubuntu/cinematic-continuous-30s}
 SCAN_CACHE=${SAM_CONTINUOUS_SOURCE_SCAN_CACHE:-$WORKSPACE/source-scans}
+ASR_SHARED_ROOT=${SAM_CONTINUOUS_SOURCE_ASR_SHARED_ROOT:-$WORKSPACE}
 WORKERS=${SAM_CONTINUOUS_SOURCE_SCAN_WORKERS:-4}
 HIGH_WATER=${SAM_CONTINUOUS_SCANNED_HIGH_WATER:-64}
 ASR_MODE=${SAM_CONTINUOUS_SOURCE_ASR_PROBE_MODE:-enforce}
@@ -18,15 +19,15 @@ BATCH_SIZE=${SAM_CONTINUOUS_SOURCE_SCAN_BATCH_SIZE:-128}
 
 export PYTHONPATH="$PIPELINE_ROOT/src"
 export HF_HOME=${HF_HOME:-/home/ubuntu/.cache/huggingface}
-mkdir -p "$SCAN_CACHE" "$WORKSPACE/source-asr-probe-requests" \
-  "$WORKSPACE/source-asr-probe-results"
+mkdir -p "$SCAN_CACHE" "$ASR_SHARED_ROOT/source-asr-probe-requests" \
+  "$ASR_SHARED_ROOT/source-asr-probe-results"
 cd "$PIPELINE_ROOT"
 
 exec nice -n 10 "$MODEL_PYTHON" -m sam_audio_pipeline.source_pipeline scan \
   --workspace "$WORKSPACE" \
   --scan-cache "$SCAN_CACHE" \
-  --proxy-asr-request-dir "$WORKSPACE/source-asr-probe-requests" \
-  --proxy-asr-result-dir "$WORKSPACE/source-asr-probe-results" \
+  --proxy-asr-request-dir "$ASR_SHARED_ROOT/source-asr-probe-requests" \
+  --proxy-asr-result-dir "$ASR_SHARED_ROOT/source-asr-probe-results" \
   --proxy-asr-mode "$ASR_MODE" \
   --proxy-asr-timeout-seconds "$ASR_TIMEOUT" \
   --scanned-high-water "$HIGH_WATER" \

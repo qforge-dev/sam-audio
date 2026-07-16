@@ -11,6 +11,14 @@ M2D_CHECKPOINT=${SAM_CONTINUOUS_M2D_CHECKPOINT:-$M2D_REPO/weights/m2d_vit_base-8
 CLASS_LABELS=${SAM_CONTINUOUS_CLASS_LABELS:-/home/ubuntu/m2d-validation/metadata/class_labels_indices.csv}
 ONTOLOGY=${SAM_CONTINUOUS_ONTOLOGY:-/home/ubuntu/m2d-validation/metadata/ontology.json}
 WORKSPACE=${SAM_CONTINUOUS_WORKSPACE:-/home/ubuntu/cinematic-continuous-30s}
+SOURCE_ASR_SHARED_ROOT=${SAM_CONTINUOUS_SOURCE_ASR_SHARED_ROOT:-$WORKSPACE}
+SOURCE_ASR_PROBE_REQUESTS="$SOURCE_ASR_SHARED_ROOT/source-asr-probe-requests"
+SOURCE_ASR_PROBE_RESULTS="$SOURCE_ASR_SHARED_ROOT/source-asr-probe-results"
+ASR_MODEL=${SAM_CONTINUOUS_ASR_MODEL:-small}
+ASR_MODEL_LABEL=${SAM_CONTINUOUS_ASR_MODEL_LABEL:-$ASR_MODEL}
+ASR_DEVICE=${SAM_CONTINUOUS_ASR_DEVICE:-cuda}
+ASR_COMPUTE_TYPE=${SAM_CONTINUOUS_ASR_COMPUTE_TYPE:-float16}
+ASR_CUDA_LIBRARY_PATH=${SAM_CONTINUOUS_ASR_CUDA_LIBRARY_PATH:-}
 RUNS_DIR="$WORKSPACE/acquisition-runs"
 BUCKET=${SAM_CONTINUOUS_S3_BUCKET:?SAM_CONTINUOUS_S3_BUCKET is required}
 S3_PREFIX=${SAM_CONTINUOUS_S3_PREFIX:-cinematic-dialogue-dataset}
@@ -19,6 +27,7 @@ ACQUISITION_PRODUCERS=${SAM_CONTINUOUS_ACQUISITION_PRODUCERS:-2}
 SEARCH_WORKERS=${SAM_CONTINUOUS_SEARCH_WORKERS:-8}
 M2D_WORKERS=${SAM_CONTINUOUS_M2D_WORKERS:-1}
 ASR_WORKERS=${SAM_CONTINUOUS_ASR_WORKERS:-1}
+EXTERNAL_ASR=${SAM_CONTINUOUS_EXTERNAL_ASR:-false}
 UPLOAD_CONCURRENCY=${SAM_CONTINUOUS_UPLOAD_CONCURRENCY:-10}
 AUTOSCALE_ENABLED=${SAM_CONTINUOUS_AUTOSCALE_ENABLED:-true}
 DOWNLOAD_MIN=${SAM_CONTINUOUS_DOWNLOAD_MIN:-2}
@@ -61,10 +70,13 @@ fi
 
 export PYTHONPATH="$PIPELINE_ROOT/src"
 export HF_HOME=${HF_HOME:-/home/ubuntu/.cache/huggingface}
+if [[ -n "$ASR_CUDA_LIBRARY_PATH" ]]; then
+  export LD_LIBRARY_PATH="$ASR_CUDA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 mkdir -p "$RUNS_DIR" "$WORKSPACE/raw-audio" "$WORKSPACE/accepted/audio" \
   "$WORKSPACE/m2d-validation" "$WORKSPACE/asr-validation" \
-  "$WORKSPACE/source-scans" "$WORKSPACE/source-asr-probe-requests" \
-  "$WORKSPACE/source-asr-probe-results"
+  "$WORKSPACE/source-scans" "$SOURCE_ASR_PROBE_REQUESTS" \
+  "$SOURCE_ASR_PROBE_RESULTS"
 cd "$PIPELINE_ROOT"
 
 configure_args=(
@@ -144,8 +156,8 @@ download_forever() {
         --m2d-device cuda
         --m2d-batch-size "$SOURCE_SCAN_BATCH_SIZE"
         --source-asr-probe-mode "$SOURCE_ASR_PROBE_MODE"
-        --source-asr-probe-requests "$WORKSPACE/source-asr-probe-requests"
-        --source-asr-probe-results "$WORKSPACE/source-asr-probe-results"
+        --source-asr-probe-requests "$SOURCE_ASR_PROBE_REQUESTS"
+        --source-asr-probe-results "$SOURCE_ASR_PROBE_RESULTS"
         --source-asr-probe-timeout "$SOURCE_ASR_PROBE_TIMEOUT"
         --yt-dlp-python "$PIPELINE_PYTHON"
       )
@@ -228,30 +240,40 @@ for ((index=0; index<M2D_WORKERS; index++)); do
     --shard-index "$index" --shard-count "$M2D_WORKERS" &
 done
 
-for ((index=0; index<ASR_WORKERS; index++)); do
-  probe_args=()
-  if (( index == 0 )); then
-    probe_args=(
-      --probe-requests-dir "$WORKSPACE/source-asr-probe-requests"
-      --probe-results-dir "$WORKSPACE/source-asr-probe-results"
-    )
-  fi
-  heartbeat_loop "asr-$index" &
-  restart_worker "asr-$index" "$WHISPER_PYTHON" \
-    -m sam_audio_pipeline.m2d_validator asr-score \
-    --input-dir "$WORKSPACE/raw-audio" \
-    --output "$WORKSPACE/asr-validation/worker-$index.jsonl" \
-    --m2d-results-dir "$WORKSPACE/m2d-validation" \
-    --require-cinematic-mix \
-    --model small \
-    --download-root /home/ubuntu/.cache/huggingface/faster-whisper \
-    --max-inference-workers "$ASR_CONCURRENCY_MAX" \
-    --cpu-threads "$ASR_CPU_THREADS" \
-    --autoscale-control "$WORKSPACE/autoscale-control.json" \
-    "${probe_args[@]}" \
-    --follow --poll-seconds 2 \
-    --shard-index "$index" --shard-count "$ASR_WORKERS" &
-done
+if [[ "$EXTERNAL_ASR" == "true" ]]; then
+  # The media host owns inference while the coordinator keeps the existing
+  # worker heartbeat/dashboard contract. Validation artifacts are on the
+  # shared volume and remain visible at the standard workspace paths.
+  heartbeat_loop asr-0 &
+else
+  for ((index=0; index<ASR_WORKERS; index++)); do
+    probe_args=()
+    if (( index == 0 )); then
+      probe_args=(
+        --probe-requests-dir "$SOURCE_ASR_PROBE_REQUESTS"
+        --probe-results-dir "$SOURCE_ASR_PROBE_RESULTS"
+      )
+    fi
+    heartbeat_loop "asr-$index" &
+    restart_worker "asr-$index" "$WHISPER_PYTHON" \
+      -m sam_audio_pipeline.m2d_validator asr-score \
+      --input-dir "$WORKSPACE/raw-audio" \
+      --output "$WORKSPACE/asr-validation/worker-$index.jsonl" \
+      --m2d-results-dir "$WORKSPACE/m2d-validation" \
+      --require-cinematic-mix \
+      --model "$ASR_MODEL" \
+      --model-label "$ASR_MODEL_LABEL" \
+      --device "$ASR_DEVICE" \
+      --compute-type "$ASR_COMPUTE_TYPE" \
+      --download-root /home/ubuntu/.cache/huggingface/faster-whisper \
+      --max-inference-workers "$ASR_CONCURRENCY_MAX" \
+      --cpu-threads "$ASR_CPU_THREADS" \
+      --autoscale-control "$WORKSPACE/autoscale-control.json" \
+      "${probe_args[@]}" \
+      --follow --poll-seconds 2 \
+      --shard-index "$index" --shard-count "$ASR_WORKERS" &
+  done
+fi
 
 if [[ "$AUTOSCALE_ENABLED" == "true" ]]; then
   restart_worker autoscaler "$PIPELINE_PYTHON" \
@@ -268,7 +290,6 @@ if [[ "$AUTOSCALE_ENABLED" == "true" ]]; then
     --interval-seconds "$AUTOSCALE_INTERVAL_SECONDS" --follow &
 fi
 
-heartbeat_loop assembler &
 restart_worker assembler "$PIPELINE_PYTHON" -m sam_audio_pipeline.continuous_dataset \
   assemble --workspace "$WORKSPACE" \
   --max-clips-per-video "$BASE_CLIPS_PER_VIDEO" \

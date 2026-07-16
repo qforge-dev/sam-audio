@@ -339,6 +339,25 @@ def _tail_jsonl(connection: sqlite3.Connection, path: Path, table: str) -> int:
     return processed
 
 
+def _write_with_retry(
+    connection: sqlite3.Connection,
+    operation: Any,
+    *,
+    attempts: int = 12,
+) -> Any:
+    """Prevent a busy catalog writer from starving another pipeline stage."""
+    for attempt in range(attempts):
+        try:
+            with connection:
+                return operation()
+        except sqlite3.OperationalError as error:
+            connection.rollback()
+            if "locked" not in str(error).lower() or attempt == attempts - 1:
+                raise
+            time.sleep(min(2.0, 0.1 * (2**attempt)))
+    raise RuntimeError("unreachable")
+
+
 def catalog_records(
     connection: sqlite3.Connection,
     *,
@@ -441,17 +460,23 @@ def assemble_once(
     max_duration_scaled_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
 ) -> int:
     connection = connect(workspace)
-    with connection:
-        m2d_paths = [workspace / "m2d-validation.jsonl"] + sorted(
-            (workspace / "m2d-validation").glob("*.jsonl")
+    connection.execute("PRAGMA busy_timeout=2000")
+    m2d_paths = [workspace / "m2d-validation.jsonl"] + sorted(
+        (workspace / "m2d-validation").glob("*.jsonl")
+    )
+    asr_paths = [workspace / "asr-validation.jsonl"] + sorted(
+        (workspace / "asr-validation").glob("*.jsonl")
+    )
+    for path in m2d_paths:
+        _write_with_retry(
+            connection,
+            lambda path=path: _tail_jsonl(connection, path, "m2d_scores"),
         )
-        asr_paths = [workspace / "asr-validation.jsonl"] + sorted(
-            (workspace / "asr-validation").glob("*.jsonl")
+    for path in asr_paths:
+        _write_with_retry(
+            connection,
+            lambda path=path: _tail_jsonl(connection, path, "asr_scores"),
         )
-        for path in m2d_paths:
-            _tail_jsonl(connection, path, "m2d_scores")
-        for path in asr_paths:
-            _tail_jsonl(connection, path, "asr_scores")
     candidates = connection.execute(
         """SELECT r.*,m.accepted AS m2d_accepted,s.accepted AS asr_accepted
         FROM records r JOIN m2d_scores m USING(filename)
@@ -460,13 +485,35 @@ def assemble_once(
         WHERE a.sha256 IS NULL AND x.sha256 IS NULL ORDER BY r.discovered_at"""
     ).fetchall()
     added = 0
-    for row in candidates:
+    _write_with_retry(
+        connection,
+        lambda: _heartbeat(
+            connection,
+            "assembler",
+            phase="processing",
+            pending=len(candidates),
+        ),
+    )
+    for index, row in enumerate(candidates):
+        if index and index % 25 == 0:
+            _write_with_retry(
+                connection,
+                lambda index=index: _heartbeat(
+                    connection,
+                    "assembler",
+                    phase="processing",
+                    processed=index,
+                    pending=max(0, len(candidates) - index),
+                ),
+            )
         if not row["m2d_accepted"] or not row["asr_accepted"]:
-            with connection:
-                connection.execute(
+            _write_with_retry(
+                connection,
+                lambda row=row: connection.execute(
                     "INSERT OR IGNORE INTO rejected VALUES(?,?,?)",
                     (row["sha256"], "automated_model_gate", _now()),
-                )
+                ),
+            )
             (workspace / "raw-audio" / row["filename"]).unlink(missing_ok=True)
             continue
         count = connection.execute(
@@ -489,23 +536,36 @@ def assemble_once(
         )
         if count >= source_budget or overlap:
             reason = "source_video_cap" if count >= source_budget else "overlap"
-            with connection:
-                connection.execute(
+            _write_with_retry(
+                connection,
+                lambda row=row, reason=reason: connection.execute(
                     "INSERT OR IGNORE INTO rejected VALUES(?,?,?)",
                     (row["sha256"], reason, _now()),
-                )
+                ),
+            )
             (workspace / "raw-audio" / row["filename"]).unlink(missing_ok=True)
             continue
         source = workspace / "raw-audio" / row["filename"]
         destination = workspace / "accepted" / "audio" / row["filename"]
-        if not source.is_file() or _sha256(source) != row["sha256"]:
+        source_valid = source.is_file() and _sha256(source) == row["sha256"]
+        if not source_valid:
+            _write_with_retry(
+                connection,
+                lambda row=row: connection.execute(
+                    "INSERT OR IGNORE INTO rejected VALUES(?,?,?)",
+                    (row["sha256"], "missing_or_corrupt_source", _now()),
+                ),
+            )
+            source.unlink(missing_ok=True)
             continue
         _link_or_copy(source, destination)
-        with connection:
-            connection.execute(
+        _write_with_retry(
+            connection,
+            lambda row=row: connection.execute(
                 "INSERT OR IGNORE INTO accepted(sha256,accepted_at) VALUES(?,?)",
                 (row["sha256"], _now()),
-            )
+            ),
+        )
         source.unlink(missing_ok=True)
         added += 1
     current_manifest = _safe_manifest(workspace / "accepted" / MANIFEST_FILENAME)
@@ -525,7 +585,7 @@ def assemble_once(
             max_clips_per_video=max_duration_scaled_clips_per_video,
         )
     counts = pipeline_counts(connection)
-    _heartbeat(connection, "assembler", **counts)
+    _write_with_retry(connection, lambda: _heartbeat(connection, "assembler", **counts))
     connection.close()
     return added
 
@@ -590,6 +650,55 @@ def _throughput(
         "clips_per_minute": round(clips_per_minute, 4),
         "audio_minutes_per_minute": round(audio_minutes_per_minute, 4),
         "audio_hours_per_hour": round(audio_minutes_per_minute, 4),
+    }
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _queue_stage_metrics(
+    connection: sqlite3.Connection,
+    *,
+    queue_count: int,
+    oldest_query: str,
+    event_query: str,
+    now: datetime,
+    window_minutes: float,
+) -> dict[str, Any]:
+    """Describe one clip queue with the same vocabulary as source stages."""
+    oldest_value = connection.execute(oldest_query).fetchone()[0]
+    oldest_minutes = (
+        round(
+            max(0.0, (now - _parse_utc_timestamp(str(oldest_value))).total_seconds())
+            / 60.0,
+            3,
+        )
+        if oldest_value
+        else None
+    )
+    cutoff = (now - timedelta(minutes=window_minutes)).isoformat()
+    rows = connection.execute(event_query, (cutoff,)).fetchall()
+    durations = sorted(
+        max(
+            0.0,
+            (
+                _parse_utc_timestamp(str(row[1])) - _parse_utc_timestamp(str(row[0]))
+            ).total_seconds(),
+        )
+        for row in rows
+        if row[0] and row[1]
+    )
+    p95_index = max(0, min(len(durations) - 1, int(len(durations) * 0.95 + 0.999) - 1))
+    return {
+        "queue_count": queue_count,
+        "oldest_ready_minutes": oldest_minutes,
+        "events": len(rows),
+        "active_events": len(rows),
+        "active_per_minute": round(len(rows) / max(window_minutes, 1e-9), 4),
+        "duration_p95_seconds": (round(durations[p95_index], 3) if durations else None),
+        "window_minutes": window_minutes,
     }
 
 
@@ -878,124 +987,48 @@ def progress_snapshot(
         "waiting_for_asr": max(0, counts["m2d_accepted"] - counts["asr_scored"]),
         "waiting_for_assembly": int(waiting_for_assembly),
     }
-    strategy_path = workspace / "experiments" / "whole-source-live-baseline.json"
-    strategy: dict[str, Any] | None = None
-    try:
-        baseline = json.loads(strategy_path.read_text())
-        deployed_at = datetime.fromisoformat(str(baseline["deployed_at"]))
-        cohort = _cohort_funnel(
-            connection, since=deployed_at, clip_seconds=clip_seconds, now=now
-        )
-        baseline_flow = baseline.get("baseline", {}).get("flow", {})
-        baseline_rate = float(
-            baseline_flow.get("accepted_audio_hours_per_wall_hour") or 0.0
-        )
-        current_rate = float(cohort["accepted_audio_hours_per_hour"])
-        strategy = {
-            "policy": "whole_source_proxy_m2d_v1",
-            "deployed_at": deployed_at.isoformat(),
-            "baseline": {
-                "processed_audio_hours_per_hour": float(
-                    baseline_flow.get("processed_audio_hours_per_wall_hour") or 0.0
-                ),
-                "accepted_audio_hours_per_hour": baseline_rate,
-                "yield_percent": float(
-                    baseline_flow.get("rolling_yield_percent") or 0.0
-                ),
-            },
-            "cohort": cohort,
-            "accepted_rate_multiplier": (
-                round(current_rate / baseline_rate, 3) if baseline_rate else None
-            ),
-            "source_scans": _source_scan_status(workspace),
-        }
-        tuning_path = workspace / "experiments" / "concurrency-8-to-16.json"
-        try:
-            tuning_marker = json.loads(tuning_path.read_text())
-            tuning_started = datetime.fromisoformat(str(tuning_marker["started_at"]))
-            tuning_cohort = _cohort_funnel(
-                connection,
-                since=tuning_started,
-                clip_seconds=clip_seconds,
-                now=now,
-            )
-            tuning_baseline_rate = float(
-                tuning_marker.get("before", {})
-                .get("strategy", {})
-                .get("cohort", {})
-                .get("accepted_audio_hours_per_hour")
-                or 0.0
-            )
-            tuning_rate = float(tuning_cohort["accepted_audio_hours_per_hour"])
-            strategy["concurrency_tuning"] = {
-                "started_at": tuning_started.isoformat(),
-                "baseline_download_concurrency": 8,
-                "current_download_concurrency": int(
-                    autoscaler.get("limits", {}).get("download_concurrency") or 0
-                ),
-                "baseline_accepted_audio_hours_per_hour": tuning_baseline_rate,
-                "cohort": tuning_cohort,
-                "accepted_rate_multiplier": (
-                    round(tuning_rate / tuning_baseline_rate, 3)
-                    if tuning_baseline_rate
-                    else None
-                ),
-            }
-        except (
-            FileNotFoundError,
-            KeyError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-            OSError,
-        ):
-            pass
-        latest_tuning_path = workspace / "experiments" / "latest-tuning.json"
-        if not latest_tuning_path.exists():
-            latest_tuning_path = (
-                workspace / "experiments" / "immediate-productive-source-reuse.json"
-            )
-        try:
-            latest_marker = json.loads(latest_tuning_path.read_text())
-            latest_started = datetime.fromisoformat(str(latest_marker["started_at"]))
-            latest_cohort = _cohort_funnel(
-                connection,
-                since=latest_started,
-                clip_seconds=clip_seconds,
-                now=now,
-            )
-            latest_baseline_rate = float(
-                latest_marker.get("baseline_accepted_audio_hours_per_hour")
-                or latest_marker.get("before", {})
-                .get("throughput_windows", {})
-                .get("5", {})
-                .get("accepted", {})
-                .get("audio_hours_per_hour")
-                or 0.0
-            )
-            latest_rate = float(latest_cohort["accepted_audio_hours_per_hour"])
-            strategy["latest_tuning"] = {
-                "label": str(latest_marker.get("label") or "Latest tuning"),
-                "started_at": latest_started.isoformat(),
-                "baseline_accepted_audio_hours_per_hour": latest_baseline_rate,
-                "cohort": latest_cohort,
-                "accepted_rate_multiplier": (
-                    round(latest_rate / latest_baseline_rate, 3)
-                    if latest_baseline_rate
-                    else None
-                ),
-            }
-        except (
-            FileNotFoundError,
-            KeyError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-            OSError,
-        ):
-            pass
-    except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError, OSError):
-        pass
+    stage_window_minutes = min(15.0, throughput_window_minutes)
+    pipeline_stages = {
+        "m2d": _queue_stage_metrics(
+            connection,
+            queue_count=queues["waiting_for_m2d"],
+            oldest_query="""SELECT MIN(r.discovered_at) FROM records r
+                LEFT JOIN m2d_scores m USING(filename) WHERE m.filename IS NULL""",
+            event_query="""SELECT r.discovered_at,m.scored_at FROM m2d_scores m
+                JOIN records r USING(filename) WHERE m.scored_at>=?""",
+            now=now,
+            window_minutes=stage_window_minutes,
+        ),
+        "asr": _queue_stage_metrics(
+            connection,
+            queue_count=queues["waiting_for_asr"],
+            oldest_query="""SELECT MIN(m.scored_at) FROM m2d_scores m
+                LEFT JOIN asr_scores s USING(filename)
+                WHERE m.accepted=1 AND s.filename IS NULL""",
+            event_query="""SELECT m.scored_at,s.scored_at FROM asr_scores s
+                JOIN m2d_scores m USING(filename) WHERE s.scored_at>=?""",
+            now=now,
+            window_minutes=stage_window_minutes,
+        ),
+        "assembly": _queue_stage_metrics(
+            connection,
+            queue_count=queues["waiting_for_assembly"],
+            oldest_query="""SELECT MIN(s.scored_at) FROM asr_scores s
+                JOIN records r USING(filename)
+                LEFT JOIN accepted a USING(sha256)
+                LEFT JOIN rejected x USING(sha256)
+                WHERE s.accepted=1 AND a.sha256 IS NULL AND x.sha256 IS NULL""",
+            event_query="""SELECT s.scored_at,a.accepted_at FROM accepted a
+                JOIN records r USING(sha256) JOIN asr_scores s USING(filename)
+                WHERE a.accepted_at>=?1
+                UNION ALL
+                SELECT s.scored_at,x.rejected_at FROM rejected x
+                JOIN records r USING(sha256) JOIN asr_scores s USING(filename)
+                WHERE x.reason!='automated_model_gate' AND x.rejected_at>=?1""",
+            now=now,
+            window_minutes=stage_window_minutes,
+        ),
+    }
     stalled_stages = [
         stage
         for stage, backlog, recent_clips in (
@@ -1021,15 +1054,6 @@ def progress_snapshot(
         flow_explanation = (
             "A pending queue has no recent consumer output or a worker is unhealthy."
         )
-    elif strategy and (
-        strategy["cohort"]["observed_minutes"] < 15
-        or strategy["cohort"]["m2d_scored"] < 20
-    ):
-        flow_state = "warming_up"
-        flow_explanation = (
-            "The new acquisition strategy is live; its cohort is still too small "
-            "for a stable throughput comparison."
-        )
     elif rolling_yield < 8.0:
         flow_state = "healthy_low_yield"
         flow_explanation = (
@@ -1054,6 +1078,7 @@ def progress_snapshot(
         "clip_seconds": clip_seconds,
         "counts": counts,
         "queues": queues,
+        "pipeline_stages": pipeline_stages,
         "flow": {
             "state": flow_state,
             "explanation": flow_explanation,
@@ -1075,7 +1100,6 @@ def progress_snapshot(
         "autoscaler": autoscaler,
         "throughput": throughput,
         "throughput_windows": throughput_windows,
-        "strategy": strategy,
         "source_frontier": frontier_snapshot(
             workspace,
             window_minutes=min(15.0, throughput_window_minutes),
