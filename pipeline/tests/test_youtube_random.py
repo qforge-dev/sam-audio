@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import math
 import signal
@@ -23,10 +24,12 @@ from sam_audio_pipeline.youtube_random import (
     _dailymotion_has_high_quality_format,
     _dailymotion_search_page,
     _discovery_candidate_allowed,
+    _expand_vimeo_seed,
     _group_candidates_by_video,
     _inject_cached_scan_sources,
     _load_source_scan_priors,
     _order_scanned_source_groups,
+    _paid_search_request_allowed,
     _permanent_media_error,
     _proxy_asr_blocks_extraction,
     _proxy_asr_from_guidance,
@@ -35,7 +38,7 @@ from sam_audio_pipeline.youtube_random import (
     _runtime_worker_limit,
     _sample_clip_starts,
     _scan_group_has_remaining_work,
-    _search_ytdlp_provider,
+    _search_vimeo,
     _use_full_source_for_group,
     acquire_scanned_source_group,
     analyze_wav,
@@ -158,37 +161,150 @@ def test_missing_youtube_proxy_config_fails_before_download(
         raise AssertionError("missing proxy config should fail closed")
 
 
-def test_site_search_hydrates_vimeo_results(monkeypatch) -> None:
-    commands: list[list[str]] = []
+def test_proxy_rotated_search_hydrates_vimeo_results(monkeypatch) -> None:
+    opened: list[str] = []
 
-    def fake_run(command, *, timeout):
-        commands.append(command)
-        if "--flat-playlist" in command:
-            stdout = json.dumps({"entries": [{"url": "https://vimeo.com/123456"}]})
-        else:
-            stdout = json.dumps(
-                {
-                    "id": "123456",
-                    "title": "English cinematic movie scene dialogue",
-                    "duration": 180,
-                    "webpage_url": "https://vimeo.com/123456",
-                    "uploader": "short-film-studio",
-                }
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    class Opener:
+        def open(self, request, timeout):
+            opened.append(request.full_url)
+            if "search.brave.com" in request.full_url:
+                return Response(
+                    b'<a href="https://vimeo.com/123456">result</a>'
+                    b'<a href="https://vimeo.com/blog/post/ignored">blog</a>'
+                )
+            return Response(
+                json.dumps(
+                    {
+                        "video_id": 123456,
+                        "title": "English cinematic movie scene dialogue",
+                        "duration": 180,
+                        "author_name": "short-film-studio",
+                        "author_url": "https://vimeo.com/studio",
+                    }
+                ).encode()
             )
-        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(youtube_random, "_run", fake_run)
+    monkeypatch.setattr(youtube_random, "_url_opener", lambda *args: Opener())
 
-    items = _search_ytdlp_provider(
-        "cinematic dialogue -reaction", 100, "cinematic", "vimeo"
+    items = _search_vimeo(
+        "cinematic dialogue -reaction", 100, "cinematic", page=3
     )
 
     assert len(items) == 1
     assert items[0]["source_url"] == "https://vimeo.com/123456"
-    search_target = commands[0][-1]
-    assert search_target.startswith("yvsearch8:site:vimeo.com ")
-    assert "-reaction" not in search_target
-    assert "--skip-download" in commands[1]
+    assert "offset=2" in opened[0]
+    assert "%2Breaction" not in opened[0]
+    assert any("api/oembed.json" in value for value in opened)
+
+
+def test_paid_search_fails_closed_and_enforces_daily_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state = tmp_path / "paid-search-budget.json"
+    monkeypatch.setenv("SAM_PAID_SEARCH_BUDGET_STATE", str(state))
+    monkeypatch.setenv("SAM_PAID_SEARCH_DAILY_REQUEST_LIMIT", "2")
+    monkeypatch.delenv("SAM_PAID_SEARCH_ENABLED", raising=False)
+
+    assert not _paid_search_request_allowed()
+    monkeypatch.setenv("SAM_PAID_SEARCH_ENABLED", "true")
+    assert _paid_search_request_allowed()
+    assert _paid_search_request_allowed()
+    assert not _paid_search_request_allowed()
+
+
+def test_brave_paid_search_uses_video_index_and_fifty_results(monkeypatch) -> None:
+    opened: list[str] = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    def urlopen(request, timeout):
+        opened.append(request.full_url)
+        return Response(
+            json.dumps(
+                {
+                    "results": [
+                        {"url": "https://vimeo.com/123456"},
+                        {"url": "https://vimeo.com/789012"},
+                    ]
+                }
+            ).encode()
+        )
+
+    monkeypatch.setenv("SAM_BRAVE_SEARCH_API_KEY", "configured")
+    monkeypatch.setattr(youtube_random, "_paid_search_request_allowed", lambda: True)
+    monkeypatch.setattr(youtube_random, "_pace_external_search", lambda: None)
+    monkeypatch.setattr(youtube_random.urllib.request, "urlopen", urlopen)
+
+    urls = youtube_random._brave_api_search_urls(
+        "cinematic dialogue", "vimeo", page=3, results=100
+    )
+
+    assert urls == ["https://vimeo.com/123456", "https://vimeo.com/789012"]
+    assert "/v1/videos/search?" in opened[0]
+    assert "count=50" in opened[0]
+    assert "offset=2" in opened[0]
+
+def test_vimeo_expansion_traverses_proven_uploader_channel(monkeypatch) -> None:
+    commands: list[list[str]] = []
+
+    def run(command, *, timeout):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "entries": [
+                        {"id": "123456"},
+                        {"id": "789012"},
+                    ]
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(youtube_random, "_run_search_command", run)
+    monkeypatch.setattr(youtube_random, "_yt_dlp_proxy_args", lambda *args: [])
+    monkeypatch.setattr(
+        youtube_random,
+        "_hydrate_vimeo_oembed",
+        lambda video_id: {
+            "id": video_id,
+            "duration": 180,
+            "title": "English cinematic dialogue scene",
+            "source_url": f"https://vimeo.com/{video_id}",
+            "source_platform": "vimeo",
+        },
+    )
+
+    expanded = _expand_vimeo_seed(
+        7,
+        {"uploader_id": "https://vimeo.com/proven-studio"},
+        profile="cinematic",
+        results=20,
+        known_video_ids={"123456"},
+    )
+
+    assert expanded[0][0] == "accepted_channel_v1"
+    assert {item["id"] for item in expanded[0][1]} == {"789012"}
+    assert all(
+        item["channel_id"] == "https://vimeo.com/proven-studio"
+        for item in expanded[0][1]
+    )
+    assert commands[0][-1] == "https://vimeo.com/proven-studio/videos"
+    assert "--playlist-start" in commands[0]
 
 
 def test_youtube_preflight_uses_proxy_config_and_audio_only_selector(
@@ -251,6 +367,88 @@ def test_proxy_pool_pins_a_source_and_changes_across_retries(
     assert first == repeated
     assert len(retries) > 1
     assert all("secret" not in " ".join(args) for args in retries)
+
+
+def test_proxy_pool_assigns_workers_to_distinct_slots_and_rotates_retries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    pool = tmp_path / "proxy-pool"
+    pool.mkdir(mode=0o700)
+    configs = []
+    for index in range(4):
+        config = pool / f"proxy-{index:02d}.conf"
+        config.write_text(f"--proxy http://user:secret-{index}@proxy-{index}:80\n")
+        config.chmod(0o600)
+        configs.append(config)
+    monkeypatch.setattr(youtube_random, "YOUTUBE_PROXY_CONFIG", pool)
+
+    assert youtube_random._yt_dlp_proxy_args("bilibili", "proxy-slot:0:0") == [
+        "--config-locations",
+        str(configs[0]),
+    ]
+    assert youtube_random._yt_dlp_proxy_args("bilibili", "proxy-slot:1:0") == [
+        "--config-locations",
+        str(configs[1]),
+    ]
+    assert youtube_random._yt_dlp_proxy_args("bilibili", "proxy-slot:0:1") == [
+        "--config-locations",
+        str(configs[1]),
+    ]
+    assert youtube_random._yt_dlp_proxy_args("bilibili", "proxy-slot:4:0") == [
+        "--config-locations",
+        str(configs[0]),
+    ]
+
+
+def test_bilibili_412_temporarily_quarantines_only_that_provider_exit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    pool = tmp_path / "proxy-pool"
+    pool.mkdir(mode=0o700)
+    configs = []
+    for index in range(3):
+        config = pool / f"proxy-{index:04d}.conf"
+        config.write_text(f"--proxy http://user:secret-{index}@proxy-{index}:80\n")
+        config.chmod(0o600)
+        configs.append(config)
+    monkeypatch.setattr(youtube_random, "YOUTUBE_PROXY_CONFIG", pool)
+
+    assert youtube_random.quarantine_proxy_for_error(
+        "bilibili",
+        f"--config-locations {configs[0]}: HTTP Error 412: Precondition Failed",
+    )
+
+    assert youtube_random._yt_dlp_proxy_args(
+        "bilibili", "proxy-slot:0:0"
+    ) == ["--config-locations", str(configs[1])]
+    assert youtube_random._yt_dlp_proxy_args(
+        "vimeo", "proxy-slot:0:0"
+    ) == ["--config-locations", str(configs[0])]
+
+
+def test_limited_worker_slots_are_distributed_over_the_full_proxy_pool(
+    tmp_path: Path, monkeypatch
+) -> None:
+    pool = tmp_path / "proxy-pool"
+    pool.mkdir(mode=0o700)
+    configs = []
+    for index in range(4):
+        config = pool / f"proxy-{index:04d}.conf"
+        config.write_text(f"--proxy http://user:secret-{index}@proxy-{index}:80\n")
+        config.chmod(0o600)
+        configs.append(config)
+    monkeypatch.setattr(youtube_random, "YOUTUBE_PROXY_CONFIG", pool)
+    monkeypatch.setenv("SAM_YTDLP_PROXY_SLOTS", "2")
+
+    assert youtube_random._yt_dlp_proxy_args(
+        "vimeo", "proxy-slot:0:0"
+    ) == ["--config-locations", str(configs[0])]
+    assert youtube_random._yt_dlp_proxy_args(
+        "vimeo", "proxy-slot:1:0"
+    ) == ["--config-locations", str(configs[2])]
+    assert youtube_random._yt_dlp_proxy_args(
+        "vimeo", "proxy-slot:1:1"
+    ) == ["--config-locations", str(configs[3])]
 
 
 def test_proxy_config_rejects_readable_secret_files(
@@ -443,6 +641,76 @@ def test_low_quality_source_is_negatively_cached(tmp_path: Path, monkeypatch) ->
     assert not _scan_group_has_remaining_work([candidate], cache_dir=cache, guidance={})
     cached = json.loads((cache / "dailymotion-low-quality.json").read_text())
     assert cached["rejection_reasons"] == ["source_high_quality_format_unavailable"]
+
+
+def test_cached_scan_extracts_from_retained_full_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    candidate = {
+        "candidate_id": "retained:0",
+        "video_id": "retained",
+        "source_platform": "vimeo",
+        "source_url": "https://example.invalid/retained",
+        "source_clip_budget": 1,
+    }
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "vimeo-retained.json").write_text(
+        json.dumps(
+            {
+                "policy": "whole_source_proxy_m2d_v1",
+                "clip_seconds": 10.0,
+                "claimed_starts": [],
+                "regions": [
+                    {
+                        "start_seconds": 20.0,
+                        "score": 8.0,
+                        "evidence": {
+                            "foreground_speech_coverage": 0.8,
+                            "vocal_music_coverage": 0.0,
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    retained = tmp_path / "source.m4a"
+    retained.write_bytes(b"source")
+    observed: dict[str, object] = {}
+
+    def normalize(candidate, source, info, client, *args, **kwargs):
+        observed.update(
+            source=source,
+            client=client,
+            source_start_seconds=kwargs.get("source_start_seconds"),
+        )
+        return {**candidate, "retrieval_status": "success"}
+
+    monkeypatch.setattr(
+        youtube_random,
+        "_download_scanned_sections",
+        lambda *args, **kwargs: pytest.fail("provider must not be called"),
+    )
+    monkeypatch.setattr(
+        youtube_random, "_normalize_candidate_from_source", normalize
+    )
+
+    results = acquire_scanned_source_group(
+        [candidate],
+        tmp_path / "output",
+        scanner=None,
+        cache_dir=cache,
+        guidance={},
+        local_source=retained,
+    )
+
+    assert results[0]["retrieval_status"] == "success"
+    assert results[0]["source_scan"]["extraction_source"] == "retained_full_source"
+    assert observed == {
+        "source": retained,
+        "client": "vimeo-source-scan-section",
+        "source_start_seconds": 0.0,
+    }
 
 
 def test_busy_cross_process_source_lock_skips_without_waiting(tmp_path: Path) -> None:

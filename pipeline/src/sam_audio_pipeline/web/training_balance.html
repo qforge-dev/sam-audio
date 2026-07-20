@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Training Dataset Balance</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg:#0b1016; --panel:#121a23; --panel-2:#18232f; --line:#293848;
+      --text:#eef5fb; --muted:#91a4b7; --blue:#67b7ff; --green:#56d491;
+      --gold:#f7c75d; --red:#ff7777; --purple:#b49cff;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; }
+    button,input,select { font:inherit; }
+    header { position:sticky; top:0; z-index:10; display:flex; align-items:center; gap:18px; padding:14px 22px; border-bottom:1px solid var(--line); background:rgba(11,16,22,.96); backdrop-filter:blur(10px); }
+    .brand h1 { margin:0; font-size:17px; }
+    .brand p { margin:2px 0 0; color:var(--muted); font-size:12px; }
+    nav { margin-left:auto; display:flex; flex-wrap:wrap; gap:8px; }
+    nav a { border:1px solid var(--line); border-radius:9px; padding:8px 11px; color:var(--muted); text-decoration:none; }
+    nav a.active { color:var(--text); border-color:#4b657d; background:var(--panel); }
+    main { width:min(1260px,calc(100% - 32px)); margin:0 auto; padding:28px 0 70px; }
+    .hero { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:24px; align-items:end; }
+    .eyebrow { color:var(--blue); text-transform:uppercase; letter-spacing:.12em; font-size:11px; font-weight:700; }
+    h2 { margin:6px 0 6px; font-size:clamp(25px,3.3vw,40px); line-height:1.12; }
+    .lede { max-width:800px; margin:0; color:var(--muted); }
+    .scope-control { display:grid; gap:6px; }
+    .scope-control label,.filter label { color:var(--muted); font-size:11px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+    select,input { min-width:220px; padding:9px 11px; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:9px; }
+    .note { margin:12px 0 0; color:var(--muted); font-size:12px; }
+    .stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:22px; }
+    .stat { padding:15px 16px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+    .stat span { color:var(--muted); font-size:11px; letter-spacing:.06em; text-transform:uppercase; }
+    .stat strong { display:block; margin-top:3px; font-size:24px; font-variant-numeric:tabular-nums; }
+    section { margin-top:30px; }
+    .section-head { display:flex; justify-content:space-between; gap:18px; align-items:end; margin-bottom:12px; }
+    .section-head h3 { margin:0; font-size:19px; }
+    .section-head p { max-width:720px; margin:0; color:var(--muted); font-size:12px; text-align:right; }
+    .insights { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }
+    .insight { min-height:112px; padding:14px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+    .insight.warning { border-color:rgba(247,199,93,.42); }
+    .insight.gap { border-color:rgba(255,119,119,.42); }
+    .insight strong { display:block; margin-bottom:6px; }
+    .insight p { margin:0; color:var(--muted); font-size:12px; }
+    .family-list { display:grid; gap:8px; }
+    .family-row { display:grid; grid-template-columns:minmax(170px,1.4fr) minmax(230px,3fr) 90px 122px; gap:12px; align-items:center; }
+    .family-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .track { height:12px; overflow:hidden; border-radius:999px; background:#0d151d; }
+    .fill { height:100%; min-width:2px; border-radius:inherit; background:linear-gradient(90deg,var(--blue),var(--purple)); }
+    .family-value { text-align:right; color:var(--muted); font-variant-numeric:tabular-nums; }
+    .badge { justify-self:end; padding:3px 7px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.05em; }
+    .badge.overrepresented { color:var(--gold); border-color:rgba(247,199,93,.45); }
+    .badge.underrepresented { color:var(--red); border-color:rgba(255,119,119,.45); }
+    .badge.middle { color:var(--green); border-color:rgba(86,212,145,.45); }
+    .small-multiples { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .distribution { padding:16px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+    .distribution h4 { margin:0 0 12px; font-size:14px; }
+    .stacked { display:flex; width:100%; height:18px; overflow:hidden; border-radius:7px; background:#0d151d; }
+    .stacked span:nth-child(1) { background:#3d4b59; }
+    .stacked span:nth-child(2) { background:var(--blue); }
+    .stacked span:nth-child(3) { background:var(--purple); }
+    .stacked span:nth-child(4) { background:var(--gold); }
+    .stacked span:nth-child(5) { background:#64717d; }
+    .legend { display:grid; gap:5px; margin-top:11px; }
+    .legend-row { display:grid; grid-template-columns:1fr auto; gap:10px; color:var(--muted); font-size:12px; }
+    .legend-row strong { color:var(--text); font-weight:500; font-variant-numeric:tabular-nums; }
+    .split { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .panel { padding:16px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+    .panel h4 { margin:0 0 11px; font-size:14px; }
+    .simple-bars { display:grid; gap:8px; }
+    .simple-row { display:grid; grid-template-columns:minmax(130px,1fr) 2fr 72px; gap:10px; align-items:center; }
+    .simple-row > span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .simple-row .fill { background:var(--blue); }
+    .table-tools { display:flex; flex-wrap:wrap; gap:10px; }
+    .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:12px; }
+    table { width:100%; border-collapse:collapse; background:var(--panel); }
+    th,td { padding:10px 12px; border-bottom:1px solid #22303e; text-align:left; }
+    th { position:sticky; top:0; background:#111a23; color:var(--muted); font-size:10px; letter-spacing:.06em; text-transform:uppercase; }
+    td.number { text-align:right; font-variant-numeric:tabular-nums; }
+    tr:last-child td { border-bottom:0; }
+    .tag-name { font-weight:600; }
+    .table-pager { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:10px; color:var(--muted); font-size:12px; }
+    .table-pager div { display:flex; gap:7px; }
+    .table-pager button { padding:6px 9px; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:8px; cursor:pointer; }
+    .table-pager button:disabled { opacity:.35; cursor:default; }
+    .empty,.loading { padding:70px 20px; text-align:center; color:var(--muted); }
+    .loading strong { display:block; margin-bottom:6px; color:var(--text); }
+    @media (max-width:900px) {
+      header,.hero,.section-head { display:grid; }
+      nav { margin-left:0; }
+      .section-head p { text-align:left; }
+      .stats,.insights { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .family-row { grid-template-columns:minmax(130px,1fr) 2fr 75px; }
+      .family-row .badge { display:none; }
+      .small-multiples,.split { grid-template-columns:1fr; }
+    }
+    @media (max-width:560px) {
+      main { width:min(100% - 20px,1260px); }
+      .stats,.insights { grid-template-columns:1fr; }
+      .family-row { grid-template-columns:1fr 80px; gap:5px 10px; }
+      .family-row .track { grid-column:1/-1; grid-row:2; }
+      select,input { width:100%; min-width:0; }
+      .table-tools { display:grid; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand"><h1>Training Dataset Balance</h1><p>Coverage and concentration across dialogue-conditioned backgrounds</p></div>
+    <nav>
+      <a id="clipsLink" href="/">Review clips</a>
+      <a id="progressLink" href="/progress">Pipeline progress</a>
+      <a id="trainingLink" href="/training">Training snapshots</a>
+      <a id="balanceLink" class="active" href="/training/balance">Dataset balance</a>
+    </nav>
+  </header>
+  <main>
+    <div class="hero">
+      <div>
+        <div class="eyebrow">Newest transformed version · deduplicated</div>
+        <h2>What the model will learn—and what it may see too often</h2>
+        <p class="lede">This view measures the dialogue, score, ambience and sound-effect coverage available for generating a plausible background around foreground dialogue.</p>
+      </div>
+      <div class="scope-control">
+        <label for="scope">Dataset slice</label>
+        <select id="scope">
+          <option value="all">All transformed records</option>
+          <option value="success">Success only</option>
+          <option value="review">Manual-review bucket</option>
+          <option value="failure">Failure bucket</option>
+        </select>
+      </div>
+    </div>
+    <p class="note" id="scopeNote"></p>
+    <div id="loading" class="loading"><strong>Building the balance summary…</strong>The first calculation runs in the background; this page will update automatically.</div>
+    <div id="dashboard" hidden>
+      <div class="stats">
+        <div class="stat"><span>Records in slice</span><strong id="recordCount">—</strong></div>
+        <div class="stat"><span>Audio hours</span><strong id="audioHours">—</strong></div>
+        <div class="stat"><span>Semantic tags</span><strong id="tagCount">—</strong></div>
+        <div class="stat"><span>Source videos</span><strong id="sourceCount">—</strong></div>
+      </div>
+
+      <section>
+        <div class="section-head"><h3>Balance signals</h3><p>Warnings describe concentration, not correctness. They are prompts for acquisition targets.</p></div>
+        <div class="insights" id="insights"></div>
+      </section>
+
+      <section>
+        <div class="section-head"><h3>Broad acoustic families</h3><p id="familyNote"></p></div>
+        <div class="family-list" id="families"></div>
+      </section>
+
+      <section>
+        <div class="section-head"><h3>Clip composition</h3><p>Each chart covers the selected slice; bins are mutually exclusive within a chart.</p></div>
+        <div class="small-multiples">
+          <div class="distribution"><h4>Dialogue density</h4><div id="dialogueWords"></div></div>
+          <div class="distribution"><h4>Dialogue time coverage</h4><div id="dialogueCoverage"></div></div>
+          <div class="distribution"><h4>Music coverage</h4><div id="musicCoverage"></div></div>
+          <div class="distribution"><h4>SFX coverage</h4><div id="sfxCoverage"></div></div>
+          <div class="distribution"><h4>Dialogue/background overlap</h4><div id="overlapCoverage"></div></div>
+          <div class="distribution"><h4>Background mix type</h4><div id="backgroundBuckets"></div></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head"><h3>Source and quality concentration</h3><p>High reuse can make the model memorize a narrow production style even when clip-level tags look diverse.</p></div>
+        <div class="split">
+          <div class="panel"><h4>Source platforms</h4><div class="simple-bars" id="platforms"></div></div>
+          <div class="panel"><h4>Most reused source videos</h4><div class="simple-bars" id="topSources"></div></div>
+          <div class="panel"><h4>Automated quality issues</h4><div class="simple-bars" id="qualityReasons"></div></div>
+          <div class="panel"><h4>Automated → manual-adjusted buckets</h4><div class="simple-bars" id="qualityBuckets"></div></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <div><h3>Every semantic tag</h3><p id="tagNote"></p></div>
+          <div class="table-tools">
+            <div class="filter"><label for="tagSearch">Find tag</label><input id="tagSearch" type="search" placeholder="e.g. footsteps"></div>
+            <div class="filter"><label for="tagRole">Tag role</label><select id="tagRole"><option value="all">All roles</option><option value="SFX">SFX</option><option value="global">Global</option><option value="both">Both</option></select></div>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Tag</th><th>Family</th><th>Role</th><th>Coverage</th><th>Records</th><th>Audio hours</th><th>Representation</th></tr></thead>
+            <tbody id="tagRows"></tbody>
+          </table>
+        </div>
+        <div class="table-pager"><span id="tagPageStatus"></span><div><button id="tagPrevious" type="button">← Previous 100</button><button id="tagNext" type="button">Next 100 →</button></div></div>
+      </section>
+      <p class="note" id="measuredAt"></p>
+    </div>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const marker = '/training/balance';
+    const markerIndex = location.pathname.indexOf(marker);
+    const BASE = markerIndex >= 0 ? location.pathname.slice(0, markerIndex) : '';
+    const api = path => `${BASE}${path}`;
+    const esc = value => String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+    const fmt = value => Number(value || 0).toLocaleString();
+    const pct = value => `${Number(value || 0).toFixed(1)}%`;
+    const state = {payload:null, scope:'all', tags:[], tagOffset:0, tagTotal:0, tagLoading:false, tagRequest:0, tagError:''};
+
+    async function getBalance() {
+      const response = await fetch(api('/api/training/balance'), {cache:'no-store'});
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+      return payload;
+    }
+
+    function stacked(target, items) {
+      const total = items.reduce((sum,item) => sum + Number(item.records || 0), 0);
+      target.innerHTML = `<div class="stacked" aria-label="Distribution">${items.map(item => `<span style="width:${total ? item.records / total * 100 : 0}%" title="${esc(item.label)}: ${pct(item.percent)}"></span>`).join('')}</div><div class="legend">${items.filter(item => item.records).map(item => `<div class="legend-row"><span>${esc(item.label)}</span><strong>${fmt(item.records)} · ${pct(item.percent)}</strong></div>`).join('')}</div>`;
+    }
+
+    function simpleBars(target, items, limit = 10) {
+      const selected = (items || []).slice(0, limit);
+      const max = Math.max(1,...selected.map(item => Number(item.records || 0)));
+      target.innerHTML = selected.length ? selected.map(item => `<div class="simple-row"><span title="${esc(item.label)}">${esc(item.label)}</span><div class="track"><div class="fill" style="width:${item.records / max * 100}%"></div></div><span class="family-value">${pct(item.percent)}</span></div>`).join('') : '<div class="empty">No data in this slice.</div>';
+    }
+
+    function renderTagRows() {
+      $('tagRows').innerHTML = state.tagError ? `<tr><td colspan="7" class="empty">${esc(state.tagError)}</td></tr>` : state.tags.length ? state.tags.map(tag => `<tr><td class="tag-name">${esc(tag.label)}</td><td>${esc(tag.family)}</td><td>${esc(tag.role)}</td><td class="number">${pct(tag.percent)}</td><td class="number">${fmt(tag.records)}</td><td class="number">${Number(tag.audio_hours).toFixed(2)}</td><td><span class="badge ${esc(tag.representation === 'dominant' ? 'overrepresented' : tag.representation === 'sparse' ? 'underrepresented' : 'middle')}">${esc(tag.representation)}</span></td></tr>`).join('') : '<tr><td colspan="7" class="empty">No tags match this filter.</td></tr>';
+      const start = state.tagTotal ? state.tagOffset + 1 : 0;
+      const end = Math.min(state.tagTotal, state.tagOffset + state.tags.length);
+      $('tagPageStatus').textContent = state.tagLoading ? 'Loading tags…' : `${fmt(start)}–${fmt(end)} of ${fmt(state.tagTotal)} matching tags`;
+      $('tagPrevious').disabled = state.tagLoading || state.tagOffset <= 0;
+      $('tagNext').disabled = state.tagLoading || state.tagOffset + state.tags.length >= state.tagTotal;
+    }
+
+    async function loadTags({reset = false} = {}) {
+      if (!state.payload) return;
+      if (reset) state.tagOffset = 0;
+      const requestId = ++state.tagRequest;
+      state.tagLoading = true;
+      state.tagError = '';
+      renderTagRows();
+      try {
+        const params = new URLSearchParams({scope:state.scope,query:$('tagSearch').value.trim(),role:$('tagRole').value,offset:String(state.tagOffset),limit:'100'});
+        const response = await fetch(api(`/api/training/balance/tags?${params}`), {cache:'no-store'});
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+        if (requestId !== state.tagRequest) return;
+        state.tags = payload.items || [];
+        state.tagTotal = Number(payload.total || 0);
+      } catch (error) {
+        if (requestId !== state.tagRequest) return;
+        state.tags = [];
+        state.tagTotal = 0;
+        state.tagError = error.message;
+      } finally {
+        if (requestId !== state.tagRequest) return;
+        state.tagLoading = false;
+        renderTagRows();
+      }
+    }
+
+    function render() {
+      const payload = state.payload;
+      const scope = payload.scopes[state.scope];
+      $('recordCount').textContent = fmt(scope.records);
+      $('audioHours').textContent = Number(scope.audio_hours).toFixed(2);
+      $('tagCount').textContent = fmt(scope.unique_tags);
+      $('sourceCount').textContent = fmt(scope.unique_source_videos);
+      $('scopeNote').textContent = payload.scope_note;
+      $('familyNote').textContent = `Relative status compares each family with the median of ${fmt(scope.family_median_records)} records. Multi-label percentages overlap.`;
+      $('tagNote').textContent = `${fmt(scope.unique_tags)} annotation tags in this slice. Dominant means ≥25% of records; sparse means <2%. These are model-generated labels, not guaranteed acoustic ground truth.`;
+      $('insights').innerHTML = scope.insights.map(item => `<article class="insight ${esc(item.level)}"><strong>${esc(item.title)}</strong><p>${esc(item.detail)}</p></article>`).join('');
+      $('families').innerHTML = scope.families.map(item => `<div class="family-row"><span class="family-label">${esc(item.label)}</span><div class="track"><div class="fill" style="width:${Math.min(100,item.percent)}%"></div></div><span class="family-value">${fmt(item.records)} · ${pct(item.percent)}</span><span class="badge ${esc(item.balance)}">${esc(item.balance)}</span></div>`).join('');
+      stacked($('dialogueWords'), scope.dialogue_words);
+      stacked($('dialogueCoverage'), scope.dialogue_coverage);
+      stacked($('musicCoverage'), scope.music_coverage);
+      stacked($('sfxCoverage'), scope.sfx_coverage);
+      stacked($('overlapCoverage'), scope.overlap_coverage);
+      stacked($('backgroundBuckets'), scope.background_buckets);
+      simpleBars($('platforms'), scope.platforms);
+      simpleBars($('topSources'), scope.top_sources);
+      simpleBars($('qualityReasons'), scope.quality_reasons);
+      const automated = Object.fromEntries(payload.automated_buckets.map(item => [item.label,item]));
+      const effective = Object.fromEntries(payload.effective_buckets.map(item => [item.label,item]));
+      const bucketItems = ['success','review','failure'].map(label => ({label:`${label}: ${fmt(automated[label]?.records)} automated → ${fmt(effective[label]?.records)} effective`,records:effective[label]?.records || 0,percent:effective[label]?.percent || 0}));
+      simpleBars($('qualityBuckets'), bucketItems, 3);
+      $('measuredAt').textContent = `Newest caption revision ${payload.revision} · ${fmt(payload.manual_decisions)} manual outcome overrides · measured ${new Date(payload.measured_at).toLocaleString()} · cached for 15 minutes.`;
+    }
+
+    async function load() {
+      try {
+        const payload = await getBalance();
+        if (payload.status === 'building') {
+          $('loading').innerHTML = `<strong>${esc(payload.message || 'Building the balance summary…')}</strong>This runs outside the request path so the dashboard remains responsive.`;
+          setTimeout(load, 2000);
+          return;
+        }
+        state.payload = payload;
+        $('loading').hidden = true;
+        $('dashboard').hidden = false;
+        render();
+        loadTags({reset:true});
+      } catch (error) {
+        $('loading').innerHTML = `<strong>Could not load dataset balance</strong>${esc(error.message)}`;
+      }
+    }
+
+    $('scope').addEventListener('change', event => { state.scope = event.target.value; render(); loadTags({reset:true}); });
+    let tagSearchTimer = null;
+    $('tagSearch').addEventListener('input', () => { clearTimeout(tagSearchTimer); tagSearchTimer = setTimeout(() => loadTags({reset:true}), 250); });
+    $('tagRole').addEventListener('change', () => loadTags({reset:true}));
+    $('tagPrevious').addEventListener('click', () => { state.tagOffset = Math.max(0,state.tagOffset - 100); loadTags(); });
+    $('tagNext').addEventListener('click', () => { state.tagOffset += 100; loadTags(); });
+    $('clipsLink').href = `${BASE}/`;
+    $('progressLink').href = `${BASE}/progress`;
+    $('trainingLink').href = `${BASE}/training`;
+    $('balanceLink').href = `${BASE}/training/balance`;
+    load();
+  </script>
+</body>
+</html>

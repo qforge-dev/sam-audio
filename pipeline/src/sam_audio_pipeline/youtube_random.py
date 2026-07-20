@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import html
 import json
 import logging
 import math
@@ -18,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -62,10 +64,11 @@ MIN_SOURCE_DURATION_SECONDS = 30.0
 MIN_DISCOVERY_SOURCE_DURATION_SECONDS = 2 * 60.0
 MAX_SOURCE_DURATION_SECONDS = 12 * 3600.0
 CANDIDATE_DURATION_POLICY = "source_duration_2m_to_12h_v3"
-DAILYMOTION_SEARCH_POLICY = "seeded_relevance_pages_1_to_50_gameplay_v5"
-MULTI_SOURCE_SEARCH_POLICY = "yt_dlp_native_related_and_channel_v2"
-DISCOVERY_EXPANSION_POLICY = "accepted_parent_graph_and_deep_search_v1"
-DISCOVERY_EXPANSION_SEEDS_PER_BATCH = 8
+DAILYMOTION_SEARCH_POLICY = "seeded_relevance_and_productive_graph_pages_v6"
+MULTI_SOURCE_SEARCH_POLICY = "native_and_proxy_rotated_vimeo_search_v3"
+DISCOVERY_EXPANSION_POLICY = "accepted_parent_graph_paged_v2"
+DISCOVERY_EXPANSION_SEEDS_PER_BATCH = 32
+DISCOVERY_EXTERNAL_QUERIES_PER_BATCH = 4
 SUPPORTED_DISCOVERY_SOURCES = (
     "youtube",
     "dailymotion",
@@ -90,10 +93,12 @@ YTDLP_SEARCH_PROVIDERS: dict[str, dict[str, Any]] = {
         "hydrate": True,
     },
     "vimeo": {
-        "search_key": "yvsearch",
-        "site": "vimeo.com",
-        "max_results": 8,
-        "hydrate": True,
+        # Vimeo's own search page blocks datacenter hosts and yt-dlp's old
+        # yvsearch path depends on YouTube, which is intentionally disabled in
+        # this deployment. Discovery uses the proxy-rotated Brave/oEmbed
+        # adapter below instead.
+        "search_key": "external",
+        "max_results": 24,
     },
     "tiktok": {
         "search_key": "yvsearch",
@@ -114,6 +119,9 @@ YTDLP_SEARCH_PROVIDERS: dict[str, dict[str, Any]] = {
 }
 YTDLP_PYTHON = sys.executable
 YOUTUBE_PROXY_CONFIG: Path | None = None
+_PROXY_QUARANTINE_SECONDS = 30 * 60
+_proxy_quarantine: dict[tuple[str, str], float] = {}
+_proxy_quarantine_lock = threading.Lock()
 SILENCE_THRESHOLD_DBFS = -55.0
 MIN_RMS_DBFS = -35.0
 MIN_PEAK_DBFS = -20.0
@@ -601,16 +609,64 @@ def _yt_dlp_proxy_args(source_platform: str, affinity_key: str = "") -> list[str
     if not path.exists():
         raise FileNotFoundError(f"yt-dlp proxy config is missing: {path}")
     configs = _protected_proxy_configs(path)
-    digest = hashlib.sha256(affinity_key.encode()).digest()
-    selected = configs[int.from_bytes(digest[:8], "big") % len(configs)]
+    normalized_platform = source_platform.strip().lower()
+    now = time.monotonic()
+    with _proxy_quarantine_lock:
+        expired = [key for key, until in _proxy_quarantine.items() if until <= now]
+        for key in expired:
+            _proxy_quarantine.pop(key, None)
+        eligible = [
+            config
+            for config in configs
+            if _proxy_quarantine.get((normalized_platform, str(config)), 0.0) <= now
+        ]
+    # Fail open if every exit is cooling down; provider circuit breaking still
+    # protects the pipeline, while this avoids permanently wedging a provider.
+    if not eligible:
+        eligible = configs
+    try:
+        prefix, slot, attempt = affinity_key.split(":", 2)
+        if prefix != "proxy-slot":
+            raise ValueError
+        slot_index = int(slot)
+        configured_slots = int(os.environ.get("SAM_YTDLP_PROXY_SLOTS", "0"))
+        if configured_slots <= 0:
+            configured_slots = len(configs)
+        # A concurrency limit below pool size should still span the complete
+        # proxy pool. Retries advance from each evenly distributed base slot.
+        distributed_slot = (slot_index * len(configs)) // configured_slots
+        selected_index = (distributed_slot + int(attempt)) % len(eligible)
+    except (TypeError, ValueError):
+        digest = hashlib.sha256(affinity_key.encode()).digest()
+        selected_index = int.from_bytes(digest[:8], "big") % len(eligible)
+    selected = eligible[selected_index]
     return ["--config-locations", str(selected)]
 
 
+def quarantine_proxy_for_error(source_platform: str, error: str) -> bool:
+    """Temporarily remove a Bilibili exit after its webpage risk check fires."""
+
+    normalized_platform = source_platform.strip().lower()
+    if normalized_platform != "bilibili" or "HTTP Error 412" not in error:
+        return False
+    match = re.search(r"(/[^\s'\"]*proxy-[0-9]+\.conf)", error)
+    if match is None:
+        return False
+    with _proxy_quarantine_lock:
+        _proxy_quarantine[(normalized_platform, match.group(1))] = (
+            time.monotonic() + _PROXY_QUARANTINE_SECONDS
+        )
+    return True
+
+
 def _candidate_proxy_affinity(candidate: dict[str, Any]) -> str:
+    attempt = str(candidate.get("_youtube_proxy_attempt") or 0)
+    if candidate.get("_proxy_slot") is not None:
+        return f"proxy-slot:{candidate['_proxy_slot']}:{attempt}"
     return ":".join(
         (
             str(candidate.get("video_id") or candidate.get("source_url") or "source"),
-            str(candidate.get("_youtube_proxy_attempt") or 0),
+            attempt,
         )
     )
 
@@ -908,14 +964,329 @@ def _search_ytdlp_provider(
     return items
 
 
+def _proxy_url_for_request(source: str, affinity_key: str) -> str | None:
+    """Read the selected protected proxy without exposing credentials in argv."""
+    proxy_args = _yt_dlp_proxy_args(source, affinity_key)
+    if not proxy_args:
+        return None
+    try:
+        config = Path(proxy_args[proxy_args.index("--config-locations") + 1])
+    except (ValueError, IndexError) as error:
+        raise ValueError("Unsupported proxy configuration arguments") from error
+    match = re.search(r"(?:^|\s)--proxy(?:=|\s+)(\S+)", config.read_text())
+    if match is None:
+        raise ValueError(f"Proxy config has no --proxy entry: {config}")
+    return match.group(1).strip("'\"")
+
+
+def _url_opener(source: str, affinity_key: str) -> urllib.request.OpenerDirector:
+    proxy = _proxy_url_for_request(source, affinity_key)
+    if proxy is None:
+        return urllib.request.build_opener()
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+
+
+def _pace_external_search() -> None:
+    """Enforce one cross-process API request cadence on the discovery host."""
+    interval = max(
+        0.0,
+        float(os.environ.get("SAM_EXTERNAL_SEARCH_MIN_INTERVAL_SECONDS", "1.05")),
+    )
+    if interval == 0:
+        return
+    state_path = Path(
+        os.environ.get(
+            "SAM_EXTERNAL_SEARCH_RATE_STATE",
+            "/tmp/sam-audio-external-search-rate",
+        )
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with state_path.open("a+") as state:
+        fcntl.flock(state, fcntl.LOCK_EX)
+        state.seek(0)
+        try:
+            previous = float(state.read().strip() or 0.0)
+        except ValueError:
+            previous = 0.0
+        delay = interval - (time.time() - previous)
+        if delay > 0:
+            time.sleep(delay)
+        state.seek(0)
+        state.truncate()
+        state.write(str(time.time()))
+        state.flush()
+
+
+def _paid_search_request_allowed() -> bool:
+    """Fail closed and enforce one durable daily budget across all producers."""
+    enabled = os.environ.get("SAM_PAID_SEARCH_ENABLED", "false").strip().lower()
+    if enabled not in {"1", "true", "yes"}:
+        return False
+    daily_limit = max(
+        0, int(os.environ.get("SAM_PAID_SEARCH_DAILY_REQUEST_LIMIT", "0"))
+    )
+    if daily_limit == 0:
+        return False
+    state_path = Path(
+        os.environ.get(
+            "SAM_PAID_SEARCH_BUDGET_STATE",
+            "/tmp/sam-audio-paid-search-budget.json",
+        )
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    today = datetime.now(UTC).date().isoformat()
+    with state_path.open("a+") as state:
+        fcntl.flock(state, fcntl.LOCK_EX)
+        state.seek(0)
+        try:
+            value = json.loads(state.read() or "{}")
+        except json.JSONDecodeError:
+            value = {}
+        count = int(value.get("count") or 0) if value.get("date") == today else 0
+        if count >= daily_limit:
+            return False
+        state.seek(0)
+        state.truncate()
+        json.dump({"date": today, "count": count + 1}, state)
+        state.flush()
+    return True
+
+
+def _brave_api_search_urls(
+    query: str, source: str, *, page: int, results: int
+) -> list[str]:
+    api_key = os.environ.get("SAM_BRAVE_SEARCH_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Brave Search API key is not configured")
+    if not _paid_search_request_allowed():
+        raise RuntimeError("Paid search is disabled or its daily budget is exhausted")
+    domain = "vimeo.com" if source == "vimeo" else "dailymotion.com"
+    parameters = urllib.parse.urlencode(
+        {
+            "q": f"site:{domain} {_query_for_source(query, source)}",
+            # Brave's dedicated video index returns up to 50 results, versus
+            # 20 web results, and includes creator/duration video metadata.
+            "count": min(results, 50),
+            "offset": min(9, max(0, page - 1)),
+            "country": "US",
+            "search_lang": "en",
+            "safesearch": "moderate",
+        }
+    )
+    request = urllib.request.Request(
+        f"https://api.search.brave.com/res/v1/videos/search?{parameters}",
+        headers={
+            "Accept": "application/json",
+            "X-Subscription-Token": api_key,
+        },
+    )
+    _pace_external_search()
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.load(response)
+    # Accept the dedicated video response and the legacy mixed response so a
+    # rolling deployment remains backward compatible with recorded fixtures.
+    sections = [payload, payload.get("web") or {}, payload.get("videos") or {}]
+    return list(
+        dict.fromkeys(
+            str(item.get("url") or "")
+            for section in sections
+            for item in section.get("results") or []
+            if item.get("url")
+        )
+    )
+
+
+def _exa_search_urls(query: str, source: str, *, results: int) -> list[str]:
+    """Costed fallback used only when the primary Brave lane has no results."""
+    api_key = os.environ.get("SAM_EXA_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Exa API key is not configured")
+    if not _paid_search_request_allowed():
+        raise RuntimeError("Paid search is disabled or its daily budget is exhausted")
+    domain = "vimeo.com" if source == "vimeo" else "dailymotion.com"
+    body = json.dumps(
+        {
+            "query": _query_for_source(query, source),
+            "includeDomains": [domain],
+            "numResults": min(results, 100),
+            "type": "fast",
+            "moderation": True,
+        }
+    ).encode()
+    request = urllib.request.Request(
+        "https://api.exa.ai/search",
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+        },
+    )
+    _pace_external_search()
+    with urllib.request.urlopen(request, timeout=25) as response:
+        payload = json.load(response)
+    return list(
+        dict.fromkeys(
+            str(item.get("url") or "")
+            for item in payload.get("results") or []
+            if item.get("url")
+        )
+    )
+
+
+def _brave_html_search_urls(query: str, source: str, *, page: int) -> list[str]:
+    domain = "vimeo.com" if source == "vimeo" else "dailymotion.com"
+    parameters = urllib.parse.urlencode(
+        {
+            "q": f"site:{domain} {_query_for_source(query, source)}",
+            "source": "web",
+            "offset": max(0, page - 1),
+        }
+    )
+    request = urllib.request.Request(
+        f"https://search.brave.com/search?{parameters}",
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "Chrome/126 Safari/537.36"
+            )
+        },
+    )
+    opener = _url_opener(source, f"external-search:{source}:{query}:{page}")
+    with opener.open(request, timeout=25) as response:
+        document = html.unescape(response.read().decode("utf-8", "ignore")).replace(
+            r"\/", "/"
+        )
+    domain_pattern = r"vimeo\.com" if source == "vimeo" else r"dailymotion\.com"
+    return re.findall(
+        rf"https?://(?:www\.)?{domain_pattern}/[^\"<> ]+", document
+    )
+
+
+def _external_search_urls(
+    query: str, source: str, *, page: int, results: int
+) -> tuple[list[str], str]:
+    """Use indexed APIs first and retain a proxy-rotated no-key fallback."""
+    try:
+        urls = _brave_api_search_urls(query, source, page=page, results=results)
+        if urls:
+            return urls, "brave_api"
+    except Exception as error:
+        logger.debug("Brave API %s search failed: %s", source, _exception_text(error))
+    exa_percent = min(
+        100,
+        max(0, int(os.environ.get("SAM_EXA_FALLBACK_PERCENT", "5"))),
+    )
+    sample = int.from_bytes(
+        hashlib.sha256(f"{source}:{query}:{page}".encode()).digest()[:4], "big"
+    ) % 100
+    if sample < exa_percent:
+        try:
+            urls = _exa_search_urls(query, source, results=results)
+            if urls:
+                return urls, "exa_fallback"
+        except Exception as error:
+            logger.debug("Exa %s search failed: %s", source, _exception_text(error))
+    return _brave_html_search_urls(query, source, page=page), "brave_html_fallback"
+
+
+def _provider_video_ids(source: str, urls: list[str]) -> list[str]:
+    if source == "vimeo":
+        pattern = r"https?://(?:www\.)?vimeo\.com/(?:video/)?([0-9]{6,12})(?:[^0-9]|$)"
+    elif source == "dailymotion":
+        pattern = r"https?://(?:(?:www\.)?dailymotion\.com/video/|dai\.ly/)([a-zA-Z0-9]+)"
+    else:
+        raise ValueError(f"Unsupported external video provider: {source}")
+    return list(
+        dict.fromkeys(
+            match
+            for url in urls
+            for match in re.findall(pattern, url)
+        )
+    )
+
+
+def _vimeo_search_page(seed: int, query: str, *, pages: int = 10) -> int:
+    """Rotate through independent web-result pages for a Vimeo query."""
+    return random.Random(f"{seed}:{query}:vimeo-page").randrange(1, pages + 1)
+
+
+def _hydrate_vimeo_oembed(video_id: str) -> dict[str, Any]:
+    url = f"https://vimeo.com/{video_id}"
+    request = urllib.request.Request(
+        "https://vimeo.com/api/oembed.json?"
+        + urllib.parse.urlencode({"url": url}),
+        headers={"User-Agent": "sam-audio-dataset-builder/1.0"},
+    )
+    opener = _url_opener("vimeo", f"vimeo-oembed:{video_id}")
+    with opener.open(request, timeout=20) as response:
+        value = json.load(response)
+    return {
+        "id": str(value.get("video_id") or video_id),
+        "title": value.get("title"),
+        "duration": value.get("duration"),
+        "uploader": value.get("author_name"),
+        "uploader_id": value.get("author_url"),
+        "source_url": url,
+        "source_platform": "vimeo",
+    }
+
+
+def _search_vimeo(
+    query: str,
+    results: int,
+    profile: str,
+    *,
+    page: int = 1,
+    known_video_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Discover Vimeo videos without depending on YouTube's search extractor."""
+    limited_results = min(results, int(YTDLP_SEARCH_PROVIDERS["vimeo"]["max_results"]))
+    urls, backend = _external_search_urls(
+        query, "vimeo", page=page, results=limited_results
+    )
+    known = known_video_ids or set()
+    video_ids = [
+        video_id
+        for video_id in _provider_video_ids("vimeo", urls)
+        if video_id not in known
+    ][:limited_results]
+    if not video_ids:
+        return []
+    items: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(6, len(video_ids))) as executor:
+        pending = {
+            executor.submit(_hydrate_vimeo_oembed, video_id): video_id
+            for video_id in video_ids
+        }
+        for future in as_completed(pending):
+            try:
+                item = future.result()
+            except Exception:
+                logger.debug("Could not hydrate Vimeo result %s", pending[future])
+                continue
+            item["external_search_backend"] = backend
+            if _discovery_candidate_allowed(item, profile=profile, source="vimeo"):
+                items.append(item)
+    return items
+
+
 def _dailymotion_search_page(seed: int, query: str, *, pages: int = 10) -> int:
     """Spread repeated query combinations across Dailymotion result pages."""
     return random.Random(f"{seed}:{query}:dailymotion-page").randrange(1, pages + 1)
 
 
-def _dailymotion_deep_search_page(seed: int, query: str) -> int:
-    """Explore beyond the ten pages covered by the normal search lane."""
-    return random.Random(f"{seed}:{query}:dailymotion-deep-page").randrange(11, 51)
+def _dailymotion_deep_search_page(
+    seed: int, query: str, *, primary_page: int | None = None
+) -> int:
+    """Choose a second real result page; the API returns nothing after page 10."""
+    primary = primary_page or _dailymotion_search_page(seed, query)
+    secondary = random.Random(
+        f"{seed}:{query}:dailymotion-secondary-page"
+    ).randrange(1, 10)
+    return secondary + 1 if secondary >= primary else secondary
 
 
 def _dailymotion_has_high_quality_format(item: dict[str, Any]) -> bool:
@@ -965,6 +1336,76 @@ def _search_dailymotion(
     return items
 
 
+def _hydrate_dailymotion_video(video_id: str) -> dict[str, Any]:
+    fields = (
+        "id,title,description,duration,owner,owner.screenname,url,language,tags,"
+        "created_time,available_formats"
+    )
+    parameters = urllib.parse.urlencode({"fields": fields})
+    request = urllib.request.Request(
+        "https://api.dailymotion.com/video/"
+        f"{urllib.parse.quote(video_id)}?{parameters}",
+        headers={"User-Agent": "sam-audio-dataset-builder/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        value = json.load(response)
+    return {
+        **value,
+        "uploader": value.get("owner.screenname"),
+        "uploader_id": value.get("owner"),
+        "source_url": value.get("url")
+        or f"https://www.dailymotion.com/video/{video_id}",
+        "source_platform": "dailymotion",
+    }
+
+
+def _search_dailymotion_external(
+    query: str,
+    results: int,
+    profile: str,
+    *,
+    page: int = 1,
+    known_video_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Find Dailymotion sources beyond its native search result ceiling."""
+    limited_results = min(results, 20)
+    urls, backend = _external_search_urls(
+        query, "dailymotion", page=page, results=limited_results
+    )
+    known = known_video_ids or set()
+    video_ids = [
+        video_id
+        for video_id in _provider_video_ids("dailymotion", urls)
+        if video_id not in known
+    ][:limited_results]
+    if not video_ids:
+        return []
+    items: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(6, len(video_ids))) as executor:
+        pending = {
+            executor.submit(_hydrate_dailymotion_video, video_id): video_id
+            for video_id in video_ids
+        }
+        for future in as_completed(pending):
+            try:
+                item = future.result()
+            except Exception:
+                logger.debug(
+                    "Could not hydrate Dailymotion result %s", pending[future]
+                )
+                continue
+            item["external_search_backend"] = backend
+            if str(item.get("language") or "").lower() not in {"", "en"}:
+                continue
+            if not _dailymotion_has_high_quality_format(item):
+                continue
+            if _discovery_candidate_allowed(
+                item, profile=profile, source="dailymotion"
+            ):
+                items.append(item)
+    return items
+
+
 def _dailymotion_connection(
     path: str,
     *,
@@ -1010,6 +1451,7 @@ def _expand_dailymotion_seed(
     *,
     profile: str,
     results: int,
+    known_video_ids: set[str] | None = None,
 ) -> list[tuple[str, list[dict[str, Any]]]]:
     video_id = str(parent.get("video_id") or "").strip()
     uploader_id = str(
@@ -1029,6 +1471,9 @@ def _expand_dailymotion_seed(
             logger.debug("Could not resolve Dailymotion owner for %s", video_id)
     expanded: list[tuple[str, list[dict[str, Any]]]] = []
     if video_id:
+        related_page = random.Random(
+            f"{seed}:{video_id}:dailymotion-related"
+        ).randrange(1, 11)
         try:
             expanded.append(
                 (
@@ -1037,15 +1482,20 @@ def _expand_dailymotion_seed(
                         f"video/{urllib.parse.quote(video_id)}/related",
                         profile=profile,
                         results=max(results, 50),
+                        page=related_page,
                     ),
                 )
             )
         except Exception:
-            logger.debug("Could not expand Dailymotion related for %s", video_id)
+            logger.debug(
+                "Could not expand Dailymotion related for %s page %d",
+                video_id,
+                related_page,
+            )
     if uploader_id:
         page = random.Random(
             f"{seed}:{video_id}:{uploader_id}:dailymotion-channel"
-        ).randrange(1, 6)
+        ).randrange(1, 101)
         try:
             expanded.append(
                 (
@@ -1064,7 +1514,103 @@ def _expand_dailymotion_seed(
                 uploader_id,
                 page,
             )
-    return expanded
+    if known_video_ids is None:
+        return expanded
+    return [
+        (
+            strategy,
+            [
+                item
+                for item in items
+                if str(item.get("id") or "") not in known_video_ids
+            ],
+        )
+        for strategy, items in expanded
+        if any(
+            str(item.get("id") or "") not in known_video_ids for item in items
+        )
+    ]
+
+
+def _expand_vimeo_seed(
+    seed: int,
+    parent: dict[str, Any],
+    *,
+    profile: str,
+    results: int,
+    known_video_ids: set[str] | None = None,
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Traverse a proven Vimeo uploader instead of buying another web search."""
+    author_url = str(
+        parent.get("uploader_id") or parent.get("channel_id") or ""
+    ).strip()
+    parsed = urllib.parse.urlparse(author_url)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() not in {
+        "vimeo.com",
+        "www.vimeo.com",
+    }:
+        return []
+    path = parsed.path.rstrip("/")
+    if not path or path.strip("/").isdigit():
+        return []
+    channel_url = urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, f"{path}/videos", "", "", "")
+    )
+    page_size = min(max(1, results), 50)
+    generator = random.Random(f"{seed}:{channel_url}:vimeo-channel-page")
+    # Bias toward shallow pages because most useful Vimeo accounts are small,
+    # while still traversing up to 1,000 videos on productive large accounts.
+    page = 1 + int((generator.random() ** 2) * 20)
+    start = (page - 1) * page_size + 1
+    response = _run_search_command(
+        [
+            YTDLP_PYTHON,
+            "-m",
+            "yt_dlp",
+            "--no-update",
+            "--quiet",
+            "--no-warnings",
+            "--flat-playlist",
+            "--playlist-start",
+            str(start),
+            "--playlist-end",
+            str(start + page_size - 1),
+            *_yt_dlp_proxy_args("vimeo", f"vimeo-channel:{channel_url}:{page}"),
+            "--dump-single-json",
+            channel_url,
+        ],
+        timeout=75,
+    )
+    payload = json.loads(response.stdout)
+    known = known_video_ids or set()
+    video_ids = list(
+        dict.fromkeys(
+            str(item.get("id") or "").strip()
+            for item in payload.get("entries") or []
+            if str(item.get("id") or "").strip().isdigit()
+            and str(item.get("id") or "").strip() not in known
+        )
+    )
+    if not video_ids:
+        return []
+    items: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(8, len(video_ids))) as executor:
+        pending = {
+            executor.submit(_hydrate_vimeo_oembed, video_id): video_id
+            for video_id in video_ids
+        }
+        for future in as_completed(pending):
+            try:
+                item = future.result()
+            except Exception:
+                logger.debug(
+                    "Could not hydrate Vimeo channel result %s", pending[future]
+                )
+                continue
+            item["channel_id"] = author_url
+            if _discovery_candidate_allowed(item, profile=profile, source="vimeo"):
+                items.append(item)
+    return [("accepted_channel_v1", items)] if items else []
 
 
 def _expand_bilibili_seed(
@@ -1126,9 +1672,18 @@ def _search(
     source: str = "youtube",
     *,
     search_page: int = 1,
+    known_video_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     if source == "dailymotion":
         return _search_dailymotion(query, results, profile, page=search_page)
+    if source == "vimeo":
+        return _search_vimeo(
+            query,
+            results,
+            profile,
+            page=search_page,
+            known_video_ids=known_video_ids,
+        )
     if source == "youtube":
         return _search_youtube(query, results, profile)
     return _search_ytdlp_provider(query, results, profile, source)
@@ -1172,6 +1727,10 @@ def _sample_clip_starts(
     return sorted(starts)
 
 
+class DiscoveryCandidatesExhausted(RuntimeError):
+    """The search completed successfully but produced too few usable candidates."""
+
+
 def discover_candidates(
     output_dir: Path,
     *,
@@ -1186,6 +1745,7 @@ def discover_candidates(
     max_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
     source: str = "youtube",
     expansion_seeds: list[dict[str, Any]] | None = None,
+    known_video_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     metadata_dir = output_dir / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -1224,6 +1784,10 @@ def discover_candidates(
                 item
                 for item in existing
                 if _discovery_candidate_allowed(item, profile=profile, source=source)
+                and (
+                    known_video_ids is None
+                    or str(item.get("video_id") or "") not in known_video_ids
+                )
             ]
             if len(filtered) >= minimum_candidates:
                 if len(filtered) != len(existing):
@@ -1246,11 +1810,14 @@ def discover_candidates(
     discoveries: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         pending: dict[Future[Any], dict[str, Any]] = {}
-        for spec in query_specs:
+        for spec_index, spec in enumerate(query_specs):
             query = spec["query"]
-            page = (
-                _dailymotion_search_page(seed, query) if source == "dailymotion" else 1
-            )
+            if source == "dailymotion":
+                page = _dailymotion_search_page(seed, query)
+            elif source == "vimeo":
+                page = _vimeo_search_page(seed, query)
+            else:
+                page = 1
             future = executor.submit(
                 _search,
                 query,
@@ -1258,6 +1825,7 @@ def discover_candidates(
                 profile,
                 source,
                 search_page=page,
+                known_video_ids=known_video_ids,
             )
             pending[future] = {
                 "kind": "search",
@@ -1271,7 +1839,9 @@ def discover_candidates(
                 "page": page,
             }
             if source == "dailymotion":
-                deep_page = _dailymotion_deep_search_page(seed, query)
+                deep_page = _dailymotion_deep_search_page(
+                    seed, query, primary_page=page
+                )
                 future = executor.submit(
                     _search,
                     query,
@@ -1279,6 +1849,7 @@ def discover_candidates(
                     profile,
                     source,
                     search_page=deep_page,
+                    known_video_ids=known_video_ids,
                 )
                 pending[future] = {
                     "kind": "search",
@@ -1287,7 +1858,58 @@ def discover_candidates(
                     "strategy": "deep_page_v1",
                     "page": deep_page,
                 }
-        productive_seeds = (expansion_seeds or [])[:DISCOVERY_EXPANSION_SEEDS_PER_BATCH]
+                if spec_index < DISCOVERY_EXTERNAL_QUERIES_PER_BATCH:
+                    future = executor.submit(
+                        _search_dailymotion_external,
+                        query,
+                        results_per_query,
+                        profile,
+                        page=page,
+                        known_video_ids=known_video_ids,
+                    )
+                    pending[future] = {
+                        "kind": "search",
+                        "query": query,
+                        "family": spec["family"],
+                        "strategy": "query_external_v1",
+                        "page": page,
+                    }
+            elif source == "vimeo":
+                secondary_page = page % 10 + 1
+                future = executor.submit(
+                    _search,
+                    query,
+                    results_per_query,
+                    profile,
+                    source,
+                    search_page=secondary_page,
+                    known_video_ids=known_video_ids,
+                )
+                pending[future] = {
+                    "kind": "search",
+                    "query": query,
+                    "family": spec["family"],
+                    "strategy": "query_paged_v1",
+                    "page": secondary_page,
+                }
+        expansion_pool_limit = (
+            256 if source == "vimeo" else DISCOVERY_EXPANSION_SEEDS_PER_BATCH
+        )
+        productive_seeds = (expansion_seeds or [])[:expansion_pool_limit]
+        if source == "vimeo":
+            unique_channels: list[dict[str, Any]] = []
+            seen_channels: set[str] = set()
+            for parent in productive_seeds:
+                channel = str(
+                    parent.get("uploader_id") or parent.get("channel_id") or ""
+                ).strip()
+                if not channel or channel in seen_channels:
+                    continue
+                seen_channels.add(channel)
+                unique_channels.append(parent)
+                if len(unique_channels) >= 8:
+                    break
+            productive_seeds = unique_channels
         for parent in productive_seeds:
             if source == "dailymotion":
                 future = executor.submit(
@@ -1296,6 +1918,7 @@ def discover_candidates(
                     parent,
                     profile=profile,
                     results=results_per_query,
+                    known_video_ids=known_video_ids,
                 )
             elif source == "bilibili":
                 future = executor.submit(
@@ -1303,6 +1926,15 @@ def discover_candidates(
                     parent,
                     profile=profile,
                     results=results_per_query,
+                )
+            elif source == "vimeo":
+                future = executor.submit(
+                    _expand_vimeo_seed,
+                    seed,
+                    parent,
+                    profile=profile,
+                    results=results_per_query,
+                    known_video_ids=known_video_ids,
                 )
             else:
                 continue
@@ -1353,8 +1985,10 @@ def discover_candidates(
         "accepted_channel_v1": 0,
         "accepted_related_v1": 1,
         "query_expanded_v2": 2,
-        "deep_page_v1": 3,
-        "query_v1": 4,
+        "query_external_v1": 3,
+        "query_paged_v1": 4,
+        "deep_page_v1": 5,
+        "query_v1": 6,
     }
     discoveries.sort(
         key=lambda value: (
@@ -1367,6 +2001,8 @@ def discover_candidates(
     for discovery in discoveries:
         item = discovery["item"]
         video_id = str(item["id"])
+        if known_video_ids is not None and video_id in known_video_ids:
+            continue
         if video_id in found_videos:
             continue
         found_videos.add(video_id)
@@ -1432,6 +2068,7 @@ def discover_candidates(
                 "discovery_page": discovery.get("page"),
                 "discovery_parent_video_id": discovery.get("parent_video_id"),
                 "discovery_parent_uploader": discovery.get("parent_uploader"),
+                "discovery_search_backend": item.get("external_search_backend"),
                 "clip_start_seconds": round(start, 3),
                 "clip_end_seconds": round(start + CLIP_SECONDS, 3),
                 "segment_index": segment_index,
@@ -1479,8 +2116,10 @@ def discover_candidates(
         )
         + "\n"
     )
-    if len(candidates) < minimum_candidates:
-        raise RuntimeError(
+    if len(candidates) < minimum_candidates and not (
+        discoveries and known_video_ids is not None
+    ):
+        raise DiscoveryCandidatesExhausted(
             f"Only discovered {len(candidates)} candidates; "
             f"need at least {minimum_candidates}"
         )
@@ -2823,6 +3462,7 @@ def acquire_scanned_source_group(
     proxy_asr_timeout_seconds: float = 120.0,
     defer_claim_commit: bool = False,
     youtube_proxy_attempt: int = 0,
+    local_source: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Serialize scan/claim mutations for one source across producer processes."""
     lock_path = _scan_cache_path(cache_dir, candidates[0]).with_suffix(".lock")
@@ -2844,6 +3484,7 @@ def acquire_scanned_source_group(
             proxy_asr_timeout_seconds=proxy_asr_timeout_seconds,
             defer_claim_commit=defer_claim_commit,
             youtube_proxy_attempt=youtube_proxy_attempt,
+            local_source=local_source,
         )
 
 
@@ -2860,6 +3501,7 @@ def _acquire_scanned_source_group_locked(
     proxy_asr_timeout_seconds: float = 120.0,
     defer_claim_commit: bool = False,
     youtube_proxy_attempt: int = 0,
+    local_source: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Scan one full source first, then extract only passing stereo regions."""
     from .source_scanner import (
@@ -3105,9 +3747,17 @@ def _acquire_scanned_source_group_locked(
                     passing_regions=len(cached.get("regions", [])),
                     rejection_reasons=cached.get("rejection_reasons", []),
                 )
+            using_retained_source = bool(
+                local_source is not None and local_source.is_file()
+            )
             extraction_download_started = time.perf_counter()
-            selected_sections = _download_scanned_sections(
-                retrieval_base, available, root
+            selected_sections = (
+                {
+                    float(region["start_seconds"]): (local_source, {})
+                    for region in available
+                }
+                if using_retained_source
+                else _download_scanned_sections(retrieval_base, available, root)
             )
             extraction_download_seconds = (
                 time.perf_counter() - extraction_download_started
@@ -3136,6 +3786,11 @@ def _acquire_scanned_source_group_locked(
                         "extraction_download_seconds": round(
                             extraction_download_seconds, 3
                         ),
+                        "extraction_source": (
+                            "retained_full_source"
+                            if using_retained_source
+                            else "provider_sections"
+                        ),
                     },
                 }
                 try:
@@ -3149,7 +3804,9 @@ def _acquire_scanned_source_group_locked(
                             output_dir,
                             root,
                             started=started,
-                            source_start_seconds=None,
+                            source_start_seconds=(
+                                0.0 if using_retained_source else None
+                            ),
                             media_task="extract",
                         )
                     )

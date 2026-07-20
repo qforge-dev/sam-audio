@@ -249,6 +249,9 @@ class DownloadSettings:
     circuit_cooldown_seconds: float = 300.0
     circuit_max_cooldown_seconds: float = 3600.0
     provider_weights: dict[str, float] | None = None
+    provider_max_active: dict[str, int] | None = None
+    provider_min_claim_interval_seconds: dict[str, float] | None = None
+    provider_circuit_failure_thresholds: dict[str, int] | None = None
     control_file: Path | None = None
 
 
@@ -451,7 +454,16 @@ def discover_into_frontier_once(
         if settings.catalog
         else {}
     )
-    expansion_seeds = _productive_expansion_seeds(guidance, seed=seed)
+    expansion_limit = (
+        256
+        if settings.source == "vimeo"
+        else youtube_random.DISCOVERY_EXPANSION_SEEDS_PER_BATCH
+    )
+    expansion_seeds = _productive_expansion_seeds(
+        guidance,
+        seed=seed,
+        limit=expansion_limit,
+    )
     cache_adoption = {"promoted": 0, "rejected": 0, "completed": 0}
     if settings.scan_cache is not None:
         cache_adoption = adopt_cached_scans(
@@ -490,6 +502,12 @@ def discover_into_frontier_once(
             "cache_adoption": cache_adoption,
             "duration_seconds": round(time.perf_counter() - started, 3),
         }
+    known_video_ids = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT video_id FROM source_jobs WHERE platform=?", (settings.source,)
+        )
+    }
     batch_dir = settings.discovery_dir / f"batch-{seed}"
     minimum_candidates = min(
         settings.minimum_candidates,
@@ -498,20 +516,29 @@ def discover_into_frontier_once(
     previous_clip_seconds = youtube_random.CLIP_SECONDS
     try:
         youtube_random.CLIP_SECONDS = settings.clip_seconds
-        candidates = discover_candidates(
-            batch_dir,
-            seed=seed,
-            query_count=settings.query_count,
-            results_per_query=settings.results_per_query,
-            workers=settings.search_workers,
-            minimum_candidates=minimum_candidates,
-            profile=settings.profile,
-            clips_per_video=settings.clips_per_video,
-            source_content_minutes_per_hour=settings.source_content_minutes_per_hour,
-            max_clips_per_video=settings.max_clips_per_video,
-            source=settings.source,
-            expansion_seeds=expansion_seeds,
-        )
+        try:
+            candidates = discover_candidates(
+                batch_dir,
+                seed=seed,
+                query_count=settings.query_count,
+                results_per_query=settings.results_per_query,
+                workers=settings.search_workers,
+                minimum_candidates=minimum_candidates,
+                profile=settings.profile,
+                clips_per_video=settings.clips_per_video,
+                source_content_minutes_per_hour=(
+                    settings.source_content_minutes_per_hour
+                ),
+                max_clips_per_video=settings.max_clips_per_video,
+                source=settings.source,
+                expansion_seeds=expansion_seeds,
+                known_video_ids=known_video_ids,
+            )
+        except youtube_random.DiscoveryCandidatesExhausted:
+            # An exhausted page is a successful, empty discovery batch rather
+            # than a crashed provider. Advancing the deterministic seed avoids
+            # systemd restart churn and retrying the same empty page forever.
+            candidates = []
     finally:
         youtube_random.CLIP_SECONDS = previous_clip_seconds
     groups = _group_candidates_by_video(candidates, grouped=True)
@@ -563,7 +590,7 @@ def discover_into_frontier_once(
     connection.close()
     result = {
         "seed": seed,
-        "status": "completed",
+        "status": "completed" if candidates else "exhausted",
         "candidate_count": len(candidates),
         "minimum_candidates": minimum_candidates,
         "unique_source_count": len(groups),
@@ -605,6 +632,10 @@ def run_discovery(args: argparse.Namespace) -> None:
         cached_scan_high_water=args.cached_scan_high_water,
     )
     seed_file = args.seed_file or args.workspace / "source-discovery-next-seed"
+    status_file = (
+        getattr(args, "status_file", None)
+        or args.workspace / "source-discovery-status.json"
+    )
     seed = _read_seed(seed_file, args.seed)
     _heartbeat(
         args.workspace,
@@ -625,7 +656,7 @@ def run_discovery(args: argparse.Namespace) -> None:
                 "error": f"{type(error).__name__}: {error}",
             }
             _atomic_json(
-                args.workspace / "source-discovery-status.json",
+                status_file,
                 {**result, "observed_at": time.time()},
             )
             logger.exception(
@@ -640,7 +671,7 @@ def run_discovery(args: argparse.Namespace) -> None:
             time.sleep(args.retry_seconds)
             continue
         _atomic_json(
-            args.workspace / "source-discovery-status.json",
+            status_file,
             {**result, "observed_at": time.time()},
         )
         _heartbeat(
@@ -663,7 +694,7 @@ def run_discovery(args: argparse.Namespace) -> None:
             result["frontier"],
             result["duration_seconds"],
         )
-        if result["status"] == "completed":
+        if result["status"] in {"completed", "exhausted"}:
             seed += 1
             _write_seed(seed_file, seed)
         if args.once:
@@ -772,16 +803,26 @@ def download_source_once(
         lease_seconds=settings.lease_seconds,
         respect_provider_circuits=True,
         provider_weights=settings.provider_weights,
+        provider_max_active=settings.provider_max_active,
+        provider_min_claim_interval_seconds=(
+            settings.provider_min_claim_interval_seconds
+        ),
     )
     if job is None:
         connection.close()
         return None
     base = job["candidates"][0]
     source_platform = str(base.get("source_platform") or "unknown")
+    try:
+        proxy_slot = int(worker.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        proxy_slot = None
     retrieval_base = {
         **base,
         "_youtube_proxy_attempt": max(0, int(job["stage_attempts"]) - 1),
     }
+    if proxy_slot is not None:
+        retrieval_base["_proxy_slot"] = proxy_slot
     target_dir = settings.source_cache / _source_cache_key(job["source_key"])
     settings.source_cache.mkdir(parents=True, exist_ok=True)
     staging: Path | None = None
@@ -906,17 +947,21 @@ def download_source_once(
             connection.close()
             return result
         message = _called_process_error_text(error)
+        youtube_random.quarantine_proxy_for_error(source_platform, message)
     except Exception as error:
         message = f"{type(error).__name__}: {error}"
     finally:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
     attempt = int(job["stage_attempts"])
+    failure_threshold = (settings.provider_circuit_failure_thresholds or {}).get(
+        source_platform, settings.circuit_failure_threshold
+    )
     circuit = provider_circuit_record_failure(
         connection,
         source_platform,
         message,
-        failure_threshold=settings.circuit_failure_threshold,
+        failure_threshold=failure_threshold,
         cooldown_seconds=settings.circuit_cooldown_seconds,
         max_cooldown_seconds=settings.circuit_max_cooldown_seconds,
     )
@@ -1007,6 +1052,13 @@ def run_downloaders(args: argparse.Namespace) -> None:
         circuit_cooldown_seconds=args.circuit_cooldown_seconds,
         circuit_max_cooldown_seconds=args.circuit_max_cooldown_seconds,
         provider_weights=args.provider_weights,
+        provider_max_active=args.provider_max_active,
+        provider_min_claim_interval_seconds=(
+            args.provider_min_claim_interval_seconds
+        ),
+        provider_circuit_failure_thresholds=(
+            args.provider_circuit_failure_thresholds
+        ),
         control_file=args.control_file,
     )
     threads = [
@@ -1090,6 +1142,7 @@ def scan_source_once(
     cache_path = _scan_cache_path(settings.scan_cache, base)
     settings.scan_cache.mkdir(parents=True, exist_ok=True)
     completed = False
+    retained_for_extraction = False
     try:
         cached = load_cached_scan(cache_path, clip_seconds=settings.clip_seconds)
         proxy: Path | None = None
@@ -1101,7 +1154,9 @@ def scan_source_once(
             proxy_started = time.perf_counter()
             scanner.create_proxy(source, proxy)
             proxy_seconds = time.perf_counter() - proxy_started
+            stereo_started = time.perf_counter()
             stereo_metrics = scanner.stereo_metrics(proxy)
+            stereo_metrics_seconds = time.perf_counter() - stereo_started
             common = {
                 "policy": SCAN_POLICY_VERSION,
                 "clip_seconds": settings.clip_seconds,
@@ -1116,6 +1171,7 @@ def scan_source_once(
                 "source_stereo_metrics": stereo_metrics,
                 "download_seconds": download.get("download_seconds"),
                 "proxy_seconds": round(proxy_seconds, 3),
+                "stereo_metrics_seconds": round(stereo_metrics_seconds, 3),
                 "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "claimed_starts": [],
             }
@@ -1232,7 +1288,9 @@ def scan_source_once(
                 "passing_regions": len(regions),
                 "m2d_windows": cached.get("m2d_windows"),
                 "scan_seconds": cached.get("scan_seconds"),
+                "inference_wait_seconds": cached.get("inference_wait_seconds"),
                 "proxy_seconds": cached.get("proxy_seconds"),
+                "stereo_metrics_seconds": cached.get("stereo_metrics_seconds"),
                 "proxy_asr_accepted": (cached.get("proxy_asr") or {}).get("accepted"),
             }
             finish_source(
@@ -1245,9 +1303,16 @@ def scan_source_once(
                 details=summary,
             )
             result = {"status": "scanned", "source_key": job["source_key"], **summary}
+            # The full-quality source is already present on the shared media
+            # volume. Retain it until extraction is terminal so selected clips
+            # do not need a second provider/CDN transfer.
+            retained_for_extraction = True
         completed = True
         connection.close()
-        shutil.rmtree(work_dir, ignore_errors=True)
+        if proxy is not None:
+            proxy.unlink(missing_ok=True)
+        if not retained_for_extraction:
+            shutil.rmtree(work_dir, ignore_errors=True)
         return result
     except Exception as error:
         message = f"{type(error).__name__}: {error}"
@@ -1264,9 +1329,11 @@ def scan_source_once(
             max_attempts=settings.max_attempts,
         )
         connection.close()
+        if state == "rejected":
+            shutil.rmtree(work_dir, ignore_errors=True)
         return {"status": state, "error": message, "source_key": job["source_key"]}
     finally:
-        if completed:
+        if completed and not retained_for_extraction:
             # The compatible scan cache is now the durable source artifact.
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1331,6 +1398,11 @@ def run_scanners(args: argparse.Namespace) -> None:
         device=args.device,
         batch_size=args.batch_size,
         inference_concurrency=args.inference_concurrency,
+        target_scan_windows=args.target_scan_windows,
+        max_window_hop_seconds=args.max_window_hop_seconds,
+        long_source_inference_concurrency=(
+            args.long_source_inference_concurrency
+        ),
     )
     settings = ScanSettings(
         workspace=args.workspace,
@@ -1495,6 +1567,7 @@ def extract_source_once(
         connection.close()
         return None
     group = job["candidates"]
+    retained_source = Path(str(job.get("downloaded_path") or ""))
     source_platform = str(group[0].get("source_platform") or "youtube")
     guidance = load_catalog_source_guidance(settings.catalog, platform=source_platform)
     try:
@@ -1510,6 +1583,7 @@ def extract_source_once(
             proxy_asr_timeout_seconds=settings.proxy_asr_timeout_seconds,
             defer_claim_commit=True,
             youtube_proxy_attempt=max(0, int(job["stage_attempts"]) - 1),
+            local_source=(retained_source if retained_source.is_file() else None),
         )
         statuses = {str(item.get("retrieval_status")) for item in results}
         if not results or "source_scan_unavailable" in statuses:
@@ -1550,6 +1624,8 @@ def extract_source_once(
             },
         )
         connection.close()
+        if next_state == "complete" and retained_source.is_file():
+            shutil.rmtree(retained_source.parent, ignore_errors=True)
         return {
             "status": next_state,
             "source_key": job["source_key"],
@@ -1571,6 +1647,8 @@ def extract_source_once(
             max_attempts=settings.max_attempts,
         )
         connection.close()
+        if state == "rejected" and retained_source.is_file():
+            shutil.rmtree(retained_source.parent, ignore_errors=True)
         return {"status": state, "error": message, "source_key": job["source_key"]}
 
 
@@ -1819,6 +1897,28 @@ def _provider_weights(value: str) -> dict[str, float]:
     return weights
 
 
+def _provider_positive_ints(value: str) -> dict[str, int]:
+    """Parse provider=integer controls such as concurrency caps."""
+    limits: dict[str, int] = {}
+    if not value.strip():
+        return limits
+    for item in value.split(","):
+        try:
+            platform, raw_limit = item.split("=", 1)
+            limit = int(raw_limit)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                "provider limits must use platform=positive_integer"
+            ) from error
+        platform = platform.strip()
+        if not platform or limit < 1:
+            raise argparse.ArgumentTypeError(
+                "provider limits must use platform=positive_integer"
+            )
+        limits[platform] = limit
+    return limits
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1828,6 +1928,7 @@ def main() -> None:
     discover.add_argument("--discovery-dir", type=Path, required=True)
     discover.add_argument("--catalog", type=Path)
     discover.add_argument("--seed-file", type=Path)
+    discover.add_argument("--status-file", type=Path)
     discover.add_argument("--seed", type=int, default=20260714)
     discover.add_argument(
         "--source",
@@ -1866,7 +1967,10 @@ def main() -> None:
         "--minimum-free-bytes",
         type=int,
         default=0,
-        help="Stop claiming new transfers when source storage reaches this free-space floor",
+        help=(
+            "Stop claiming new transfers when source storage reaches this "
+            "free-space floor"
+        ),
     )
     download.add_argument("--lease-seconds", type=float, default=7200)
     download.add_argument("--max-attempts", type=_positive_int, default=4)
@@ -1879,6 +1983,24 @@ def main() -> None:
         type=_provider_weights,
         default={},
         help="Comma-separated provider=weight concurrency shares",
+    )
+    download.add_argument(
+        "--provider-max-active",
+        type=_provider_positive_ints,
+        default={},
+        help="Comma-separated provider=maximum_active_transfer hard caps",
+    )
+    download.add_argument(
+        "--provider-min-claim-interval-seconds",
+        type=_provider_weights,
+        default={},
+        help="Comma-separated provider=seconds global admission rate limits",
+    )
+    download.add_argument(
+        "--provider-circuit-failure-thresholds",
+        type=_provider_positive_ints,
+        default={},
+        help="Comma-separated provider=failure_count circuit overrides",
     )
     download.add_argument("--poll-seconds", type=float, default=1)
     download.add_argument("--clip-seconds", type=float, default=30)
@@ -1909,6 +2031,13 @@ def main() -> None:
     scan.add_argument("--device", default="cuda")
     scan.add_argument("--batch-size", type=_positive_int, default=128)
     scan.add_argument("--inference-concurrency", type=_positive_int, default=2)
+    scan.add_argument(
+        "--target-scan-windows", type=_positive_int, default=3_600
+    )
+    scan.add_argument("--max-window-hop-seconds", type=float, default=5.0)
+    scan.add_argument(
+        "--long-source-inference-concurrency", type=_positive_int, default=2
+    )
     scan.add_argument("--control-file", type=Path)
 
     extract = commands.add_parser("extract")

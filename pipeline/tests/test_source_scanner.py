@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -79,6 +80,19 @@ def test_source_scan_selects_ranked_non_overlapping_regions() -> None:
     assert all("windows" not in item["evidence"] for item in regions)
 
 
+def test_source_scan_selects_regions_from_sparse_long_source_windows() -> None:
+    regions = select_candidate_regions(
+        _passing_probabilities(13),
+        _labels(),
+        _families(),
+        clip_seconds=30,
+        max_regions=10,
+        window_hop_seconds=5,
+    )
+
+    assert [item["start_seconds"] for item in regions] == [0.0, 30.0]
+
+
 def test_source_scan_rejects_vocal_music_regions() -> None:
     probabilities = _passing_probabilities(59)
     probabilities[:, 3] = 0.30
@@ -92,6 +106,43 @@ def test_source_scan_rejects_vocal_music_regions() -> None:
     )
 
     assert regions == []
+
+
+def test_source_scan_reports_inference_slot_wait() -> None:
+    scanner = object.__new__(M2DSourceScanner)
+    scanner.labels = _labels()
+    scanner.families = _families()
+    scanner.sample_rate = 16_000
+    scanner.inference_concurrency = 4
+    scanner._inference_slots = threading.BoundedSemaphore(4)
+    scanner.target_scan_windows = 3_600
+    scanner.long_source_inference_concurrency = 2
+    scanner._long_source_inference_slots = threading.BoundedSemaphore(2)
+    scanner._proxy_window_hop_seconds = lambda _proxy: 1.0
+    scanner._probabilities = lambda _proxy, **_kwargs: (
+        _passing_probabilities(29),
+        29,
+        1.25,
+        1.0,
+    )
+
+    result = scanner.scan(None, clip_seconds=30, max_regions=1)
+
+    assert result["m2d_inference_concurrency"] == 4
+    assert result["inference_wait_seconds"] >= 0
+    assert result["scan_seconds"] == 1.25
+
+
+def test_source_scan_adapts_window_hop_for_very_long_sources() -> None:
+    scanner = object.__new__(M2DSourceScanner)
+    scanner.sample_rate = 16_000
+    scanner.target_scan_windows = 3_600
+    scanner.max_window_hop_seconds = 5.0
+
+    assert scanner._window_hop_seconds(60 * 60 * 16_000) == 1.0
+    assert scanner._window_hop_seconds(2 * 60 * 60 * 16_000) == 2.0
+    assert scanner._window_hop_seconds(5 * 60 * 60 * 16_000) == 5.0
+    assert scanner._window_hop_seconds(12 * 60 * 60 * 16_000) == 5.0
 
 
 def test_region_confidence_gate_requires_measured_foreground_speech_margin() -> None:

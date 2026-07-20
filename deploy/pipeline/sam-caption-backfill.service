@@ -1,0 +1,19 @@
+[Unit]
+Description=Immutable scene-caption v4 snapshot backfill
+After=network-online.target audio-flamingo-next-secondary.service
+Wants=network-online.target audio-flamingo-next-secondary.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
+Environment=PYTHONPATH=/home/ubuntu/sam-audio-deploy/pipeline/src
+Environment=AWS_REGION=us-east-1
+Environment=AWS_DEFAULT_REGION=us-east-1
+ExecStart=/home/ubuntu/sam-audio-deploy/pipeline/.venv/bin/python -m sam_audio_pipeline.caption_backfill --workspace /home/ubuntu/dialogue-background-training-v1 run --api-url http://127.0.0.1:8003 --workers 16 --extra-api-url http://127.0.0.1:8001 --extra-workers 8 --bucket sam-audio-pipeline-artifactbucket-ndb3jfc3asyk --prefix dialogue-background-training-v4 --upload-workers 16
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -36,7 +36,7 @@
     .reviewer-pill { color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 8px 11px; }
     .reviewer-pill strong { color: var(--blue); }
     .quiet-btn { color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 9px; padding: 8px 11px; text-decoration: none; }
-    .layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); min-height: 0; }
+    .layout { display: block; min-height: 0; }
     aside { border-right: 1px solid var(--line); background: #0e151d; min-height: calc(100vh - 72px); display: flex; flex-direction: column; }
     .filters { padding: 14px; border-bottom: 1px solid var(--line); }
     .filter-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -99,14 +99,12 @@
     .modal-card { width: min(440px, 100%); padding: 25px; border-radius: 16px; border: 1px solid var(--line); background: var(--panel); box-shadow: 0 25px 80px rgba(0,0,0,.45); }
     .modal-card h3 { margin: 0 0 7px; font-size: 22px; }
     .modal-card p { margin: 0 0 17px; color: var(--muted); }
+    .modal-card .identity-error { margin: 10px 0 0; color: var(--red); font-size: 12px; }
     .modal-card input { width: 100%; padding: 11px 12px; border-radius: 9px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
     .modal-card button { width: 100%; margin-top: 12px; padding: 11px; border: 0; border-radius: 9px; background: var(--blue); color: #061522; font-weight: 850; }
     .empty { color: var(--muted); padding: 25px; text-align: center; }
     @media (max-width: 800px) {
       header { flex-wrap: wrap; }
-      .layout { grid-template-columns: 1fr; }
-      aside { min-height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
-      .clip-list { max-height: 210px; }
       .decision-grid, .reason-grid { grid-template-columns: 1fr; }
       main { padding: 22px 16px 40px; }
     }
@@ -122,28 +120,13 @@
       </div>
       <div class="header-actions">
         <a class="quiet-btn" id="progressLink" href="/progress">Pipeline progress</a>
+        <a class="quiet-btn" id="trainingLink" href="/training">Training snapshots</a>
         <span class="reviewer-pill" id="activeReviewers"></span>
         <button class="reviewer-pill" id="reviewerButton">Reviewer: <strong id="reviewerName"></strong></button>
         <a class="quiet-btn" id="exportLink" href="/api/export.csv">Export CSV</a>
       </div>
     </header>
     <div class="layout">
-      <aside>
-        <div class="filters">
-          <input id="search" type="search" placeholder="Search clips or titles">
-          <div class="filter-row">
-            <select id="statusFilter">
-              <option value="all">All decisions</option>
-              <option value="unreviewed">Unreviewed</option>
-              <option value="good">Good</option>
-              <option value="perfect">Perfect</option>
-              <option value="not_ok">Not OK</option>
-            </select>
-            <select id="bucketFilter"><option value="all">All backgrounds</option></select>
-          </div>
-        </div>
-        <div id="clipList" class="clip-list"></div>
-      </aside>
       <main>
         <div class="review-card">
           <div class="eyebrow" id="counter">Clip</div>
@@ -190,11 +173,12 @@
       <h3>Who is reviewing?</h3>
       <p>Each browser gets a separate random queue, so you and your friend never receive the same live clip.</p>
       <input id="identityName" maxlength="80" placeholder="Your name" autocomplete="nickname">
+      <p class="identity-error" id="identityError" hidden></p>
       <button id="identitySave">Start reviewing</button>
     </div>
   </div>
   <script>
-    const app = { state: null, filtered: [], current: null, identity: null };
+    const app = { state: null, current: null, identity: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
     const pct = value => value == null ? '—' : `${Math.round(value * 100)}%`;
@@ -205,6 +189,14 @@
     const api = path => `${BASE}${path}`;
     const identityBody = () => ({reviewer_id: app.identity.id, reviewer_name: app.identity.name});
     const isMine = clip => clip?.claim?.reviewer_id === app.identity?.id;
+    const createReviewerId = () => {
+      if (typeof globalThis.crypto?.randomUUID === 'function') return crypto.randomUUID();
+      if (typeof globalThis.crypto?.getRandomValues === 'function') {
+        const bytes = crypto.getRandomValues(new Uint8Array(16));
+        return `reviewer-${[...bytes].map(value => value.toString(16).padStart(2, '0')).join('')}`;
+      }
+      return `reviewer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    };
 
     async function fetchJson(path, options = {}) {
       const response = await fetch(api(path), options);
@@ -227,17 +219,24 @@
     function requestIdentity(forceNew = false) {
       return new Promise(resolve => {
         $('identityModal').classList.add('open');
+        $('identityError').hidden = true;
+        $('identityError').textContent = '';
         $('identityName').value = forceNew ? '' : (storedIdentity()?.name || '');
         $('identityName').focus();
         const saveIdentity = () => {
           const name = $('identityName').value.trim();
           if (!name) return;
-          const previous = forceNew ? null : storedIdentity();
-          app.identity = {id: previous?.id || crypto.randomUUID(), name};
-          localStorage.setItem('sam-reviewer', JSON.stringify(app.identity));
-          $('identityModal').classList.remove('open');
-          $('reviewerName').textContent = name;
-          resolve(app.identity);
+          try {
+            const previous = forceNew ? null : storedIdentity();
+            app.identity = {id: previous?.id || createReviewerId(), name};
+            localStorage.setItem('sam-reviewer', JSON.stringify(app.identity));
+            $('identityModal').classList.remove('open');
+            $('reviewerName').textContent = name;
+            resolve(app.identity);
+          } catch (error) {
+            $('identityError').textContent = `Could not save reviewer: ${error.message || error}`;
+            $('identityError').hidden = false;
+          }
         };
         $('identitySave').onclick = saveIdentity;
         $('identityName').onkeydown = event => { if (event.key === 'Enter') saveIdentity(); };
@@ -250,41 +249,31 @@
       $('reviewerName').textContent = app.identity.name;
       $('exportLink').href = api('/api/export.csv');
       $('progressLink').href = api('/progress');
+      $('trainingLink').href = api('/training');
       await refreshState();
       $('datasetName').textContent = `${app.state.dataset.name} · ${app.state.summary.total} clips`;
       Object.entries(app.state.reason_labels).forEach(([key, label], index) => {
         const shortcut = index === 9 ? '0' : String(index + 1);
         $('reasonGrid').insertAdjacentHTML('beforeend', `<label class="reason"><input type="checkbox" value="${key}"><span>${esc(label)}</span><kbd>${shortcut}</kbd></label>`);
       });
-      $('search').addEventListener('input', applyFilters);
-      $('statusFilter').addEventListener('change', applyFilters);
-      $('bucketFilter').addEventListener('change', applyFilters);
       bindActions();
-      applyFilters();
       const routePrefix = `${BASE}/clip/`;
       const routeName = location.pathname.startsWith(routePrefix)
         ? decodeURIComponent(location.pathname.slice(routePrefix.length))
         : null;
-      if (routeName && app.state.clips.some(clip => clip.filename === routeName)) {
+      if (routeName) {
         await openClip(routeName, false);
       } else {
         await claimNext(false);
       }
       setInterval(heartbeat, 30000);
-      setInterval(liveRefresh, 5000);
+      setInterval(liveRefresh, 10000);
     }
 
     async function refreshState() {
       app.state = await fetchJson('/api/state');
       $('datasetName').textContent = `${app.state.dataset.name} · ${app.state.summary.total} clips`;
-      const knownBuckets = new Set([...$('bucketFilter').options].map(option => option.value));
-      const newBuckets = [...new Set(app.state.clips.map(c => c.background_bucket).filter(Boolean))].sort();
-      for (const bucket of newBuckets) {
-        if (!knownBuckets.has(bucket)) $('bucketFilter').insertAdjacentHTML('beforeend', `<option value="${esc(bucket)}">${esc(bucket.replaceAll('_', ' '))}</option>`);
-      }
-      if (app.current) app.current = app.state.clips.find(clip => clip.filename === app.current.filename) || null;
       updateProgress();
-      applyFilters();
     }
 
     async function liveRefresh() {
@@ -294,41 +283,10 @@
       } catch (_) {}
     }
 
-    function applyFilters() {
-      const query = $('search').value.trim().toLowerCase();
-      const status = $('statusFilter').value;
-      const bucket = $('bucketFilter').value;
-      app.filtered = app.state.clips.filter(clip => {
-        const decision = clip.review?.decision || 'unreviewed';
-        return (status === 'all' || status === decision)
-          && (bucket === 'all' || bucket === clip.background_bucket)
-          && (!query || `${clip.filename} ${clip.title || ''} ${clip.uploader || ''}`.toLowerCase().includes(query));
-      });
-      renderList();
-    }
-
-    function renderList() {
-      if (!app.filtered.length) { $('clipList').innerHTML = '<div class="empty">No clips match these filters.</div>'; return; }
-      $('clipList').innerHTML = app.filtered.map(clip => {
-        const index = app.state.clips.indexOf(clip) + 1;
-        const active = app.current?.filename === clip.filename ? ' active' : '';
-        const decision = clip.review?.decision || '';
-        const claimedOther = clip.claim && !isMine(clip);
-        const claimText = claimedOther ? ` · ${clip.claim.reviewer_name} reviewing` : '';
-        const status = decision || (clip.claim ? 'claimed' : '');
-        return `<div class="clip-row${active}${claimedOther ? ' claimed-other' : ''}" data-file="${esc(clip.filename)}">
-          <div class="clip-index">${index}</div><div><div class="clip-title">${esc(clip.title || clip.filename)}</div><div class="clip-file">${esc(clip.background_bucket?.replaceAll('_',' ') || '')}${esc(claimText)}</div></div><span class="status-dot ${status}"></span>
-        </div>`;
-      }).join('');
-      document.querySelectorAll('.clip-row').forEach(row => row.addEventListener('click', () => openClip(row.dataset.file)));
-    }
-
-    function selectClip(filename, updateHistory = true) {
-      const clip = app.state.clips.find(item => item.filename === filename);
+    function selectClip(clip, updateHistory = true) {
       if (!clip) return;
       app.current = clip;
-      const index = app.state.clips.indexOf(clip) + 1;
-      $('counter').textContent = `Clip ${index} of ${app.state.clips.length}`;
+      $('counter').textContent = 'Random clip';
       $('clipTitle').textContent = clip.title || 'Untitled source clip';
       $('clipFilename').textContent = clip.filename;
       $('bucketText').textContent = (clip.background_bucket || '').replaceAll('_', ' ');
@@ -350,10 +308,7 @@
       $('badPanel').classList.toggle('open', clip.review?.decision === 'not_ok');
       document.querySelectorAll('#reasonGrid input').forEach(box => box.checked = clip.review?.reasons?.includes(box.value) || false);
       $('note').value = clip.review?.note || '';
-      if (updateHistory) history.pushState({filename}, '', `${BASE}/clip/${encodeURIComponent(filename)}`);
-      renderList();
-      const row = document.querySelector(`.clip-row[data-file="${CSS.escape(filename)}"]`);
-      row?.scrollIntoView({block: 'nearest'});
+      if (updateHistory) history.pushState({filename: clip.filename}, '', `${BASE}/clip/${encodeURIComponent(clip.filename)}`);
       if ($('autoPlay').checked) $('audio').play().catch(() => {});
     }
 
@@ -367,12 +322,11 @@
     }
 
     async function openClip(filename, updateHistory = true) {
-      const clip = app.state.clips.find(item => item.filename === filename);
-      if (!clip) return;
+      let clip = await fetchJson(`/api/clips/${encodeURIComponent(filename)}`);
       if (clip.review) {
         await releaseCurrent();
         await refreshState();
-        selectClip(filename, updateHistory);
+        selectClip(clip, updateHistory);
         return;
       }
       if (!isMine(clip)) await releaseCurrent();
@@ -380,8 +334,9 @@
         await fetchJson(`/api/claims/${encodeURIComponent(filename)}`, {
           method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(identityBody())
         });
+        clip = await fetchJson(`/api/clips/${encodeURIComponent(filename)}`);
         await refreshState();
-        selectClip(filename, updateHistory);
+        selectClip(clip, updateHistory);
       } catch (error) {
         toast(error.message);
         await refreshState();
@@ -396,9 +351,10 @@
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({...identityBody(), release_filename: releaseFilename})
       });
-      await refreshState();
-      if (payload.filename) {
-        selectClip(payload.filename);
+      app.state.summary = payload.summary;
+      updateProgress();
+      if (payload.clip) {
+        selectClip(payload.clip);
       } else {
         app.current = null;
         $('counter').textContent = 'Queue complete';
@@ -428,6 +384,7 @@
 
     function updateProgress() {
       const s = app.state.summary;
+      $('datasetName').textContent = `${app.state.dataset.name} · ${s.total} clips`;
       $('progressText').textContent = `${s.reviewed} / ${s.total} reviewed`;
       $('summaryText').textContent = `${s.perfect} perfect · ${s.good} good · ${s.not_ok} not OK`;
       $('progressBar').style.width = `${s.total ? s.reviewed / s.total * 100 : 0}%`;

@@ -234,11 +234,22 @@ SAM_MEDIA_WORKER_SHARED_TMP=/home/ubuntu/cinematic-continuous-30s/source-work/.s
 SAM_CONTINUOUS_SOURCE_SCAN_CPU_EXEMPT=true
 ```
 
-`extract` offloads selected-section retrieval and clip normalization. `ffmpeg`
-offloads whole-source proxy creation and ASR probe cuts. The source autoscaler
-treats remote download and extraction concurrency independently from GPU-host
-CPU pressure, while scan concurrency remains CPU-aware because M2D and scan
-coordination are resident on the GPU host.
+The media host must also allow the independent worker pools to authenticate
+concurrently. Install `deploy/pipeline/sam-media-worker-sshd.conf` as
+`/etc/ssh/sshd_config.d/99-sam-media-worker.conf`, validate with `sshd -t`, and
+reload `ssh.service`. OpenSSH's default `MaxStartups 10:30:100` randomly drops
+connection bursts well below the configured pipeline concurrency.
+
+`extract` offloads clip normalization. A passing scan retains its already
+downloaded full source on the shared media volume, extraction reads the selected
+regions locally, and the source directory is deleted when extraction becomes
+terminal. This avoids a second provider transfer and its separate CDN token or
+anti-bot failure. Legacy scanned jobs whose source was already deleted fall back
+to selected-section retrieval. `ffmpeg` also offloads whole-source proxy creation
+and ASR probe cuts. The source autoscaler treats remote download and extraction
+concurrency independently from GPU-host CPU pressure, while scan concurrency
+remains CPU-aware because M2D and scan coordination are resident on the GPU
+host.
 
 When source proxy FFmpeg is remote, `SAM_CONTINUOUS_SOURCE_SCAN_CPU_EXEMPT=true`
 allows additional source threads to keep remote proxy work in flight. It does
@@ -263,15 +274,19 @@ at the first external storage boundary: the queue item cap, queue byte cap, or
 200 GiB free-space floor. This intentionally allows the downloaded queue to
 grow while later stages are tuned separately.
 
-For a 500-IP proxy pool, the live configuration uses a 64-consecutive-failure
+For the Webshare proxy pool, the live configuration uses a 64-consecutive-failure
 breaker threshold with a 60-second initial cooldown. This keeps circuit
 isolation while avoiding provider-wide shutdowns caused by a few bad proxy IPs
-inside a 128-transfer pool.
+inside the transfer pool.
 
-Four independent discovery controllers maintain a 16,000-source global / 1,200
-per-provider frontier so the transfer pool does not become search-starved. Each
-controller owns its cursor and seed; this expands the feed without duplicating
-queries or coupling downloads to scan/ASR queues.
+The live service pins 11 discovery controllers to providers (two Dailymotion,
+four Vimeo, four Bilibili, and one guarded YouTube controller) instead of rotating every controller through the
+same list. This prevents long Bilibili hydration rounds from synchronizing the
+producers and starving the 240-transfer pool. Each controller owns its seed;
+the 5,000-source ready high-water bounds search work while a 10,000-source
+per-provider active limit prevents one provider's downstream backlog from
+blocking every other provider. Empty discovery batches back off exponentially
+from 30 seconds to five minutes.
 
 ASR runs on the GPU host and consumes both final clips and prioritized source
 probes from the media host's shared NFS queue:
@@ -371,21 +386,47 @@ Use it with the one-shot builder via `--youtube-proxy-config`. The independent
 source services use these non-secret environment settings:
 
 ```text
-SAM_CONTINUOUS_DISCOVERY_SOURCES=youtube,dailymotion,vimeo,tiktok,soundcloud,bilibili,internet_archive
-SAM_CONTINUOUS_DISCOVERED_HIGH_WATER=8000
-SAM_CONTINUOUS_PLATFORM_DISCOVERED_HIGH_WATER=600
+SAM_CONTINUOUS_DISCOVERY_SOURCES=bilibili,dailymotion,vimeo,youtube
+SAM_CONTINUOUS_DISCOVERY_PROVIDER_WORKERS=dailymotion=2,vimeo=4,bilibili=4,youtube=1
+SAM_CONTINUOUS_DISCOVERY_PROVIDER_QUERY_COUNTS=dailymotion=4,vimeo=2,bilibili=25,youtube=2
+SAM_CONTINUOUS_DISCOVERED_HIGH_WATER=5000
+SAM_CONTINUOUS_PLATFORM_DISCOVERED_HIGH_WATER=10000
+SAM_CONTINUOUS_PLATFORM_DISCOVERED_HIGH_WATERS=dailymotion=2500,vimeo=2500,bilibili=2000,youtube=100
+SAM_PAID_SEARCH_ENABLED=true
+SAM_PAID_SEARCH_DAILY_REQUEST_LIMIT=200
+SAM_CONTINUOUS_SOURCE_PROVIDER_MAX_ACTIVE=youtube=8
+SAM_CONTINUOUS_SOURCE_PROVIDER_MIN_CLAIM_INTERVAL_SECONDS=youtube=1
+SAM_CONTINUOUS_PROVIDER_CIRCUIT_FAILURE_THRESHOLDS=youtube=4
 SAM_YOUTUBE_PROXY_CONFIG=/home/ubuntu/.config/sam-audio/youtube-proxy.conf
 ```
 
-Discovery rotates durably through the seven-source pool instead of letting the
-first provider fill the frontier. The global high-water mark bounds total
-metadata, while the per-provider active quota keeps the queue balanced.
-Dailymotion uses its public API; YouTube, SoundCloud, and Bilibili use native
-yt-dlp search extractors; Vimeo, TikTok, and Internet Archive use site-scoped
-Yahoo Video discovery followed by yt-dlp metadata hydration. Every source then
-passes the same stereo, source-quality, M2D, ASR, and diversity gates. The
-progress dashboard reports recent attempts, success percentage, transfer MB/s,
-source-audio hours/hour, and terminal outcomes for each provider.
+The Dailymotion lane combines its public API, deeper accepted-channel/related
+traversal, and a small no-key indexed fallback. Vimeo traverses paginated video
+lists from already accepted uploaders and hydrates metadata through oEmbed;
+no paid web search is required. Bilibili retains native search and graph
+traversal. Every result still passes the same stereo, source-quality, M2D, ASR,
+and diversity gates.
+
+YouTube is opportunistic: it may use at most 8 of the 240 transfer slots
+(3.3%), claims at most one new source per second globally, and four consecutive
+transport failures open only the YouTube circuit. The other provider lanes
+continue while its exponential recovery cooldown runs.
+
+Indexed-search credentials belong in the root-owned mode-0600 file
+`/etc/sam-source-discovery-secrets.env`, which is read only by the discovery
+service. Do not add values to the repository environment file:
+
+```text
+SAM_EXA_API_KEY=...
+SAM_EXTERNAL_SEARCH_MIN_INTERVAL_SECONDS=1.05
+SAM_EXA_FALLBACK_PERCENT=100
+```
+
+Paid search fails closed without both `SAM_PAID_SEARCH_ENABLED=true` and a
+positive daily request limit. A cross-process budget file makes the cap durable
+across worker restarts. The production lane uses the configured Exa credential
+only after native discovery is exhausted; proxy-rotated Brave HTML remains the
+no-key fallback when the daily budget is exhausted.
 
 `SAM_YOUTUBE_PROXY_CONFIG` may name one config file or a directory containing
 one mode-0600 `.conf` file per direct proxy. The service deterministically pins
@@ -396,17 +437,17 @@ frontier or manifests. Search queries are pinned independently.
 For a direct pool, create a mode-0700 directory, write one `--proxy ...` line
 to each mode-0600 `.conf`, and point `SAM_YOUTUBE_PROXY_CONFIG` at the directory.
 
-The config is applied only to YouTube discovery, full-source audio transfer,
-and selected-section retrieval. All other providers remain direct. Worker logs and
-frontier errors redact URL user information, while child process arguments
-contain only a selected config path. Test the credential before switching
+The live configuration applies the pool to discovery hydration and transfer for
+all enabled providers. Worker logs and frontier errors redact URL user
+information, while child process arguments contain only a selected config path.
+Test the credential before switching
 discovery; an HTTP 407 response means Webshare rejected the proxy
 username/password, while `Invalid download token` means a proxy-list export URL
 must be regenerated in Webshare.
 
-When a YouTube proxy is unavailable, the round-robin service continues through
-the other six providers rather than weakening the selection policy or using
-account cookies. A one-shot Dailymotion-only run remains available:
+When one provider fails, its circuit opens independently rather than weakening
+the selection policy or using account cookies. A one-shot Dailymotion-only run
+remains available:
 
 ```bash
 uv run sam-pipeline-youtube-random \
@@ -626,3 +667,116 @@ are downloaded separately to `/home/ubuntu/models` and referenced at runtime.
 When syncing systemd launchers, preserve executable modes. Stop only the SAM
 queue consumer while restarting the SAM model API; queued messages remain safe
 in SQS and task state remains safe in DynamoDB.
+
+## Dialogue/background training snapshots
+
+`sam-training-dataset.service` is a separate, resumable downstream consumer of
+the continuous catalog. It never starts, stops, or applies backpressure to
+source discovery, download, scan, extraction, or the existing 2,500-record
+snapshot publisher. It also watches its own `inbox/` for ZIP files and folders,
+so older accepted packages can be added without changing acquisition.
+
+For every input it creates an aligned 48 kHz stereo contract:
+
+- `original.wav`: deterministic two-pass EBU R128 normalization;
+- `dialogue.wav`: the stereo-mapped SAM `human voices` target;
+- `background.wav`: the final voice-stage residual, retaining music, ambience,
+  and sound effects together;
+- `scene_description.txt`: an M2D-grounded Audio Flamingo Next caption of the
+  background only;
+- `dialogue_transcript.txt`: the faster-whisper transcript; and
+- `metadata.json`: source provenance, timestamped M2D/ASR evidence, SAM judges,
+  adaptive candidate metadata, stereo mapping, reconstruction similarity,
+  artifact hashes, and the three-bucket quality decision.
+
+The current scene-caption contract is revision 4. `scene_description.txt` is
+always rendered as an 80–140 word `DESCRIPTION:` section followed by a
+`TIMELINE:` of one to six contiguous intervals covering exactly 00:00–00:30.
+The publisher rejects model/process boilerplate, missing coverage, and sparse
+multi-interval placeholders before any immutable snapshot is written. Speech
+recognized in the background is removed from the text but retained as a review
+signal.
+
+The publisher commits immutable 1,000-record snapshots. Every completed record
+is included, including `success`, `review`, and `failure`; records are never
+silently removed because of their quality result. Each record repeats its
+bucket and reasons, the manifest records exact bucket counts, and publication
+fails before upload if the row label and metadata label disagree. Training code
+should apply the manifest's default filter, `quality.bucket == 'success'`, while
+review and failure records remain available for audit and policy improvement.
+After a snapshot's manifest and `READY.json` are durable in S3, its local work
+files are removed to bound disk use.
+
+Install the independent worker without changing the acquisition target:
+
+```bash
+sudo install -m 0644 deploy/pipeline/sam-training-dataset.env \
+  /etc/sam-training-dataset.env
+sudo install -m 0644 deploy/pipeline/sam-training-dataset.service \
+  /etc/systemd/system/sam-training-dataset.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now sam-training-dataset.service
+```
+
+Inspect progress or add a package:
+
+```bash
+cd /home/ubuntu/sam-audio-deploy/pipeline
+.venv/bin/python -m sam_audio_pipeline.training_dataset \
+  --workspace /home/ubuntu/dialogue-background-training-v1 status
+cp /path/to/accepted-clips.zip \
+  /home/ubuntu/dialogue-background-training-v1/inbox/
+```
+
+Snapshot control objects are under
+`s3://$SAM_TRAINING_S3_BUCKET/dialogue-background-training-v1/snapshots/`.
+Record artifacts are partitioned by their explicit quality bucket beneath the
+same prefix.
+
+The inbox accepts ZIPs and directories. ZIP extraction is atomic: an interrupted
+or unsafe archive never becomes a visible package root. Directory packages are
+incremental and content-addressed, so adding a new file or replacing a file with
+new bytes creates a new durable job instead of being hidden by the first scan.
+
+The official SAM checkpoint is gated and is deliberately not part of the image
+or repository. On a replacement GPU host, authenticate an approved Hugging Face
+account and download it directly on that host:
+
+```bash
+/home/ubuntu/sam-audio-deploy/.venv/bin/hf auth login
+/home/ubuntu/sam-audio-deploy/.venv/bin/hf download \
+  facebook/sam-audio-small-tv \
+  --local-dir /home/ubuntu/models/sam-audio-small-tv
+sudo systemctl enable --now sam-audio-api.service
+```
+
+The training supervisor waits for `/healthz` before it starts separation, so a
+missing checkpoint does not consume job retries. Audio Flamingo is independent
+of SAM. Its API handles the checkpoint's encoder-decoder output without removing
+input-prompt tokens, requests at most 384 generated tokens, compacts M2D
+evidence to ten timeline samples, and normalizes valid, truncated, or native
+caption formats into the same background-only schema. Any speech content removed
+from a caption is retained as a quality signal and sends the record to `review`.
+
+Prompt changes are evaluated against saved real stems before deployment:
+
+```bash
+PYTHONPATH=pipeline/src pipeline/.venv/bin/python \
+  -m sam_audio_pipeline.caption_prompt_lab \
+  --workspace /home/ubuntu/dialogue-background-training-v1 \
+  --api-url http://127.0.0.1:8001 \
+  --samples 8 \
+  --output /home/ubuntu/dialogue-background-training-v1/logs/caption-prompt-lab.jsonl
+```
+
+Corrective caption streams use
+`dialogue-background-training-vN/snapshots/vN-...` and preserve membership of
+every older immutable revision. The pipeline dashboard reads
+`caption_revision_state`, so transformed, published, remaining, and
+success/review/failure totals automatically follow the newest revision.
+
+Before an immutable snapshot is uploaded, the publisher proves that every
+record has a unique ID and sequence, all six artifacts, a matching S3 bucket
+partition and quality label, and counts that reconcile exactly with the
+manifest. The resulting audit is embedded as `verification.status = passed`;
+`READY.json` is not written if any invariant fails.

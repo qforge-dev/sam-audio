@@ -1,0 +1,19 @@
+[Unit]
+Description=Voice-only dialogue/background training dataset pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
+EnvironmentFile=/etc/sam-training-dataset.env
+ExecStart=/home/ubuntu/sam-audio-deploy/deploy/pipeline/run-training-dataset.sh
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 [Unit]
-Description=SAM Audio inference API
-After=network-online.target
+Description=SAM Audio inference API (GPU 1 replica)
+After=network-online.target audio-flamingo-next.service
 Wants=network-online.target
 
 [Service]
@@ -10,6 +10,10 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/sam-audio-deploy
 Environment=SAM_AUDIO_RUNTIME=/home/ubuntu/sam-audio-venv
 Environment=LD_LIBRARY_PATH=/home/ubuntu/sam-audio-venv/lib/python3.14/site-packages/nvidia/cu13/lib
+Environment=CUDA_VISIBLE_DEVICES=1
+Environment=SAM_AUDIO_PORT=8002
+Environment=SAM_AUDIO_MAX_BATCH_SIZE=2
+Environment=SAM_AUDIO_MAX_ACTIVE_REQUESTS=8
 ExecStart=/home/ubuntu/sam-audio-deploy/deploy/start-sam-audio-api.sh
 Restart=on-failure
 RestartSec=5

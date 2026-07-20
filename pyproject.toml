@@ -26,11 +26,11 @@ dependencies = [
     "perception-models @ git+https://github.com/facebookresearch/perception_models.git@unpin-deps",
     "pydub",
     "setuptools<81",
-    "torch",
-    "torchaudio",
-    "torchcodec",
+    "torch==2.10.0",
+    "torchaudio==2.10.0",
+    "torchcodec==0.10.0",
     "torchdiffeq",
-    "torchvision",
+    "torchvision==0.25.0",
     "transformers>=4.54.0",
 ]
 

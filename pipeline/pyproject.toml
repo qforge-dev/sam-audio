@@ -26,6 +26,9 @@ sam-pipeline-m2d-validate = "sam_audio_pipeline.m2d_validator:main"
 sam-pipeline-review = "sam_audio_pipeline.review_app:main"
 sam-pipeline-source = "sam_audio_pipeline.source_pipeline:main"
 sam-audio-flamingo-api = "sam_audio_pipeline.flamingo_api:main"
+sam-training-dataset = "sam_audio_pipeline.training_dataset:main"
+sam-caption-prompt-lab = "sam_audio_pipeline.caption_prompt_lab:main"
+sam-caption-backfill = "sam_audio_pipeline.caption_backfill:main"
 
 [dependency-groups]
 dev = [

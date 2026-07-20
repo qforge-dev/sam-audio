@@ -20,6 +20,21 @@ def _enabled_tasks() -> set[str]:
     }
 
 
+def _direct_tasks() -> set[str]:
+    """Tasks that should avoid one transient systemd unit per command.
+
+    Hundreds of concurrent network transfers can exhaust systemd's D-Bus
+    command queue before they exhaust the host network.  GNU timeout still
+    bounds and reaps these commands without involving the service manager.
+    """
+
+    return {
+        value.strip().lower()
+        for value in os.environ.get("SAM_MEDIA_WORKER_DIRECT_TASKS", "").split(",")
+        if value.strip()
+    }
+
+
 def command_for_media_worker(
     command: Sequence[str], *, task: str, timeout: float
 ) -> tuple[list[str], float]:
@@ -34,21 +49,35 @@ def command_for_media_worker(
         return list(command), timeout
 
     remote_timeout = max(1, math.ceil(timeout))
-    unit = f"sam-media-{task.lower()}-{uuid.uuid4().hex}"
-    remote = shlex.join(
-        [
-            "sudo",
-            "systemd-run",
-            "--quiet",
-            "--wait",
-            "--pipe",
-            "--collect",
-            f"--unit={unit}",
-            f"--property=RuntimeMaxSec={remote_timeout}s",
-            "--",
-            *command,
-        ]
-    )
+    normalized_task = task.lower()
+    if normalized_task in _direct_tasks():
+        marker = f"sam-media-direct-{normalized_task}-{uuid.uuid4().hex}"
+        bounded = shlex.join(
+            [
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=15s",
+                f"{remote_timeout}s",
+                *command,
+            ]
+        )
+        remote = shlex.join(["bash", "-c", f"exec -a {marker} {bounded}"])
+    else:
+        unit = f"sam-media-{normalized_task}-{uuid.uuid4().hex}"
+        remote = shlex.join(
+            [
+                "sudo",
+                "systemd-run",
+                "--quiet",
+                "--wait",
+                "--pipe",
+                "--collect",
+                f"--unit={unit}",
+                f"--property=RuntimeMaxSec={remote_timeout}s",
+                "--",
+                *command,
+            ]
+        )
     wrapped = [
         "ssh",
         "-T",
@@ -120,7 +149,11 @@ def cleanup_remote_media(task: str) -> int:
     identity = os.environ.get("SAM_MEDIA_WORKER_SSH_IDENTITY", "").strip()
     if identity:
         command.extend(["-i", identity])
-    remote = f"sudo systemctl stop 'sam-media-{normalized}-*' 2>/dev/null || true"
+    direct_pattern = f"[s]am-media-direct-{normalized}-"
+    remote = (
+        f"sudo systemctl stop 'sam-media-{normalized}-*' 2>/dev/null || true"
+        f"; pkill -TERM -f {shlex.quote(direct_pattern)} 2>/dev/null || true"
+    )
     if normalized in {"download", "extract"}:
         staging_variable = (
             "SAM_CONTINUOUS_SOURCE_STAGING_DIR"

@@ -3,13 +3,15 @@ set -euo pipefail
 
 cd /home/ubuntu/sam-audio-deploy
 
+SAM_AUDIO_RUNTIME=${SAM_AUDIO_RUNTIME:-/home/ubuntu/sam-audio-venv}
+
 export PYTHONPATH=/home/ubuntu/sam-audio-deploy
-export SAM_AUDIO_MODEL=/home/ubuntu/models/sam-audio-small-tv
-export SAM_AUDIO_HOST=127.0.0.1
-export SAM_AUDIO_PORT=8000
+export SAM_AUDIO_MODEL=${SAM_AUDIO_MODEL:-/home/ubuntu/models/sam-audio-small-tv}
+export SAM_AUDIO_HOST=${SAM_AUDIO_HOST:-127.0.0.1}
+export SAM_AUDIO_PORT=${SAM_AUDIO_PORT:-8000}
 
 export HF_HOME=/home/ubuntu/.cache/huggingface
-export HF_HUB_CACHE=/home/ubuntu/models/huggingface/hub
+export HF_HUB_CACHE="$HF_HOME/hub"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export USE_TF=0
@@ -17,6 +19,7 @@ export USE_FLAX=0
 export TRANSFORMERS_NO_TF=1
 export TRANSFORMERS_NO_FLAX=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
 export NVIDIA_TF32_OVERRIDE=1
 export SAM_AUDIO_DTYPE_POLICY=tf32
@@ -40,9 +43,12 @@ export SAM_AUDIO_VOICE_JUDGE_OVERALL_WEIGHT=0.5
 export SAM_AUDIO_VOICE_JUDGE_PRECISION_WEIGHT=0.5
 export SAM_AUDIO_MUSIC_JUDGE_OVERALL_WEIGHT=0.25
 export SAM_AUDIO_MUSIC_JUDGE_PRECISION_WEIGHT=0.75
-export SAM_AUDIO_MAX_BATCH_SIZE=1
-export SAM_AUDIO_MAX_ACTIVE_REQUESTS=16
+export SAM_AUDIO_MAX_BATCH_SIZE=${SAM_AUDIO_MAX_BATCH_SIZE:-1}
+export SAM_AUDIO_MAX_ACTIVE_REQUESTS=${SAM_AUDIO_MAX_ACTIVE_REQUESTS:-16}
 export SAM_AUDIO_PREDECODE_INPUTS=true
 export SAM_AUDIO_ASYNC_OUTPUTS=true
+# This deployment only accepts audio + text prompts. Avoid loading the optional
+# video-only ImageBind ranker and its checkpoint.
+export SAM_AUDIO_DISABLE_VISUAL_RANKER=true
 
-exec /home/ubuntu/sam-audio-deploy/.venv/bin/sam-audio-api
+exec "$SAM_AUDIO_RUNTIME/bin/sam-audio-api"

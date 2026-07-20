@@ -125,6 +125,25 @@ def candidate(video_id: str) -> list[dict[str, object]]:
     ]
 
 
+def test_stage_events_have_time_first_dashboard_index(tmp_path: Path) -> None:
+    connection = connect_frontier(tmp_path)
+
+    indexes = {
+        str(row[1]): row
+        for row in connection.execute("PRAGMA index_list(source_stage_events)")
+    }
+    columns = [
+        str(row[2])
+        for row in connection.execute(
+            "PRAGMA index_info(source_stage_events_finished_at)"
+        )
+    ]
+
+    assert "source_stage_events_finished_at" in indexes
+    assert columns == ["finished_at"]
+    connection.close()
+
+
 def test_enqueue_is_idempotent_without_resetting_state(tmp_path: Path) -> None:
     connection = connect_frontier(tmp_path)
     assert enqueue_source(connection, candidate("movie"), priority=1, now=10)
@@ -227,6 +246,74 @@ def test_claims_use_provider_weights_for_active_leases(tmp_path: Path) -> None:
     assert all(item is not None for item in claimed)
     assert [item["platform"] for item in claimed].count("dailymotion") == 4
     assert [item["platform"] for item in claimed].count("youtube") == 1
+
+
+def test_claims_enforce_provider_active_transfer_cap(tmp_path: Path) -> None:
+    connection = connect_frontier(tmp_path)
+    for index in range(6):
+        youtube = candidate(f"yt-cap-{index}")
+        youtube[0]["source_platform"] = "youtube"
+        vimeo = candidate(f"vimeo-cap-{index}")
+        vimeo[0]["source_platform"] = "vimeo"
+        enqueue_source(connection, youtube, priority=100, now=10 + index)
+        enqueue_source(connection, vimeo, priority=1, now=20 + index)
+
+    claimed = [
+        claim_source(
+            connection,
+            "discovered",
+            worker=f"download-{index}",
+            lease_seconds=100,
+            now=30,
+            provider_weights={"youtube": 10, "vimeo": 1},
+            provider_max_active={"youtube": 2},
+        )
+        for index in range(6)
+    ]
+
+    assert all(item is not None for item in claimed)
+    assert [item["platform"] for item in claimed].count("youtube") == 2
+    assert [item["platform"] for item in claimed].count("vimeo") == 4
+
+
+def test_claims_rate_limit_one_provider_without_idling_others(tmp_path: Path) -> None:
+    connection = connect_frontier(tmp_path)
+    for index in range(3):
+        youtube = candidate(f"yt-rate-{index}")
+        youtube[0]["source_platform"] = "youtube"
+        vimeo = candidate(f"vimeo-rate-{index}")
+        vimeo[0]["source_platform"] = "vimeo"
+        enqueue_source(connection, youtube, priority=100, now=10 + index)
+        enqueue_source(connection, vimeo, priority=1, now=20 + index)
+
+    first = claim_source(
+        connection,
+        "discovered",
+        worker="download-0",
+        lease_seconds=100,
+        now=30,
+        provider_min_claim_interval_seconds={"youtube": 1},
+    )
+    throttled = claim_source(
+        connection,
+        "discovered",
+        worker="download-1",
+        lease_seconds=100,
+        now=30.5,
+        provider_min_claim_interval_seconds={"youtube": 1},
+    )
+    resumed = claim_source(
+        connection,
+        "discovered",
+        worker="download-2",
+        lease_seconds=100,
+        now=31,
+        provider_min_claim_interval_seconds={"youtube": 1},
+    )
+
+    assert first is not None and first["platform"] == "youtube"
+    assert throttled is not None and throttled["platform"] == "vimeo"
+    assert resumed is not None and resumed["platform"] == "youtube"
 
 
 def test_provider_circuit_skips_open_provider_and_allows_one_recovery_probe(
@@ -413,9 +500,12 @@ def test_transition_and_snapshot_report_stage_timing(tmp_path: Path) -> None:
         "per_minute": pytest.approx(1 / 15, abs=1e-4),
         "active_events": 1,
         "active_per_minute": pytest.approx(1 / 15, abs=1e-4),
+        "audio_hours_per_hour": pytest.approx(2 / 3, abs=1e-4),
+        "audio_basis": "successful_source_duration",
         "outcomes": {"success": 1},
         "duration_p50_seconds": 12.0,
         "duration_p95_seconds": 12.0,
+        "window_minutes": 15,
     }
     platform = snapshot["platforms"]["dailymotion"]
     assert platform["states"]["downloaded"] == 1
@@ -426,6 +516,9 @@ def test_transition_and_snapshot_report_stage_timing(tmp_path: Path) -> None:
     throughput = snapshot["download_throughput"]
     assert throughput["completed_file_megabytes_per_second"] == pytest.approx(
         12 / 900, abs=0.001
+    )
+    assert throughput["source_audio_hours_per_wall_hour"] == pytest.approx(
+        2 / 3, abs=0.001
     )
     assert throughput["host_network"]["receive_megabytes_per_second"] is None
 
@@ -497,5 +590,75 @@ def test_worker_heartbeat_becomes_stale_without_progress(tmp_path: Path) -> None
     stale = frontier_snapshot(tmp_path, now=131)
 
     assert current["workers"][0]["state"] == "running"
+    assert current["workers"][0]["activity"] == "idle"
     assert current["workers"][0]["details"] == {"last_status": "high_water"}
     assert stale["workers"][0]["state"] == "stale"
+    assert stale["workers"][0]["activity"] == "stale"
+
+
+def test_active_lease_marks_long_running_worker_as_working(tmp_path: Path) -> None:
+    connection = connect_frontier(tmp_path)
+    enqueue_source(connection, candidate("movie"), now=80)
+    heartbeat_worker(
+        connection,
+        "download-0",
+        stage="download",
+        details={"last_status": "idle"},
+        now=80,
+    )
+    claim_source(
+        connection,
+        "discovered",
+        worker="download-0",
+        lease_seconds=120,
+        now=100,
+    )
+
+    worker = frontier_snapshot(tmp_path, now=120)["workers"][0]
+
+    assert worker["state"] == "stale"
+    assert worker["activity"] == "working"
+    assert worker["heartbeat_age_seconds"] == 40.0
+
+
+def test_download_worker_detail_reads_live_process_lazily(tmp_path: Path) -> None:
+    from sam_audio_pipeline.source_frontier import download_worker_detail
+
+    item = candidate("movie")
+    item[0]["title"] = "Movie scene"
+    staging = tmp_path / ".source-download-test"
+    staging.mkdir()
+    (staging / "source.webm.part").write_bytes(b"x" * 2_000_000)
+    proc_root = tmp_path / "proc"
+    process = proc_root / "123"
+    process.mkdir(parents=True)
+    command = (
+        "sam-media-direct-download-test yt-dlp --config-locations proxy-0042.conf "
+        f"-o {staging}/source.%(ext)s https://example.test/movie"
+    )
+    (process / "cmdline").write_bytes(command.replace(" ", "\0").encode())
+    observed_at = process.stat().st_ctime + 10.0
+    connection = connect_frontier(tmp_path)
+    enqueue_source(connection, item, now=observed_at - 20.0)
+    heartbeat_worker(
+        connection, "download-0", stage="download", now=observed_at - 10.0
+    )
+    claim_source(
+        connection,
+        "discovered",
+        worker="download-0",
+        lease_seconds=120,
+        now=observed_at - 5.0,
+    )
+
+    detail = download_worker_detail(
+        tmp_path, "download-0", now=observed_at, proc_root=proc_root
+    )
+
+    assert detail is not None
+    assert detail["activity"] == "working"
+    assert detail["source"]["title"] == "Movie scene"
+    assert detail["transfer"]["status"] == "downloading"
+    assert detail["transfer"]["bytes"] == 2_000_000
+    assert detail["transfer"]["average_megabytes_per_second"] == 0.2
+    assert detail["transfer"]["proxy_slot"] == 42

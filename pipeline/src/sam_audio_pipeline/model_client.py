@@ -3,12 +3,38 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+
+def _extract_archive(archive_path: Path, destination: Path) -> None:
+    """Validate and atomically replace a prior separation extraction."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}-",
+            dir=destination.parent,
+        )
+    )
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.infolist():
+                member_path = Path(member.filename)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise ValueError(f"Unsafe archive member: {member.filename}")
+            archive.extractall(temporary)
+        shutil.rmtree(destination, ignore_errors=True)
+        os.replace(temporary, destination)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
 
 
 @dataclass(frozen=True)
@@ -46,13 +72,7 @@ class SAMAudioClient:
                     for block in response.iter_bytes():
                         destination.write(block)
         extracted = output_dir / "extracted"
-        extracted.mkdir()
-        with zipfile.ZipFile(archive_path) as archive:
-            for member in archive.infolist():
-                member_path = Path(member.filename)
-                if member_path.is_absolute() or ".." in member_path.parts:
-                    raise ValueError(f"Unsafe archive member: {member.filename}")
-            archive.extractall(extracted)
+        _extract_archive(archive_path, extracted)
         metadata = json.loads((extracted / "metadata.json").read_text())
         artifact_metadata = metadata.get("artifacts", {})
         canonical = artifact_metadata.get("canonical_stems", {})

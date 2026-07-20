@@ -286,7 +286,7 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
     assert records[0]["catalog_sequence"] == 1
     review = ReviewStore(workspace / "accepted", audio_directory="audio")
     assert review.state()["summary"]["total"] == 1
-    assert review.state()["clips"][0]["filename"] == filename
+    assert review.clip(filename)["filename"] == filename
 
     snapshot_dir = workspace / "snapshots" / "test"
     _snapshot_manifest(workspace, 1, 1, snapshot_dir)
@@ -302,6 +302,11 @@ def test_independent_workers_promote_score_and_assemble_incrementally(
     assert progress["next_snapshot"]["remaining"] == 2499
     assert progress["pipeline_stages"]["m2d"]["queue_count"] == 0
     assert progress["pipeline_stages"]["m2d"]["active_events"] == 1
+    assert math.isclose(
+        progress["pipeline_stages"]["m2d"]["audio_hours_per_hour"],
+        1 / 30,
+        abs_tol=1e-4,
+    )
     assert progress["pipeline_stages"]["asr"]["queue_count"] == 0
     assert progress["pipeline_stages"]["asr"]["active_events"] == 1
     assert progress["pipeline_stages"]["assembly"]["queue_count"] == 0

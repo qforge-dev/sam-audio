@@ -58,6 +58,32 @@ def test_media_command_wraps_only_enabled_tasks_and_quotes_arguments(
     assert timeout == 120.2
 
 
+def test_media_command_can_avoid_transient_units_for_high_fanout_tasks(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SAM_MEDIA_WORKER_SSH_TARGET", "ubuntu@172.31.0.10")
+    monkeypatch.setenv("SAM_MEDIA_WORKER_REMOTE_TASKS", "download,ffmpeg")
+    monkeypatch.setenv("SAM_MEDIA_WORKER_DIRECT_TASKS", "download")
+    original = ["yt-dlp", "https://example.test/watch?v=one&list=two"]
+
+    command, timeout = command_for_media_worker(original, task="download", timeout=90.2)
+
+    parsed = shlex.split(command[-1])
+    assert parsed[:2] == ["bash", "-c"]
+    bounded = shlex.split(parsed[2])
+    assert bounded[:3] == ["exec", "-a", bounded[2]]
+    assert bounded[2].startswith("sam-media-direct-download-")
+    assert bounded[3:7] == [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=15s",
+        "91s",
+    ]
+    assert bounded[7:] == original
+    assert "systemd-run" not in command[-1]
+    assert timeout == 120.2
+
+
 def test_media_command_keeps_unlisted_task_local(monkeypatch) -> None:
     monkeypatch.setenv("SAM_MEDIA_WORKER_SSH_TARGET", "ubuntu@172.31.0.10")
     monkeypatch.setenv("SAM_MEDIA_WORKER_REMOTE_TASKS", "ffmpeg")
@@ -117,6 +143,7 @@ def test_cleanup_stops_task_units_and_removes_download_staging(
     assert remote_media.cleanup_remote_media("download") == 0
     assert observed[-2] == "ubuntu@172.31.0.10"
     assert "sam-media-download-*" in observed[-1]
+    assert "[s]am-media-direct-download-" in observed[-1]
     assert "/shared/.staging" in observed[-1]
 
 

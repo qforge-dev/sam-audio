@@ -219,10 +219,15 @@ def promote_once(runs_dir: Path, workspace: Path) -> int:
             )
             declared_digest = str(source_record.get("sha256") or "")
             known = connection.execute(
-                "SELECT 1 FROM records WHERE sha256=? OR candidate_id=? LIMIT 1",
+                """SELECT filename FROM records
+                WHERE sha256=? OR candidate_id=? LIMIT 1""",
                 (declared_digest, candidate_id),
             ).fetchone()
             if known:
+                # The row is committed before publishing its audio so a slow
+                # shared-filesystem operation never holds the SQLite writer.
+                # Repair the narrow crash window on the following pass.
+                _link_or_copy(source, raw_dir / str(known["filename"]))
                 continue
             actual_digest = _sha256(source)
             digest = declared_digest or actual_digest
@@ -259,9 +264,9 @@ def promote_once(runs_dir: Path, workspace: Path) -> int:
                             _now(),
                         ),
                     )
-                    if cursor.rowcount:
-                        _link_or_copy(source, destination)
-                        added += 1
+                if cursor.rowcount:
+                    _link_or_copy(source, destination)
+                    added += 1
             except sqlite3.IntegrityError:
                 continue
         with connection:
@@ -460,7 +465,10 @@ def assemble_once(
     max_duration_scaled_clips_per_video: int = DEFAULT_MAX_CLIPS_PER_SOURCE,
 ) -> int:
     connection = connect(workspace)
-    connection.execute("PRAGMA busy_timeout=2000")
+    # Promotion, assembly, heartbeats, and snapshot bookkeeping share this WAL.
+    # Under burst load a legitimate writer can hold it longer than two seconds;
+    # use the connection's normal timeout instead of abandoning the whole batch.
+    connection.execute("PRAGMA busy_timeout=30000")
     m2d_paths = [workspace / "m2d-validation.jsonl"] + sorted(
         (workspace / "m2d-validation").glob("*.jsonl")
     )
@@ -666,6 +674,7 @@ def _queue_stage_metrics(
     event_query: str,
     now: datetime,
     window_minutes: float,
+    clip_seconds: float,
 ) -> dict[str, Any]:
     """Describe one clip queue with the same vocabulary as source stages."""
     oldest_value = connection.execute(oldest_query).fetchone()[0]
@@ -697,6 +706,10 @@ def _queue_stage_metrics(
         "events": len(rows),
         "active_events": len(rows),
         "active_per_minute": round(len(rows) / max(window_minutes, 1e-9), 4),
+        "audio_hours_per_hour": round(
+            len(rows) * clip_seconds / max(window_minutes * 60.0, 1e-9), 4
+        ),
+        "audio_basis": "completed_clips",
         "duration_p95_seconds": (round(durations[p95_index], 3) if durations else None),
         "window_minutes": window_minutes,
     }
@@ -778,7 +791,8 @@ def _source_scan_status(workspace: Path) -> dict[str, Any]:
     proxy_asr_enforced_rejected = proxy_asr_regions_checked = 0
     proxy_asr_live_scored = proxy_asr_derived = 0
     proxy_asr_seconds = 0.0
-    scan_seconds = download_seconds = proxy_seconds = 0.0
+    scan_seconds = inference_wait_seconds = stereo_metrics_seconds = 0.0
+    download_seconds = proxy_seconds = 0.0
     now = datetime.now(UTC)
     recent = {
         "5": {"sources": 0, "matches": 0, "regions": 0},
@@ -825,6 +839,8 @@ def _source_scan_status(workspace: Path) -> dict[str, Any]:
                     proxy_asr_rejected += 1
                     proxy_asr_enforced_rejected += int(bool(proxy_asr.get("enforced")))
         scan_seconds += float(item.get("scan_seconds") or 0.0)
+        inference_wait_seconds += float(item.get("inference_wait_seconds") or 0.0)
+        stereo_metrics_seconds += float(item.get("stereo_metrics_seconds") or 0.0)
         if item.get("download_seconds") is not None:
             timed_sources += 1
             download_seconds += float(item.get("download_seconds") or 0.0)
@@ -874,6 +890,8 @@ def _source_scan_status(workspace: Path) -> dict[str, Any]:
         if passing_regions
         else 0.0,
         "model_scan_seconds": round(scan_seconds, 3),
+        "model_inference_wait_seconds": round(inference_wait_seconds, 3),
+        "stereo_metrics_seconds": round(stereo_metrics_seconds, 3),
         "timed_sources": timed_sources,
         "source_download_seconds": round(download_seconds, 3),
         "proxy_decode_seconds": round(proxy_seconds, 3),
@@ -897,6 +915,7 @@ def progress_snapshot(
     *,
     throughput_window_minutes: float = 60.0,
     target_hours: float = 10_000.0,
+    cached_discovery_strategies: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     from .source_frontier import frontier_snapshot
 
@@ -998,6 +1017,7 @@ def progress_snapshot(
                 JOIN records r USING(filename) WHERE m.scored_at>=?""",
             now=now,
             window_minutes=stage_window_minutes,
+            clip_seconds=clip_seconds,
         ),
         "asr": _queue_stage_metrics(
             connection,
@@ -1009,6 +1029,7 @@ def progress_snapshot(
                 JOIN m2d_scores m USING(filename) WHERE s.scored_at>=?""",
             now=now,
             window_minutes=stage_window_minutes,
+            clip_seconds=clip_seconds,
         ),
         "assembly": _queue_stage_metrics(
             connection,
@@ -1027,6 +1048,7 @@ def progress_snapshot(
                 WHERE x.reason!='automated_model_gate' AND x.rejected_at>=?1""",
             now=now,
             window_minutes=stage_window_minutes,
+            clip_seconds=clip_seconds,
         ),
     }
     stalled_stages = [
@@ -1103,7 +1125,9 @@ def progress_snapshot(
         "source_frontier": frontier_snapshot(
             workspace,
             window_minutes=min(15.0, throughput_window_minutes),
+            clip_seconds=clip_seconds,
             catalog_path=workspace / CATALOG_FILENAME,
+            cached_discovery_strategies=cached_discovery_strategies,
         ),
         "goal": {
             "target_audio_hours": target_hours,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import threading
 import time
@@ -31,6 +32,8 @@ _discovery_snapshot_cache: dict[
 ] = {}
 _discovery_snapshot_cache_lock = threading.Lock()
 _DISCOVERY_SNAPSHOT_CACHE_SECONDS = 30.0
+_initialized_frontiers: set[str] = set()
+_frontier_schema_lock = threading.Lock()
 DISCOVERY_PROBE_ACTIVE_SOURCES = 8
 DISCOVERY_MIN_SCAN_SOURCES = 12
 DISCOVERY_MIN_FINAL_RECORDS = 20
@@ -221,17 +224,22 @@ def _cached_discovery_strategy_snapshot(
 
 def connect_frontier(workspace: Path) -> sqlite3.Connection:
     workspace.mkdir(parents=True, exist_ok=True)
+    database = workspace / FRONTIER_FILENAME
     connection = sqlite3.connect(
-        workspace / FRONTIER_FILENAME,
+        database,
         timeout=30,
         isolation_level=None,
     )
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA busy_timeout=30000")
-    connection.executescript(
-        """
+    database_key = str(database.absolute())
+    with _frontier_schema_lock:
+        if database_key in _initialized_frontiers:
+            return connection
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.executescript(
+            """
         CREATE TABLE IF NOT EXISTS source_jobs (
             source_key TEXT PRIMARY KEY,
             platform TEXT NOT NULL,
@@ -258,6 +266,10 @@ def connect_frontier(workspace: Path) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS source_jobs_ready
         ON source_jobs(state, available_at, lease_expires_at, priority DESC);
+        CREATE INDEX IF NOT EXISTS source_jobs_platform_state_lease
+        ON source_jobs(platform, state, lease_expires_at);
+        CREATE INDEX IF NOT EXISTS source_jobs_lease_owner
+        ON source_jobs(lease_owner, lease_expires_at);
         CREATE TABLE IF NOT EXISTS source_stage_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_key TEXT NOT NULL REFERENCES source_jobs(source_key),
@@ -271,6 +283,8 @@ def connect_frontier(workspace: Path) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS source_stage_events_finished
         ON source_stage_events(stage, finished_at);
+        CREATE INDEX IF NOT EXISTS source_stage_events_finished_at
+        ON source_stage_events(finished_at);
         CREATE TABLE IF NOT EXISTS source_workers (
             worker TEXT PRIMARY KEY,
             stage TEXT NOT NULL,
@@ -290,8 +304,13 @@ def connect_frontier(workspace: Path) -> sqlite3.Connection:
             last_success_at TEXT,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS source_provider_claim_rates (
+            platform TEXT PRIMARY KEY,
+            last_claim_at REAL NOT NULL
+        );
         """
-    )
+        )
+        _initialized_frontiers.add(database_key)
     return connection
 
 
@@ -392,6 +411,8 @@ def claim_source(
     now: float | None = None,
     respect_provider_circuits: bool = False,
     provider_weights: Mapping[str, float] | None = None,
+    provider_max_active: Mapping[str, int] | None = None,
+    provider_min_claim_interval_seconds: Mapping[str, float] | None = None,
 ) -> dict[str, Any] | None:
     """Atomically lease the highest-priority ready source in one stage."""
     if state not in ACTIVE_STATES:
@@ -403,6 +424,16 @@ def claim_source(
         str(platform): float(weight)
         for platform, weight in (provider_weights or {}).items()
         if float(weight) > 0
+    }
+    max_active = {
+        str(platform): int(limit)
+        for platform, limit in (provider_max_active or {}).items()
+        if int(limit) > 0
+    }
+    min_claim_intervals = {
+        str(platform): float(interval)
+        for platform, interval in (provider_min_claim_interval_seconds or {}).items()
+        if float(interval) > 0
     }
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -423,14 +454,35 @@ def claim_source(
         parameters: list[Any] = [state, timestamp, timestamp, worker]
         if respect_provider_circuits:
             parameters.extend((timestamp, timestamp, worker))
-        parameters.extend((worker, timestamp, json.dumps(weights)))
+        parameters.extend(
+            (
+                timestamp,
+                json.dumps(max_active),
+                worker,
+                timestamp,
+                json.dumps(weights),
+            )
+        )
         row = connection.execute(
             f"""SELECT candidate.* FROM source_jobs AS candidate
             {circuit_join}
+            LEFT JOIN source_provider_claim_rates AS rate
+            ON rate.platform=candidate.platform
             WHERE candidate.state=? AND candidate.available_at<=?
             AND (candidate.lease_expires_at IS NULL
                  OR candidate.lease_expires_at<=? OR candidate.lease_owner=?)
             {circuit_filter}
+            AND (rate.last_claim_at IS NULL OR rate.last_claim_at <= ? -
+                COALESCE(CAST(json_extract(
+                    ?, '$.' || candidate.platform
+                ) AS REAL), 0.0))
+            AND (SELECT COUNT(*) FROM source_jobs AS capped
+                 WHERE capped.platform=candidate.platform
+                   AND capped.state=candidate.state
+                   AND capped.lease_expires_at>?) <
+                COALESCE(CAST(json_extract(
+                    ?, '$.' || candidate.platform
+                ) AS INTEGER), 2147483647)
             ORDER BY CASE WHEN candidate.lease_owner=? THEN 0 ELSE 1 END,
             (SELECT COUNT(*) FROM source_jobs AS active
              WHERE active.platform=candidate.platform
@@ -441,7 +493,9 @@ def claim_source(
             ) AS REAL), 1.0), 0.01) ASC,
             candidate.priority DESC, candidate.discovered_at,
             candidate.source_key LIMIT 1""",
-            parameters,
+            parameters[: (7 if respect_provider_circuits else 4)]
+            + [timestamp, json.dumps(min_claim_intervals)]
+            + parameters[(7 if respect_provider_circuits else 4) :],
         ).fetchone()
         if row is None:
             connection.commit()
@@ -483,6 +537,13 @@ def claim_source(
         if changed != 1:
             connection.rollback()
             return None
+        if row["platform"] in min_claim_intervals:
+            connection.execute(
+                """INSERT INTO source_provider_claim_rates(platform,last_claim_at)
+                VALUES(?,?) ON CONFLICT(platform) DO UPDATE SET
+                last_claim_at=excluded.last_claim_at""",
+                (row["platform"], timestamp),
+            )
         claimed = connection.execute(
             "SELECT * FROM source_jobs WHERE source_key=?",
             (row["source_key"],),
@@ -845,6 +906,161 @@ def downloaded_queue_bytes(connection: sqlite3.Connection) -> int:
     return total
 
 
+def _active_download_process(
+    *,
+    source_url: str,
+    video_id: str,
+    now: float,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any] | None:
+    """Find one live direct-download process without spawning a process monitor."""
+    matches: list[dict[str, Any]] = []
+    try:
+        entries = proc_root.iterdir()
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", errors="replace"
+            )
+        except OSError:
+            continue
+        if "sam-media-direct-download-" not in command:
+            continue
+        matches_source = bool(source_url and source_url in command) or bool(
+            video_id and video_id in command
+        )
+        if not matches_source:
+            continue
+        try:
+            started_at = entry.stat().st_ctime
+        except OSError:
+            started_at = now
+        staging_match = re.search(
+            r"(?P<path>/[^\s\"']*/\.source-download-[^/\s\"']+)", command
+        )
+        proxy_match = re.search(r"proxy-(?P<slot>\d+)\.conf", command)
+        matches.append(
+            {
+                "pid": int(entry.name),
+                "command": command,
+                "started_at": started_at,
+                "elapsed_seconds": max(0.0, now - started_at),
+                "staging_path": (
+                    staging_match.group("path") if staging_match is not None else None
+                ),
+                "proxy_slot": (
+                    int(proxy_match.group("slot")) if proxy_match is not None else None
+                ),
+            }
+        )
+    return max(matches, key=lambda item: item["started_at"]) if matches else None
+
+
+def download_worker_detail(
+    workspace: Path,
+    worker: str,
+    *,
+    now: float | None = None,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any] | None:
+    """Return lazy, bounded telemetry for one download worker."""
+    timestamp = time.time() if now is None else now
+    connection = connect_frontier(workspace)
+    worker_row = connection.execute(
+        "SELECT * FROM source_workers WHERE worker=? AND stage='download'", (worker,)
+    ).fetchone()
+    if worker_row is None:
+        connection.close()
+        return None
+    job = connection.execute(
+        """SELECT source_key,platform,video_id,candidate_json,lease_started_at,
+        lease_expires_at FROM source_jobs WHERE lease_owner=? AND state='discovered'
+        AND lease_expires_at>? ORDER BY lease_started_at DESC LIMIT 1""",
+        (worker, timestamp),
+    ).fetchone()
+    connection.close()
+    updated = datetime.fromisoformat(str(worker_row["updated_at"])).timestamp()
+    heartbeat_age = max(0.0, timestamp - updated)
+    details = json.loads(worker_row["details_json"] or "{}")
+    if worker_row["state"] == "paused":
+        activity = "paused"
+    elif job is not None:
+        activity = "working"
+    elif heartbeat_age < 30.0:
+        activity = "idle"
+    else:
+        activity = "stale"
+    result: dict[str, Any] = {
+        "worker": worker,
+        "activity": activity,
+        "heartbeat_age_seconds": round(heartbeat_age, 1),
+        "last_status": details.get("last_status"),
+        "source": None,
+        "transfer": None,
+    }
+    if job is None:
+        return result
+    try:
+        candidates = json.loads(job["candidate_json"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        candidates = []
+    candidate = candidates[0] if candidates else {}
+    source_url = str(candidate.get("source_url") or "")
+    video_id = str(job["video_id"] or candidate.get("video_id") or "")
+    result["source"] = {
+        "source_key": job["source_key"],
+        "platform": job["platform"],
+        "video_id": video_id,
+        "title": candidate.get("title"),
+        "url": source_url,
+        "duration_seconds": candidate.get("duration_seconds"),
+    }
+    process = _active_download_process(
+        source_url=source_url,
+        video_id=video_id,
+        now=timestamp,
+        proc_root=proc_root,
+    )
+    if process is None:
+        result["transfer"] = {
+            "status": "starting_or_finalizing",
+            "bytes": None,
+            "average_megabytes_per_second": None,
+            "elapsed_seconds": max(0.0, timestamp - float(job["lease_started_at"])),
+            "proxy_slot": None,
+        }
+        return result
+    staging_path = process["staging_path"]
+    transferred_bytes = 0
+    if staging_path:
+        try:
+            transferred_bytes = sum(
+                path.stat().st_size
+                for path in Path(staging_path).rglob("*")
+                if path.is_file()
+            )
+        except OSError:
+            transferred_bytes = 0
+    elapsed = float(process["elapsed_seconds"])
+    is_probe = "--skip-download" in str(process["command"])
+    result["transfer"] = {
+        "status": "probing" if is_probe else "downloading",
+        "bytes": transferred_bytes,
+        "average_megabytes_per_second": (
+            round(transferred_bytes / 1_000_000.0 / elapsed, 3)
+            if transferred_bytes and elapsed > 0.0
+            else 0.0 if not is_probe else None
+        ),
+        "elapsed_seconds": round(elapsed, 1),
+        "proxy_slot": process["proxy_slot"],
+    }
+    return result
+
+
 def _percentile(values: list[float], quantile: float) -> float | None:
     if not values:
         return None
@@ -893,8 +1109,10 @@ def frontier_snapshot(
     workspace: Path,
     *,
     window_minutes: float = 15.0,
+    clip_seconds: float = 30.0,
     now: float | None = None,
     catalog_path: Path | None = None,
+    cached_discovery_strategies: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return queue and recent-stage health without mutating frontier state."""
     path = workspace / FRONTIER_FILENAME
@@ -922,11 +1140,6 @@ def frontier_snapshot(
             else None
         )
     cutoff = _now_iso(timestamp - window_minutes * 60.0)
-    events = connection.execute(
-        """SELECT stage,outcome,duration_seconds FROM source_stage_events
-        WHERE finished_at>=?""",
-        (cutoff,),
-    ).fetchall()
     platform_events = connection.execute(
         """SELECT j.platform,e.stage,e.outcome,e.duration_seconds,e.details_json,
         json_extract(j.candidate_json,'$[0].duration_seconds') AS source_duration
@@ -936,28 +1149,66 @@ def frontier_snapshot(
     ).fetchall()
     stage_metrics: dict[str, dict[str, Any]] = {}
     for stage in STAGE_FOR_STATE.values():
-        selected = [row for row in events if row["stage"] == stage]
+        selected = [row for row in platform_events if row["stage"] == stage]
         active = [
             row for row in selected if not str(row["outcome"]).startswith("cache_")
         ]
         durations = [float(row["duration_seconds"]) for row in active]
         outcomes = Counter(str(row["outcome"]) for row in selected)
+        if stage == "extract":
+            audio_seconds = 0.0
+            for row in active:
+                try:
+                    details = json.loads(row["details_json"] or "{}")
+                    published = max(0, int(details.get("clips_published") or 0))
+                    audio_seconds += published * clip_seconds
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+            audio_basis = "published_clips"
+        else:
+            audio_rows = (
+                [
+                    row
+                    for row in active
+                    if row["outcome"] in {"success", "recovered"}
+                ]
+                if stage == "download"
+                else active
+            )
+            audio_seconds = sum(
+                max(0.0, float(row["source_duration"] or 0.0))
+                for row in audio_rows
+            )
+            audio_basis = (
+                "successful_source_duration"
+                if stage == "download"
+                else "source_duration"
+            )
         stage_metrics[stage] = {
             "events": len(selected),
             "per_minute": round(len(selected) / max(window_minutes, 1e-9), 4),
             "active_events": len(active),
             "active_per_minute": round(len(active) / max(window_minutes, 1e-9), 4),
+            "audio_hours_per_hour": round(
+                audio_seconds / max(window_minutes * 60.0, 1e-9), 4
+            ),
+            "audio_basis": audio_basis,
             "outcomes": dict(outcomes),
             "duration_p50_seconds": _percentile(durations, 0.5),
             "duration_p95_seconds": _percentile(durations, 0.95),
+            "window_minutes": window_minutes,
         }
     platform_metrics: dict[str, dict[str, Any]] = {}
     platform_counts = frontier_platform_counts(connection)
     circuits = provider_circuit_snapshot(connection, now=timestamp)
-    discovery_strategies = _cached_discovery_strategy_snapshot(
-        connection,
-        workspace=workspace,
-        catalog_path=catalog_path,
+    discovery_strategies = (
+        cached_discovery_strategies
+        if cached_discovery_strategies is not None
+        else _cached_discovery_strategy_snapshot(
+            connection,
+            workspace=workspace,
+            catalog_path=catalog_path,
+        )
     )
     for platform in sorted(platform_counts):
         downloads = [
@@ -1015,15 +1266,40 @@ def frontier_snapshot(
         int(metrics["downloaded_bytes"]) for metrics in platform_metrics.values()
     )
     queue_bytes = downloaded_queue_bytes(connection)
+    active_jobs = {
+        str(row["lease_owner"]): dict(row)
+        for row in connection.execute(
+            """SELECT lease_owner,source_key,platform,state,lease_started_at,
+            lease_expires_at FROM source_jobs
+            WHERE lease_owner IS NOT NULL AND lease_expires_at>?
+            ORDER BY lease_started_at""",
+            (timestamp,),
+        )
+    }
     workers = []
     for row in connection.execute("SELECT * FROM source_workers ORDER BY worker"):
         updated = datetime.fromisoformat(str(row["updated_at"])).timestamp()
+        heartbeat_age = max(0.0, timestamp - updated)
+        health = row["state"] if heartbeat_age < 30.0 else "stale"
+        active_job = active_jobs.get(str(row["worker"]))
+        if row["state"] == "paused":
+            activity = "paused"
+        elif active_job is not None:
+            # Long downloads can exceed the heartbeat threshold. The active
+            # lease is authoritative evidence that the worker is still busy.
+            activity = "working"
+        elif health == "running":
+            activity = "idle"
+        else:
+            activity = "stale"
         workers.append(
             {
                 "worker": row["worker"],
                 "stage": row["stage"],
-                "state": (row["state"] if timestamp - updated < 30.0 else "stale"),
+                "state": health,
+                "activity": activity,
                 "updated_at": row["updated_at"],
+                "heartbeat_age_seconds": round(heartbeat_age, 1),
                 "details": json.loads(row["details_json"]),
             }
         )
@@ -1042,6 +1318,13 @@ def frontier_snapshot(
                 completed_download_bytes
                 / max(window_minutes * 60.0, 1e-9)
                 / 1_000_000.0,
+                3,
+            ),
+            "source_audio_hours_per_wall_hour": round(
+                sum(
+                    float(metrics["source_audio_hours_per_wall_hour"])
+                    for metrics in platform_metrics.values()
+                ),
                 3,
             ),
             "host_network": _host_receive_rate(timestamp)

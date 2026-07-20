@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,9 @@ SCAN_POLICY_VERSION = "whole_source_proxy_m2d_v1"
 PROXY_SAMPLE_RATE = 16_000
 PROXY_ACTIVITY_DBFS = -50.0
 REGION_HOP_SECONDS = 5.0
+DEFAULT_TARGET_SCAN_WINDOWS = 3_600
+DEFAULT_MAX_WINDOW_HOP_SECONDS = 5.0
+DEFAULT_LONG_SOURCE_INFERENCE_CONCURRENCY = 2
 MIN_REGION_FOREGROUND_SPEECH_COVERAGE = 0.48
 MAX_REGION_VOCAL_MUSIC_COVERAGE = 0.11
 
@@ -65,6 +69,7 @@ def select_candidate_regions(
     clip_seconds: float,
     max_regions: int,
     region_hop_seconds: float = REGION_HOP_SECONDS,
+    window_hop_seconds: float = WINDOW_HOP_SECONDS,
 ) -> list[dict[str, Any]]:
     """Select high-confidence non-overlapping regions from one scored timeline."""
     if clip_seconds < WINDOW_SECONDS:
@@ -73,23 +78,25 @@ def select_candidate_regions(
         raise ValueError("max_regions must be positive")
     if region_hop_seconds <= 0:
         raise ValueError("region_hop_seconds must be positive")
+    if window_hop_seconds <= 0:
+        raise ValueError("window_hop_seconds must be positive")
     windows_per_region = (
-        math.floor((clip_seconds - WINDOW_SECONDS) / WINDOW_HOP_SECONDS) + 1
+        math.floor((clip_seconds - WINDOW_SECONDS) / window_hop_seconds) + 1
     )
-    region_hop_windows = max(1, round(region_hop_seconds / WINDOW_HOP_SECONDS))
+    region_hop_windows = max(1, round(region_hop_seconds / window_hop_seconds))
     ranked: list[dict[str, Any]] = []
     for first in range(
         0,
         max(0, len(probabilities) - windows_per_region + 1),
         region_hop_windows,
     ):
-        start = first * WINDOW_HOP_SECONDS
+        start = first * window_hop_seconds
         evaluation = evaluate_probabilities(
             probabilities[first : first + windows_per_region],
             labels,
             families,
             starts=[
-                start + offset * WINDOW_HOP_SECONDS
+                start + offset * window_hop_seconds
                 for offset in range(windows_per_region)
             ],
             require_cinematic_mix=True,
@@ -132,6 +139,11 @@ class M2DSourceScanner:
         device: str = "cuda",
         batch_size: int = 128,
         inference_concurrency: int = 2,
+        target_scan_windows: int = DEFAULT_TARGET_SCAN_WINDOWS,
+        max_window_hop_seconds: float = DEFAULT_MAX_WINDOW_HOP_SECONDS,
+        long_source_inference_concurrency: int = (
+            DEFAULT_LONG_SOURCE_INFERENCE_CONCURRENCY
+        ),
     ) -> None:
         try:
             import soundfile as sf
@@ -154,8 +166,19 @@ class M2DSourceScanner:
         self.batch_size = max(1, batch_size)
         self.sample_rate = int(self.model.cfg.sample_rate)
         self.inference_concurrency = max(1, inference_concurrency)
+        self.target_scan_windows = max(1, target_scan_windows)
+        self.max_window_hop_seconds = max(
+            WINDOW_HOP_SECONDS, max_window_hop_seconds
+        )
         self._inference_slots = threading.BoundedSemaphore(
             self.inference_concurrency
+        )
+        self.long_source_inference_concurrency = max(
+            1,
+            min(long_source_inference_concurrency, self.inference_concurrency),
+        )
+        self._long_source_inference_slots = threading.BoundedSemaphore(
+            self.long_source_inference_concurrency
         )
 
     def create_proxy(self, source: Path, destination: Path) -> None:
@@ -221,17 +244,35 @@ class M2DSourceScanner:
             )
         }
 
-    def _probabilities(self, proxy: Path) -> tuple[np.ndarray, int, float]:
+    def _window_hop_seconds(self, total_frames: int) -> float:
+        duration_seconds = total_frames / self.sample_rate
+        return max(
+            WINDOW_HOP_SECONDS,
+            min(
+                self.max_window_hop_seconds,
+                duration_seconds / self.target_scan_windows,
+            ),
+        )
+
+    def _proxy_window_hop_seconds(self, proxy: Path) -> float:
+        with self.soundfile.SoundFile(str(proxy)) as audio:
+            if audio.channels != 2 or audio.samplerate != self.sample_rate:
+                raise ValueError("Proxy must be stereo at the M2D sample rate")
+            return self._window_hop_seconds(len(audio))
+
+    def _probabilities(
+        self, proxy: Path, *, window_hop_seconds: float
+    ) -> tuple[np.ndarray, int, float, float]:
         started = time.perf_counter()
         window_frames = round(WINDOW_SECONDS * self.sample_rate)
         model_frames = max(window_frames, 3 * self.sample_rate)
-        hop_frames = round(WINDOW_HOP_SECONDS * self.sample_rate)
         all_probabilities: list[np.ndarray] = []
         active_windows = 0
         with self.soundfile.SoundFile(str(proxy)) as audio:
             if audio.channels != 2 or audio.samplerate != self.sample_rate:
                 raise ValueError("Proxy must be stereo at the M2D sample rate")
             total_frames = len(audio)
+            hop_frames = round(window_hop_seconds * self.sample_rate)
             window_count = max(
                 0, math.floor((total_frames - window_frames) / hop_frames) + 1
             )
@@ -276,7 +317,12 @@ class M2DSourceScanner:
             if all_probabilities
             else np.empty((0, len(self.labels)), dtype=np.float32)
         )
-        return probabilities, active_windows, time.perf_counter() - started
+        return (
+            probabilities,
+            active_windows,
+            time.perf_counter() - started,
+            window_hop_seconds,
+        )
 
     def scan(
         self,
@@ -285,16 +331,31 @@ class M2DSourceScanner:
         clip_seconds: float,
         max_regions: int,
     ) -> dict[str, Any]:
-        with self._inference_slots:
-            probabilities, active_windows, inference_seconds = self._probabilities(
-                proxy
-            )
+        window_hop_seconds = self._proxy_window_hop_seconds(proxy)
+        long_source_slot = (
+            self._long_source_inference_slots
+            if window_hop_seconds > WINDOW_HOP_SECONDS
+            else nullcontext()
+        )
+        wait_started = time.perf_counter()
+        with long_source_slot:
+            with self._inference_slots:
+                inference_wait_seconds = time.perf_counter() - wait_started
+                (
+                    probabilities,
+                    active_windows,
+                    inference_seconds,
+                    window_hop_seconds,
+                ) = self._probabilities(
+                    proxy, window_hop_seconds=window_hop_seconds
+                )
         regions = select_candidate_regions(
             probabilities,
             self.labels,
             self.families,
             clip_seconds=clip_seconds,
             max_regions=max_regions,
+            window_hop_seconds=window_hop_seconds,
         )
         return {
             "policy": SCAN_POLICY_VERSION,
@@ -302,7 +363,13 @@ class M2DSourceScanner:
             "proxy_activity_threshold_dbfs": PROXY_ACTIVITY_DBFS,
             "m2d_windows": len(probabilities),
             "m2d_inference_concurrency": self.inference_concurrency,
+            "long_source_inference_concurrency": (
+                self.long_source_inference_concurrency
+            ),
             "active_proxy_windows": active_windows,
+            "window_hop_seconds": round(window_hop_seconds, 4),
+            "target_scan_windows": self.target_scan_windows,
+            "inference_wait_seconds": round(inference_wait_seconds, 3),
             "scan_seconds": round(inference_seconds, 3),
             "regions": regions,
         }

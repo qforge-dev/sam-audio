@@ -173,6 +173,49 @@ def test_discovery_refresh_does_not_reset_existing_sources(
     assert frontier_counts(connection)["discovered"] == 1
 
 
+def test_exhausted_discovery_batch_advances_without_process_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    seed_file = tmp_path / "next-seed"
+
+    def exhausted(*args, **kwargs):
+        raise source_pipeline.youtube_random.DiscoveryCandidatesExhausted(
+            "Only discovered 0 candidates; need at least 1"
+        )
+
+    monkeypatch.setattr(source_pipeline, "discover_candidates", exhausted)
+    args = SimpleNamespace(
+        workspace=tmp_path / "workspace",
+        discovery_dir=tmp_path / "discovery",
+        source="vimeo",
+        profile="cinematic",
+        clip_seconds=30.0,
+        query_count=1,
+        results_per_query=1,
+        search_workers=1,
+        minimum_candidates=1,
+        clips_per_video=16,
+        source_content_minutes_per_hour=10.0,
+        max_clips_per_video=60,
+        discovered_high_water=10,
+        platform_high_water=10,
+        scan_cache=None,
+        cached_scan_high_water=4,
+        seed_file=seed_file,
+        status_file=tmp_path / "status.json",
+        seed=42,
+        once=True,
+        retry_seconds=1.0,
+        poll_seconds=1.0,
+        high_water_poll_seconds=1.0,
+    )
+
+    run_discovery(args)
+
+    assert seed_file.read_text() == "43\n"
+    assert json.loads(args.status_file.read_text())["status"] == "exhausted"
+
+
 def test_one_shot_discovery_advances_past_a_poison_seed(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -416,6 +459,7 @@ def test_download_stage_atomically_publishes_a_valid_source(
     )
 
     def download(candidate, root):
+        assert candidate["_proxy_slot"] == 0
         path = root / "source.mp4"
         path.write_bytes(b"media")
         return path, {"format_id": "hls-380"}
@@ -606,6 +650,7 @@ class FakeScanner:
             ]
         return {
             "m2d_windows": 100,
+            "inference_wait_seconds": 0.5,
             "scan_seconds": 1.25,
             "regions": regions,
         }
@@ -621,7 +666,7 @@ def _scan_settings(tmp_path: Path) -> ScanSettings:
     )
 
 
-def test_scan_stage_persists_cache_and_releases_source_storage(
+def test_scan_stage_persists_cache_and_retains_source_for_extraction(
     tmp_path: Path, monkeypatch
 ) -> None:
     settings = _scan_settings(tmp_path)
@@ -642,7 +687,11 @@ def test_scan_stage_persists_cache_and_releases_source_storage(
     assert result is not None
     assert result["status"] == "scanned"
     assert result["passing_regions"] == 1
-    assert not work_dir.exists()
+    assert result["inference_wait_seconds"] == 0.5
+    assert result["stereo_metrics_seconds"] >= 0
+    assert work_dir.exists()
+    assert (work_dir / "source.mp4").is_file()
+    assert not (work_dir / "proxy.flac").exists()
     cache_files = list(settings.scan_cache.glob("*.json"))
     assert len(cache_files) == 1
     connection = connect_frontier(settings.workspace)

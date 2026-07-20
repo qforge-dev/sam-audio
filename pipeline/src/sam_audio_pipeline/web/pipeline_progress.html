@@ -5,14 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Dataset Pipeline Progress</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b1016; --panel:#121a23; --panel2:#18232f; --line:#293848; --text:#eef5fb; --muted:#90a2b4; --blue:#67b7ff; --green:#56d491; --gold:#f7c75d; }
+    :root { color-scheme: dark; --bg:#0b1016; --panel:#121a23; --panel2:#18232f; --line:#293848; --text:#eef5fb; --muted:#90a2b4; --blue:#67b7ff; --green:#56d491; --gold:#f7c75d; --red:#ff8b8b; }
     * { box-sizing: border-box; }
     [hidden] { display:none !important; }
     body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 Inter,ui-sans-serif,system-ui,sans-serif; }
     header { display:flex; align-items:center; gap:16px; padding:16px 24px; border-bottom:1px solid var(--line); background:rgba(11,16,22,.96); position:sticky; top:0; z-index:2; }
     h1 { margin:0; font-size:18px; } h2 { margin:0 0 5px; font-size:22px; }
     header p { margin:2px 0 0; color:var(--muted); font-size:12px; }
-    .back { margin-left:auto; color:var(--text); border:1px solid var(--line); border-radius:9px; padding:8px 11px; text-decoration:none; }
+    .back { color:var(--text); border:1px solid var(--line); border-radius:9px; padding:8px 11px; text-decoration:none; }
+    .back:first-of-type { margin-left:auto; }
     .shell { max-width:1180px; margin:0 auto; padding:32px 22px 70px; }
     .hero { display:grid; grid-template-columns:minmax(0,2fr) minmax(240px,1fr); gap:16px; margin-bottom:16px; }
     .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:20px; }
@@ -26,6 +27,19 @@
     .metric { min-height:130px; }
     .metric strong { display:block; font-size:30px; margin:12px 0 3px; font-variant-numeric:tabular-nums; }
     .metric small { color:var(--muted); }
+    .transform-funnel { grid-template-columns:repeat(3,minmax(0,1fr)); }
+    .transform-card { min-height:156px; }
+    .transform-card .bar { height:7px; margin-top:14px; }
+    .transform-card .bar > div { background:var(--blue); }
+    .bucket-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:12px 0 16px; }
+    .bucket-grid .success { border-color:rgba(86,212,145,.48); }
+    .bucket-grid .review { border-color:rgba(247,199,93,.48); }
+    .bucket-grid .failure { border-color:rgba(255,139,139,.48); }
+    .bucket-strip { display:flex; height:12px; overflow:hidden; border-radius:99px; background:#253240; margin:16px 0 8px; }
+    .bucket-strip span { min-width:0; transition:width .35s; }
+    .bucket-strip .success { background:var(--green); }
+    .bucket-strip .review { background:var(--gold); }
+    .bucket-strip .failure { background:var(--red); }
     .section-head { display:flex; justify-content:space-between; align-items:end; gap:15px; margin:30px 0 10px; }
     .section-head p { margin:0; color:var(--muted); }
     .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:14px; }
@@ -42,6 +56,22 @@
     .worker.complete { color:var(--green); }
     .pipeline { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; }
     .pipeline span { padding:6px 9px; border-radius:8px; background:var(--panel2); border:1px solid var(--line); color:#bdcad5; }
+    .download-worker-panel { padding:16px; }
+    .download-worker-summary { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+    .download-worker-summary span { display:inline-flex; align-items:center; gap:7px; padding:5px 9px; border:1px solid var(--line); border-radius:99px; color:var(--muted); font-size:12px; }
+    .download-worker-summary i { width:9px; height:9px; border-radius:3px; background:var(--muted); }
+    .download-worker-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(22px,1fr)); gap:6px; }
+    .download-worker-cell { aspect-ratio:1; min-width:0; border:1px solid var(--line); border-radius:6px; background:#0e151d; box-shadow:inset 0 0 0 1px rgba(255,255,255,.015); transition:background-color .2s,border-color .2s,opacity .2s; }
+    .download-worker-cell.working,.download-worker-summary i.working { background:var(--green); border-color:var(--green); }
+    .download-worker-cell.idle,.download-worker-summary i.idle { background:#294158; border-color:#456683; }
+    .download-worker-cell.paused,.download-worker-summary i.paused { background:var(--gold); border-color:var(--gold); opacity:.78; }
+    .download-worker-cell.stale,.download-worker-summary i.stale { background:var(--red); border-color:var(--red); }
+    .download-worker-cell.unknown,.download-worker-summary i.unknown { background:#202a34; border-color:#40505f; opacity:.6; }
+    .download-worker-note { margin:12px 0 0; font-size:12px; }
+    .download-worker-tooltip { position:fixed; z-index:20; width:min(360px,calc(100vw - 24px)); padding:12px 14px; border:1px solid #456683; border-radius:10px; background:#0b1118; box-shadow:0 14px 40px rgba(0,0,0,.42); pointer-events:none; }
+    .download-worker-tooltip strong { display:block; margin-bottom:3px; font-size:13px; }
+    .download-worker-tooltip p { margin:4px 0; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+    .download-worker-tooltip .worker-transfer { color:var(--text); }
     .flow-note { margin:-4px 0 16px; padding:13px 16px; border:1px solid var(--line); border-radius:11px; background:var(--panel2); color:var(--muted); }
     .flow-note.balanced { border-color:rgba(86,212,145,.35); color:#bcebd2; }
     .flow-note.healthy { border-color:rgba(86,212,145,.35); color:#bcebd2; }
@@ -58,6 +88,8 @@
   <header>
     <div><h1>Dataset Pipeline Progress</h1><p id="updated">Connecting to the live worker…</p></div>
     <a class="back" id="reviewLink" href="/">Review clips</a>
+    <a class="back" id="trainingLink" href="/training">Training snapshots</a>
+    <a class="back" id="balanceLink" href="/training/balance">Dataset balance</a>
   </header>
   <main class="shell">
     <section class="hero">
@@ -79,6 +111,22 @@
     <p class="flow-note" id="flowNote" hidden></p>
     <div class="section-head" id="sourceFrontierHeading" hidden><div><h2>End-to-end queue funnel</h2><p>Every stage uses the same queue depth, oldest-item age, processing-rate, latency, and event-count format.</p></div></div>
     <section class="funnel" id="sourceFrontier" hidden></section>
+    <p class="flow-note" id="sourceFrontierNote" hidden></p>
+    <div class="section-head" id="transformationHeading" hidden><div><h2>Dialogue/background transformation</h2><p>How much of the accepted source pool has been stemmed, packaged for review, and published in the newest caption revision.</p></div></div>
+    <section class="funnel transform-funnel" id="transformation" hidden></section>
+    <section class="card" id="transformationBucketsPanel" hidden>
+      <div class="eyebrow" id="transformationBucketTitle">Newest version quality buckets</div>
+      <div class="bucket-strip" id="transformationBucketStrip" aria-label="Newest version bucket distribution"></div>
+      <div class="bucket-grid" id="transformationBuckets"></div>
+      <p class="muted" id="transformationNote"></p>
+    </section>
+    <div class="section-head" id="downloadWorkerHeading" hidden><div><h2>Download workers</h2><p>One cell per configured worker. Hover a cell to see its ID and latest state.</p></div></div>
+    <section class="card download-worker-panel" id="downloadWorkerPanel" hidden>
+      <div class="download-worker-summary" id="downloadWorkerSummary"></div>
+      <div class="download-worker-grid" id="downloadWorkerGrid" role="list" aria-label="Download worker states"></div>
+      <p class="muted download-worker-note" id="downloadWorkerNote"></p>
+    </section>
+    <div class="download-worker-tooltip" id="downloadWorkerTooltip" role="tooltip" hidden></div>
     <section class="funnel" id="funnel" hidden></section>
     <div class="section-head" id="autoscalerHeading" hidden><div><h2>Adaptive worker control</h2><p>Queue pressure and aggregate host resources determine live concurrency limits.</p></div></div>
     <section class="funnel" id="autoscaler" hidden></section>
@@ -106,7 +154,126 @@
     const $ = id => document.getElementById(id);
     const number = value => new Intl.NumberFormat().format(value || 0);
     const label = value => String(value || 'waiting').replaceAll('_',' ');
-    $('reviewLink').href = `${BASE}/`;
+    const hours = value => `${Number(value || 0).toFixed(2)} audio h`;
+    let downloadWorkerPoolSize = -1;
+    const downloadWorkerCells = new Map();
+    const downloadWorkerDetailCache = new Map();
+    let downloadWorkerHoverTimer = null;
+    let hoveredDownloadWorker = null;
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
+    const bytes = value => {
+      if (value == null) return 'size unavailable';
+      const units = ['B','KB','MB','GB'];
+      let amount = Number(value || 0); let unit = 0;
+      while (amount >= 1000 && unit < units.length - 1) { amount /= 1000; unit += 1; }
+      return `${amount.toFixed(unit >= 2 ? 1 : 0)} ${units[unit]}`;
+    };
+    function positionDownloadWorkerTooltip(cell) {
+      const tooltip = $('downloadWorkerTooltip');
+      const rect = cell.getBoundingClientRect();
+      const width = Math.min(360, innerWidth - 24);
+      const left = Math.max(12, Math.min(innerWidth - width - 12, rect.left + rect.width / 2 - width / 2));
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${Math.min(innerHeight - tooltip.offsetHeight - 12, rect.bottom + 8)}px`;
+    }
+    function showDownloadWorkerTooltip(cell, detail) {
+      const tooltip = $('downloadWorkerTooltip');
+      const source = detail.source || {};
+      const transfer = detail.transfer || {};
+      const speed = transfer.average_megabytes_per_second == null ? 'speed unavailable' : `${Number(transfer.average_megabytes_per_second).toFixed(2)} MB/s avg`;
+      const sourceLine = source.url || source.source_key || 'No active source';
+      const transferLine = detail.activity === 'working' ? `${label(transfer.status)} · ${bytes(transfer.bytes)} · ${speed} · ${Number(transfer.elapsed_seconds || 0).toFixed(0)}s` : `Last result: ${label(detail.last_status || 'none')} · heartbeat ${Number(detail.heartbeat_age_seconds || 0).toFixed(0)}s ago`;
+      tooltip.innerHTML = `<strong>${escapeHtml(detail.worker)} · ${escapeHtml(label(detail.activity))}</strong><p>${escapeHtml(source.title || sourceLine)}</p>${source.title ? `<p>${escapeHtml(sourceLine)}</p>` : ''}<p class="worker-transfer">${escapeHtml(transferLine)}</p>${transfer.proxy_slot == null ? '' : `<p>Proxy slot ${escapeHtml(transfer.proxy_slot)} · ${escapeHtml(label(source.platform))}</p>`}`;
+      tooltip.hidden = false;
+      positionDownloadWorkerTooltip(cell);
+    }
+    async function loadDownloadWorkerTooltip(cell) {
+      const worker = cell.dataset.worker;
+      if (hoveredDownloadWorker !== worker) return;
+      const cached = downloadWorkerDetailCache.get(worker);
+      if (cached && Date.now() - cached.fetchedAt < 5000) {
+        showDownloadWorkerTooltip(cell, cached.detail);
+        return;
+      }
+      const tooltip = $('downloadWorkerTooltip');
+      tooltip.innerHTML = `<strong>${escapeHtml(worker)}</strong><p>Loading current download…</p>`;
+      tooltip.hidden = false;
+      positionDownloadWorkerTooltip(cell);
+      try {
+        const response = await fetch(`${BASE}/api/progress/download-workers/${encodeURIComponent(worker)}`, {cache:'no-store'});
+        if (!response.ok) throw new Error(`Worker detail returned ${response.status}`);
+        const detail = await response.json();
+        downloadWorkerDetailCache.set(worker, {fetchedAt:Date.now(), detail});
+        if (hoveredDownloadWorker === worker) showDownloadWorkerTooltip(cell, detail);
+      } catch (error) {
+        if (hoveredDownloadWorker === worker) {
+          tooltip.innerHTML = `<strong>${escapeHtml(worker)}</strong><p>Current detail is temporarily unavailable.</p>`;
+          positionDownloadWorkerTooltip(cell);
+        }
+      }
+    }
+    function renderDownloadWorkers(frontier) {
+      const workers = (frontier.workers || []).filter(worker => worker.stage === 'download');
+      const byName = new Map(workers.map(worker => [worker.worker, worker]));
+      const configuredLimit = Number(frontier.autoscaler?.limits?.download);
+      const observedLimit = workers.reduce((maximum, worker) => {
+        const match = /^download-(\d+)$/.exec(worker.worker || '');
+        return match ? Math.max(maximum, Number(match[1]) + 1) : maximum;
+      }, 0);
+      const poolSize = Number.isFinite(configuredLimit) && configuredLimit >= 0 ? configuredLimit : observedLimit;
+      if (poolSize !== downloadWorkerPoolSize) {
+        downloadWorkerPoolSize = poolSize;
+        downloadWorkerCells.clear();
+        const fragment = document.createDocumentFragment();
+        for (let index = 0; index < poolSize; index += 1) {
+          const name = `download-${index}`;
+          const cell = document.createElement('span');
+          cell.className = 'download-worker-cell unknown';
+          cell.setAttribute('role', 'listitem');
+          cell.dataset.worker = name;
+          fragment.appendChild(cell);
+          downloadWorkerCells.set(name, cell);
+        }
+        $('downloadWorkerGrid').replaceChildren(fragment);
+      }
+      const counts = {working:0, idle:0, paused:0, stale:0, unknown:0};
+      for (const [name, cell] of downloadWorkerCells) {
+        const worker = byName.get(name);
+        const activity = ['working','idle','paused','stale'].includes(worker?.activity) ? worker.activity : 'unknown';
+        const lastStatus = worker?.details?.last_status ? ` · last result: ${label(worker.details.last_status)}` : '';
+        const heartbeatAge = worker?.heartbeat_age_seconds == null ? '' : ` · heartbeat ${Number(worker.heartbeat_age_seconds).toFixed(0)}s ago`;
+        const description = `${name} · ${activity}${lastStatus}${heartbeatAge}`;
+        counts[activity] += 1;
+        const className = `download-worker-cell ${activity}`;
+        if (cell.className !== className) cell.className = className;
+        if (cell.getAttribute('aria-label') !== description) {
+          cell.setAttribute('aria-label', description);
+        }
+      }
+      $('downloadWorkerSummary').innerHTML = ['working','idle','paused','stale','unknown']
+        .filter(state => counts[state] || state !== 'unknown')
+        .map(state => `<span><i class="${state}"></i><strong>${number(counts[state])}</strong> ${label(state)}</span>`).join('');
+      $('downloadWorkerNote').textContent = `${number(poolSize)} configured workers · states come from the existing cached progress snapshot; no extra worker polling is performed.`;
+      $('downloadWorkerHeading').hidden = false;
+      $('downloadWorkerPanel').hidden = false;
+    }
+    $('downloadWorkerGrid').addEventListener('mouseover', event => {
+      const cell = event.target.closest('.download-worker-cell');
+      if (!cell || cell.contains(event.relatedTarget)) return;
+      hoveredDownloadWorker = cell.dataset.worker;
+      clearTimeout(downloadWorkerHoverTimer);
+      downloadWorkerHoverTimer = setTimeout(() => loadDownloadWorkerTooltip(cell), 300);
+    });
+    $('downloadWorkerGrid').addEventListener('mouseout', event => {
+      const cell = event.target.closest('.download-worker-cell');
+      if (!cell || cell.contains(event.relatedTarget)) return;
+      clearTimeout(downloadWorkerHoverTimer);
+      hoveredDownloadWorker = null;
+      $('downloadWorkerTooltip').hidden = true;
+    });
+      $('reviewLink').href = `${BASE}/`;
+      $('trainingLink').href = `${BASE}/training`;
+      $('balanceLink').href = `${BASE}/training/balance`;
     const metricDefinitions = [
       ['review_snapshot','Review snapshot','Already materialized and listenable'],
       ['attempts','Download attempts','Sources/positions tried'],
@@ -165,7 +332,8 @@
           const stageText = item => {
             const stage = item || {};
             const p95 = stage.duration_p95_seconds == null ? 'collecting latency' : `p95 ${Number(stage.duration_p95_seconds).toFixed(1)} s`;
-            return `${Number(stage.active_per_minute || 0).toFixed(2)} work/min · ${p95} · ${number(stage.active_events)} work / ${number(stage.events)} total events`;
+            const window = Number(stage.window_minutes || frontier.window_minutes || 0);
+            return `${Number(stage.active_per_minute || 0).toFixed(2)} work/min · ${Number(stage.audio_hours_per_hour || 0).toFixed(2)} audio h/h · rolling ${window.toFixed(0)} min · ${p95} · ${number(stage.active_events)} work / ${number(stage.events)} total events`;
           };
           const queueText = (age, item, prefix = '') => {
             const oldest = age == null ? 'no queued work' : `oldest ${Number(age).toFixed(1)} min`;
@@ -174,7 +342,7 @@
           $('sourceFrontierHeading').hidden = false;
           $('sourceFrontier').hidden = false;
           $('sourceFrontier').innerHTML = [
-            ['Host receive', hostNetwork.receive_megabytes_per_second == null ? 'warming up' : `${Number(hostNetwork.receive_megabytes_per_second).toFixed(1)} MB/s`, `${Number(downloadThroughput.completed_file_megabytes_per_second || 0).toFixed(1)} MB/s in completed source files over ${Number(frontier.window_minutes || 0).toFixed(0)} min · host sample ${Number(hostNetwork.observed_seconds || 0).toFixed(0)} s`],
+            ['Host receive', hostNetwork.receive_megabytes_per_second == null ? 'warming up' : `${Number(hostNetwork.receive_megabytes_per_second).toFixed(1)} MB/s`, `${Number(downloadThroughput.completed_file_megabytes_per_second || 0).toFixed(1)} MB/s in completed source files · ${Number(downloadThroughput.source_audio_hours_per_wall_hour || 0).toFixed(2)} source audio h/h over rolling ${Number(frontier.window_minutes || 0).toFixed(0)} min · raw host sample ${Number(hostNetwork.observed_seconds || 0).toFixed(0)} s`],
             ['Download queue', number(counts.discovered), queueText(ages.discovered, stages.download)],
             ['Scan queue', number(counts.downloaded), queueText(ages.downloaded, stages.scan, `${(Number(frontier.downloaded_queue_bytes || 0) / 1073741824).toFixed(2)} GiB queued`)],
             ['Extraction queue', number(counts.scanned), queueText(ages.scanned, stages.extract)],
@@ -182,6 +350,39 @@
             ['Speech queue', number(data.queues.waiting_for_asr), queueText(pipelineStages.asr?.oldest_ready_minutes, pipelineStages.asr)],
             ['Assembly queue', number(data.queues.waiting_for_assembly), queueText(pipelineStages.assembly?.oldest_ready_minutes, pipelineStages.assembly)]
           ].map(([title,value,help]) => `<div class="card metric"><div class="eyebrow">${title}</div><strong>${value}</strong><small>${help}</small></div>`).join('');
+          $('sourceFrontierNote').hidden = false;
+          $('sourceFrontierNote').textContent = `How to read this: queue depth and oldest age are live snapshots. work/min, audio h/h, p95 latency, and event counts use the rolling ${Number(frontier.window_minutes || 0).toFixed(0)}-minute window. work/min counts completed non-cache work events divided by the full window; “work / total events” shows non-cache work versus all events including cache bookkeeping. Audio h/h uses successfully downloaded source duration for Download, source duration processed by Scan, 30-second clips actually published by Extraction, and completed 30-second clips for M2D, Speech, and Assembly. Host receive is raw network ingress over its separate ${Number(hostNetwork.observed_seconds || 0).toFixed(0)}-second sample.`;
+          const transformation = data.training_transformation;
+          if (transformation) {
+            const sourceTotal = Number(transformation.source?.clips || 0);
+            const stages = [
+              ['Accepted source', transformation.source, 'All clips that survived acquisition validation'],
+              ['Registered', transformation.registered, 'Accepted clips entered into the dialogue/background training pipeline'],
+              ['Stemmed', transformation.stemmed, 'SAM dialogue and background separation completed'],
+              ['Review clips', transformation.review_clips, 'Six-artifact training packages materialized and listenable'],
+              [`Version ${number(transformation.revision)} transformed`, transformation.latest_transformed, 'Newest description format and quality decision completed'],
+              [`Version ${number(transformation.revision)} published`, transformation.latest_published, 'Included in an immutable READY-marked S3 snapshot']
+            ];
+            $('transformationHeading').hidden = false;
+            $('transformation').hidden = false;
+            $('transformation').innerHTML = stages.map(([title,item,help]) => {
+              const clips = Number(item?.clips || 0);
+              const percent = sourceTotal ? clips / sourceTotal * 100 : 0;
+              return `<div class="card metric transform-card"><div class="eyebrow">${title}</div><strong>${number(clips)}</strong><small>${hours(item?.audio_hours)} · ${percent.toFixed(1)}% of accepted source<br>${help}</small><div class="bar"><div style="width:${Math.min(100, percent)}%"></div></div></div>`;
+            }).join('');
+            const buckets = transformation.buckets || {};
+            const bucketTotal = ['success','review','failure'].reduce((sum,key) => sum + Number(buckets[key]?.clips || 0), 0);
+            $('transformationBucketTitle').textContent = `Version ${number(transformation.revision)} quality buckets · all transformed clips`;
+            $('transformationBucketStrip').innerHTML = ['success','review','failure'].map(key => `<span class="${key}" style="width:${bucketTotal ? Number(buckets[key]?.clips || 0) / bucketTotal * 100 : 0}%"></span>`).join('');
+            $('transformationBuckets').innerHTML = ['success','review','failure'].map(key => {
+              const item = buckets[key] || {};
+              const percent = bucketTotal ? Number(item.clips || 0) / bucketTotal * 100 : 0;
+              return `<div class="card metric ${key}"><div class="eyebrow">${label(key)}</div><strong>${number(item.clips)}</strong><small>${hours(item.audio_hours)} · ${percent.toFixed(1)}% of transformed</small></div>`;
+            }).join('');
+            $('transformationBucketsPanel').hidden = false;
+            $('transformationNote').textContent = `${number(transformation.remaining?.clips)} review packages (${hours(transformation.remaining?.audio_hours)}) still need version ${number(transformation.revision)} transformation. Counts are whole-dataset totals refreshed every 15 seconds; audio hours are exact 30-second clip equivalents. Measured ${new Date(transformation.measured_at).toLocaleTimeString()}.`;
+          }
+          renderDownloadWorkers(frontier);
           const autoscaler = data.autoscaler || {};
           if (autoscaler.enabled) {
             const gpu = autoscaler.gpu || {};

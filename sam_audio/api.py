@@ -110,6 +110,9 @@ class InferenceService:
         )
         self.predecode_inputs = _env_bool("SAM_AUDIO_PREDECODE_INPUTS", True)
         self.async_outputs = _env_bool("SAM_AUDIO_ASYNC_OUTPUTS", True)
+        self.disable_visual_ranker = _env_bool(
+            "SAM_AUDIO_DISABLE_VISUAL_RANKER", False
+        )
         self.request_timeout = float(os.environ.get("SAM_AUDIO_REQUEST_TIMEOUT", "900"))
         self.model: SAMAudio | None = None
         self.processor: SAMAudioProcessor | None = None
@@ -124,7 +127,10 @@ class InferenceService:
             self.dtype_policy,
         )
         self.processor = SAMAudioProcessor.from_pretrained(self.model_id)
-        self.model = SAMAudio.from_pretrained(self.model_id)
+        model_overrides = (
+            {"visual_ranker": None} if self.disable_visual_ranker else {}
+        )
+        self.model = SAMAudio.from_pretrained(self.model_id, **model_overrides)
         self.model.eval().to(self.device)
         for name in ("text_ranker", "visual_ranker"):
             ranker = getattr(self.model, name, None)

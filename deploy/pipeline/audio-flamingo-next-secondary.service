@@ -1,5 +1,5 @@
 [Unit]
-Description=Audio Flamingo Next inference API
+Description=Audio Flamingo Next inference API for caption v4 backfill
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/sam-audio-deploy/pipeline
-EnvironmentFile=/etc/audio-flamingo-next.env
+EnvironmentFile=/etc/audio-flamingo-next-secondary.env
 Environment=PYTHONPATH=/home/ubuntu/sam-audio-deploy/pipeline/src
 ExecStart=/home/ubuntu/sam-audio-deploy/.venv/bin/python -m sam_audio_pipeline.flamingo_api
 Restart=on-failure

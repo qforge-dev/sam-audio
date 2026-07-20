@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Training Snapshot Review</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1016;
+      --panel: #121a23;
+      --panel-2: #18232f;
+      --line: #293848;
+      --text: #eef5fb;
+      --muted: #91a4b7;
+      --blue: #67b7ff;
+      --green: #56d491;
+      --gold: #f7c75d;
+      --red: #ff7777;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+    button, select { font: inherit; }
+    button { cursor: pointer; }
+    header { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 18px; padding: 14px 22px; border-bottom: 1px solid var(--line); background: rgba(11,16,22,.96); backdrop-filter: blur(10px); }
+    .brand h1 { margin: 0; font-size: 17px; }
+    .brand p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .nav { margin-left: auto; display: flex; gap: 8px; }
+    .nav a, .control { border: 1px solid var(--line); border-radius: 9px; padding: 8px 11px; color: var(--muted); background: transparent; text-decoration: none; }
+    .nav a.active { color: var(--text); border-color: #4b657d; background: var(--panel); }
+    main { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 60px; }
+    .toolbar { display: flex; align-items: end; gap: 12px; margin-bottom: 24px; }
+    .field { display: grid; gap: 6px; }
+    .field label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+    select { min-width: 300px; padding: 9px 11px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 9px; }
+    .snapshot-summary { color: var(--muted); font-size: 12px; }
+    .record-head { display: grid; grid-template-columns: 1fr auto; gap: 20px; align-items: start; margin-bottom: 20px; }
+    .eyebrow { color: var(--blue); text-transform: uppercase; letter-spacing: .12em; font-size: 11px; font-weight: 750; }
+    h2 { margin: 7px 0 5px; font-size: clamp(22px, 3vw, 34px); line-height: 1.15; }
+    .record-id { max-width: 760px; color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 13px; }
+    .chip { padding: 5px 9px; border: 1px solid var(--line); border-radius: 999px; color: #c2d0dc; background: var(--panel-2); font-size: 12px; }
+    .chip.success { color: var(--green); border-color: rgba(86,212,145,.5); }
+    .chip.review { color: var(--gold); border-color: rgba(247,199,93,.5); }
+    .chip.failure { color: var(--red); border-color: rgba(255,119,119,.5); }
+    .pager { display: flex; gap: 8px; }
+    .pager button { padding: 9px 12px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 9px; }
+    .pager button:disabled { opacity: .35; cursor: default; }
+    .players { display: grid; grid-template-columns: repeat(3, 1fr); gap: 13px; }
+    .player { padding: 17px; border: 1px solid var(--line); border-radius: 14px; background: linear-gradient(145deg, #15202b, #10171f); }
+    .player h3 { margin: 0; font-size: 15px; }
+    .player p { min-height: 36px; margin: 4px 0 13px; color: var(--muted); font-size: 12px; }
+    audio { display: block; width: 100%; height: 42px; }
+    .content { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(300px, .7fr); gap: 14px; margin-top: 14px; }
+    .stack { display: grid; gap: 14px; align-content: start; }
+    .card { padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+    .card h3 { margin: 0 0 11px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+    .description { margin: 0; font-size: 17px; line-height: 1.65; }
+    .transcript { margin: 0; white-space: pre-wrap; color: #d9e4ed; line-height: 1.7; }
+    .timeline { display: grid; gap: 8px; margin-top: 17px; }
+    .timeline-row { display: grid; grid-template-columns: 80px 1fr; gap: 12px; padding-top: 8px; border-top: 1px solid #22303e; }
+    .time { color: var(--blue); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .quality-copy { margin: -3px 0 13px; color: var(--muted); font-size: 12px; }
+    .quality-status { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 13px; }
+    .quality-status .arrow { color: var(--muted); }
+    .reason-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+    .reason-list li { display: grid; gap: 8px; padding: 10px; border-radius: 8px; background: #0f171f; color: #c4d1dc; }
+    .reason-name { font-weight: 650; }
+    .reason-controls, .override-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .quality-button { padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--panel-2); }
+    .quality-button:hover { color: var(--text); border-color: #4b657d; }
+    .quality-button.selected-true { color: var(--red); border-color: rgba(255,119,119,.65); background: rgba(255,119,119,.08); }
+    .quality-button.selected-false { color: var(--green); border-color: rgba(86,212,145,.65); background: rgba(86,212,145,.08); }
+    .quality-button.success { color: var(--green); border-color: rgba(86,212,145,.5); }
+    .quality-button.failure { color: var(--red); border-color: rgba(255,119,119,.5); }
+    .quality-button.active { color: var(--text); box-shadow: inset 0 0 0 1px currentColor; }
+    .quality-button:disabled { opacity: .4; cursor: default; }
+    .override-block { margin-top: 14px; padding-top: 14px; border-top: 1px solid #22303e; }
+    .override-label { margin-bottom: 8px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+    .save-status { min-height: 18px; margin-top: 8px; color: var(--muted); font-size: 11px; }
+    .save-status.error { padding: 0; text-align: left; }
+    .kv { display: grid; grid-template-columns: 1fr auto; gap: 8px 16px; }
+    .kv span:nth-child(odd) { color: var(--muted); }
+    .kv span:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
+    .source-link { color: var(--blue); overflow-wrap: anywhere; }
+    details { margin-top: 14px; }
+    summary { cursor: pointer; color: var(--muted); }
+    pre { max-height: 360px; overflow: auto; padding: 13px; border-radius: 9px; background: #0b1118; color: #aebdca; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+    .loading, .error { padding: 60px 20px; text-align: center; color: var(--muted); }
+    .error { color: var(--red); }
+    @media (max-width: 900px) {
+      header { flex-wrap: wrap; }
+      .nav { margin-left: 0; width: 100%; }
+      .toolbar, .record-head { display: grid; }
+      select { min-width: 0; width: 100%; }
+      .players, .content { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand"><h1>Training Snapshot Review</h1><p>Voice-only dialogue/background packages</p></div>
+    <nav class="nav">
+      <a id="clipsLink" href="/">Review clips</a>
+      <a id="progressLink" href="/progress">Pipeline progress</a>
+      <a id="trainingLink" class="active" href="/training">Training snapshots</a>
+      <a id="balanceLink" href="/training/balance">Dataset balance</a>
+    </nav>
+  </header>
+  <main>
+    <div class="toolbar">
+      <div class="field">
+        <label for="snapshotSelect">Immutable snapshot</label>
+        <select id="snapshotSelect"></select>
+      </div>
+      <div class="snapshot-summary" id="snapshotSummary">Loading snapshots…</div>
+    </div>
+    <div id="loading" class="loading">Loading one training record…</div>
+    <section id="record" hidden>
+      <div class="record-head">
+        <div>
+          <div class="eyebrow" id="position"></div>
+          <h2 id="title">Training record</h2>
+          <div class="record-id" id="recordId"></div>
+          <div class="chips" id="chips"></div>
+        </div>
+        <div class="pager">
+          <button id="previous">← Previous</button>
+          <button id="random">Random</button>
+          <button id="next">Next →</button>
+        </div>
+      </div>
+      <div class="players">
+        <article class="player">
+          <h3>Whole mix</h3><p>Original stereo source before separation.</p>
+          <audio id="originalAudio" controls preload="metadata"></audio>
+        </article>
+        <article class="player">
+          <h3>Dialogue only</h3><p>SAM voice stem after stereo mapping and normalization.</p>
+          <audio id="dialogueAudio" controls preload="metadata"></audio>
+        </article>
+        <article class="player">
+          <h3>Background only</h3><p>Residual ambience, music and sound effects without dialogue.</p>
+          <audio id="backgroundAudio" controls preload="metadata"></audio>
+        </article>
+      </div>
+      <div class="content">
+        <div class="stack">
+          <article class="card">
+            <h3>Generated scene description</h3>
+            <p class="description" id="description"></p>
+            <div class="timeline" id="timeline"></div>
+          </article>
+          <article class="card">
+            <h3>Dialogue transcript</h3>
+            <p class="transcript" id="transcript"></p>
+          </article>
+        </div>
+        <div class="stack">
+          <article class="card">
+            <h3>Automated quality decision</h3>
+            <p class="quality-copy">The automated result stays unchanged. Add a separate manual annotation for each detected problem, then optionally override the final outcome.</p>
+            <div class="quality-status" id="qualityStatus"></div>
+            <ul class="reason-list" id="reasons"></ul>
+            <div class="override-block">
+              <div class="override-label">Manual outcome override</div>
+              <div class="override-actions">
+                <button class="quality-button success" id="markSuccess" type="button">Mark success</button>
+                <button class="quality-button failure" id="markFailure" type="button">Mark failure</button>
+                <button class="quality-button" id="clearOverride" type="button">Clear override</button>
+              </div>
+              <div class="save-status" id="overrideStatus"></div>
+            </div>
+          </article>
+          <article class="card">
+            <h3>Signals</h3>
+            <div class="kv" id="signals"></div>
+          </article>
+          <article class="card">
+            <h3>Source</h3>
+            <div id="source"></div>
+            <details><summary>Full record metadata</summary><pre id="metadata"></pre></details>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const marker = '/training';
+    const markerIndex = location.pathname.indexOf(marker);
+    const BASE = markerIndex >= 0 ? location.pathname.slice(0, markerIndex) : '';
+    const routeParts = markerIndex >= 0
+      ? location.pathname.slice(markerIndex + marker.length).split('/').filter(Boolean).map(decodeURIComponent)
+      : [];
+    const app = { snapshots: [], snapshot: null, record: null, saving: false };
+    const api = path => `${BASE}${path}`;
+    const esc = value => String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+    const number = value => value == null ? '—' : Number(value).toFixed(2);
+
+    async function json(path, options = {}) {
+      const response = await fetch(api(path), options);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+      return payload;
+    }
+
+    function snapshotLabel(snapshot) {
+      const buckets = snapshot.quality_buckets || {};
+      return `${snapshot.snapshot_id} · ${snapshot.record_count.toLocaleString()} records · ${buckets.success || 0} success`;
+    }
+
+    function updateSnapshotSummary() {
+      const s = app.snapshot;
+      const b = s.quality_buckets || {};
+      $('snapshotSummary').textContent = `${b.success || 0} success · ${b.review || 0} review · ${b.failure || 0} failure · ${s.verification_status || 'published'}`;
+    }
+
+    async function loadRecord({position = 0, recordId = null} = {}) {
+      $('loading').hidden = false;
+      $('loading').className = 'loading';
+      $('loading').textContent = 'Loading one training record…';
+      $('record').hidden = true;
+      try {
+        const query = recordId ? `record_id=${encodeURIComponent(recordId)}` : `position=${position}`;
+        app.record = await json(`/api/training/snapshots/${encodeURIComponent(app.snapshot.snapshot_id)}/records?${query}`);
+        renderRecord();
+      } catch (error) {
+        $('loading').className = 'error';
+        $('loading').textContent = error.message;
+      }
+    }
+
+    function audioUrl(stem) {
+      return api(`/api/training/audio/${encodeURIComponent(app.record.snapshot_id)}/${encodeURIComponent(app.record.record_id)}/${stem}`);
+    }
+
+    function qualityReasons(quality) {
+      return [...new Set([...(quality.failure_reasons || []), ...(quality.review_reasons || [])])];
+    }
+
+    function renderQuality() {
+      const r = app.record;
+      const quality = r.quality || {};
+      const automated = r.automated_quality_bucket || quality.bucket || r.quality_bucket;
+      const manual = r.manual_quality_override;
+      const effective = r.effective_quality_bucket || automated;
+      const issues = manual?.issues || {};
+      const reasons = qualityReasons(quality);
+      $('qualityStatus').innerHTML = [
+        `<span class="chip ${esc(automated)}">Automated: ${esc(automated)}</span>`,
+        manual?.decision ? '<span class="arrow">→</span>' : '',
+        manual?.decision ? `<span class="chip ${esc(effective)}">Manual: ${esc(effective)}</span>` : '',
+      ].join('');
+      $('reasons').innerHTML = reasons.length ? reasons.map(reason => {
+        const occurs = Object.prototype.hasOwnProperty.call(issues, reason) ? issues[reason] : null;
+        return `<li><span class="reason-name">${esc(String(reason).replaceAll('_', ' '))}</span><div class="reason-controls" role="group" aria-label="Manual annotation for ${esc(reason)}"><button type="button" class="quality-button ${occurs === true ? 'selected-true' : ''}" data-issue="${esc(reason)}" data-occurs="true">Occurred</button><button type="button" class="quality-button ${occurs === false ? 'selected-false' : ''}" data-issue="${esc(reason)}" data-occurs="false">Did not occur</button></div></li>`;
+      }).join('') : '<li><span class="snapshot-summary">No automated quality problems were reported.</span></li>';
+      $('markSuccess').classList.toggle('active', manual?.decision === 'success');
+      $('markFailure').classList.toggle('active', manual?.decision === 'failure');
+      $('clearOverride').disabled = !manual;
+      $('overrideStatus').className = 'save-status';
+      $('overrideStatus').textContent = manual?.updated_at
+        ? `Manual annotation saved ${new Date(manual.updated_at).toLocaleString()}. Original automated result is unchanged.`
+        : 'No manual override saved.';
+      const sam = (r.separation || {}).sam || {};
+      const profile = (r.separation || {}).source_profile || {};
+      $('chips').innerHTML = [
+        `<span class="chip ${esc(automated)}">Automated ${esc(automated)}</span>`,
+        manual?.decision ? `<span class="chip ${esc(effective)}">Manual ${esc(effective)}</span>` : '',
+        `<span class="chip">SAM ${esc(sam.verification_status || '—')}</span>`,
+        `<span class="chip">${esc(profile.channels || 2)} ch · ${esc(profile.sample_rate_hz || 48000)} Hz</span>`,
+      ].join('');
+    }
+
+    function overridePath() {
+      return `/api/training/snapshots/${encodeURIComponent(app.record.snapshot_id)}/records/${encodeURIComponent(app.record.record_id)}/quality-override`;
+    }
+
+    async function saveOverride(nextOverride) {
+      if (app.saving) return;
+      app.saving = true;
+      $('overrideStatus').className = 'save-status';
+      $('overrideStatus').textContent = 'Saving…';
+      try {
+        const payload = await json(overridePath(), {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({decision: nextOverride.decision || null, issues: nextOverride.issues || {}}),
+        });
+        app.record.manual_quality_override = payload.manual_quality_override;
+        app.record.effective_quality_bucket = payload.effective_quality_bucket;
+        renderQuality();
+        $('metadata').textContent = JSON.stringify(app.record, null, 2);
+      } catch (error) {
+        $('overrideStatus').className = 'save-status error';
+        $('overrideStatus').textContent = error.message;
+      } finally {
+        app.saving = false;
+      }
+    }
+
+    async function clearOverride() {
+      if (app.saving || !app.record.manual_quality_override) return;
+      app.saving = true;
+      $('overrideStatus').className = 'save-status';
+      $('overrideStatus').textContent = 'Clearing…';
+      try {
+        const payload = await json(overridePath(), {method: 'DELETE'});
+        app.record.manual_quality_override = null;
+        app.record.effective_quality_bucket = payload.effective_quality_bucket;
+        renderQuality();
+        $('metadata').textContent = JSON.stringify(app.record, null, 2);
+      } catch (error) {
+        $('overrideStatus').className = 'save-status error';
+        $('overrideStatus').textContent = error.message;
+      } finally {
+        app.saving = false;
+      }
+    }
+
+    function renderRecord() {
+      const r = app.record;
+      const quality = r.quality || {};
+      const description = r.scene_description || {};
+      const parsed = description.parsed || {};
+      const asr = r.dialogue_transcription || {};
+      const source = r.source || {};
+      const separation = r.separation || {};
+      const reconstruction = separation.reconstruction || {};
+      $('position').textContent = `Record ${r.snapshot_position + 1} of ${r.snapshot_record_count}`;
+      $('title').textContent = source.title || source.filename || 'Training record';
+      $('recordId').textContent = r.record_id;
+      renderQuality();
+      $('originalAudio').src = audioUrl('original');
+      $('dialogueAudio').src = audioUrl('dialogue');
+      $('backgroundAudio').src = audioUrl('background');
+      $('description').textContent = parsed.description || 'No generated description.';
+      $('transcript').textContent = asr.transcript || 'No dialogue transcript.';
+      $('timeline').innerHTML = (parsed.timeline || []).map(item => {
+        const span = item.time_seconds || item.t || [];
+        const events = item.events || item.event || [];
+        return `<div class="timeline-row"><span class="time">${esc(span.join?.('–') || '')}s</span><span>${esc(Array.isArray(events) ? events.join(', ') : events)}</span></div>`;
+      }).join('');
+      const signals = quality.signals || {};
+      const signalRows = [
+        ['Reconstruction similarity', reconstruction.similarity_score ?? signals.reconstruction_similarity],
+        ['Background speech coverage', signals.background_speech_coverage],
+        ['Vocal music coverage', signals.background_vocal_music_coverage],
+        ['Dialogue words', signals.dialogue_word_count],
+        ['ASR language probability', signals.dialogue_language_probability],
+        ['Separation seconds', separation.processing_seconds],
+        ['Caption seconds', description.processing_seconds],
+      ];
+      $('signals').innerHTML = signalRows.map(([label, value]) => `<span>${esc(label)}</span><span>${esc(number(value))}</span>`).join('');
+      const sourceUrl = source.source_url || source.webpage_url || source.url;
+      $('source').innerHTML = [
+        source.platform ? `<div>${esc(source.platform)}</div>` : '',
+        sourceUrl ? `<a class="source-link" href="${esc(sourceUrl)}" target="_blank" rel="noreferrer">${esc(sourceUrl)}</a>` : '<span class="snapshot-summary">Source URL unavailable</span>',
+      ].join('');
+      $('metadata').textContent = JSON.stringify(r, null, 2);
+      $('previous').disabled = r.snapshot_position <= 0;
+      $('next').disabled = r.snapshot_position >= r.snapshot_record_count - 1;
+      const route = `${BASE}/training/${encodeURIComponent(r.snapshot_id)}/${encodeURIComponent(r.record_id)}`;
+      history.replaceState({}, '', route);
+      $('loading').hidden = true;
+      $('record').hidden = false;
+    }
+
+    async function init() {
+      $('clipsLink').href = `${BASE}/`;
+      $('progressLink').href = `${BASE}/progress`;
+      $('trainingLink').href = `${BASE}/training`;
+      $('balanceLink').href = `${BASE}/training/balance`;
+      const payload = await json('/api/training/snapshots');
+      app.snapshots = payload.snapshots;
+      if (!app.snapshots.length) throw new Error('No immutable training snapshots are available yet.');
+      $('snapshotSelect').innerHTML = app.snapshots.map(snapshot => `<option value="${esc(snapshot.snapshot_id)}">${esc(snapshotLabel(snapshot))}</option>`).join('');
+      const requested = routeParts[0];
+      app.snapshot = app.snapshots.find(item => item.snapshot_id === requested) || app.snapshots[0];
+      $('snapshotSelect').value = app.snapshot.snapshot_id;
+      updateSnapshotSummary();
+      await loadRecord({recordId: routeParts[1] || null});
+    }
+
+    $('snapshotSelect').addEventListener('change', async event => {
+      app.snapshot = app.snapshots.find(item => item.snapshot_id === event.target.value);
+      updateSnapshotSummary();
+      await loadRecord({position: 0});
+    });
+    $('previous').addEventListener('click', () => loadRecord({position: app.record.snapshot_position - 1}));
+    $('next').addEventListener('click', () => loadRecord({position: app.record.snapshot_position + 1}));
+    $('random').addEventListener('click', () => loadRecord({position: Math.floor(Math.random() * app.snapshot.record_count)}));
+    $('reasons').addEventListener('click', event => {
+      const button = event.target.closest('button[data-issue]');
+      if (!button) return;
+      const current = app.record.manual_quality_override || {decision: null, issues: {}};
+      saveOverride({
+        decision: current.decision,
+        issues: {...current.issues, [button.dataset.issue]: button.dataset.occurs === 'true'},
+      });
+    });
+    $('markSuccess').addEventListener('click', () => {
+      const current = app.record.manual_quality_override || {issues: {}};
+      saveOverride({decision: 'success', issues: current.issues});
+    });
+    $('markFailure').addEventListener('click', () => {
+      const current = app.record.manual_quality_override || {issues: {}};
+      saveOverride({decision: 'failure', issues: current.issues});
+    });
+    $('clearOverride').addEventListener('click', clearOverride);
+    document.addEventListener('keydown', event => {
+      if (event.key === 'ArrowLeft' && !$('previous').disabled) loadRecord({position: app.record.snapshot_position - 1});
+      if (event.key === 'ArrowRight' && !$('next').disabled) loadRecord({position: app.record.snapshot_position + 1});
+      if (event.key.toLowerCase() === 'r') loadRecord({position: Math.floor(Math.random() * app.snapshot.record_count)});
+    });
+    init().catch(error => {
+      $('loading').className = 'error';
+      $('loading').textContent = error.message;
+    });
+  </script>
+</body>
+</html>
